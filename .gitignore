@@ -1,0 +1,21 @@
+# Ignorar entornos virtuales
+hobbies/
+.hobbies_venv/
+*.egg-info/
+*.pyc
+__pycache__/
+
+# Ignorar configuraciones de IDEs
+.vscode/
+.idea/
+
+# Ignorar archivos temporales y logs
+*.log
+*.out
+
+# Ignorar sistemas operativos
+.DS_Store
+Thumbs.db
+
+# Ignorar configuraciones específicas
+.env
