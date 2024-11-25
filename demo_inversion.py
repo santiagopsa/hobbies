@@ -4,13 +4,16 @@ from openai import OpenAI
 import time
 from elegir_cripto import choose_best_cryptos  # Importar la función de selección de criptos
 import matplotlib.pyplot as plt
+from dotenv import load_dotenv
+import os
 
 # Configurar APIs de OpenAI y CCXT
 exchange = ccxt.binance({
     "rateLimit": 1200,
     "enableRateLimit": True
 })
-client = OpenAI(api_key="sk-f3rQTzIsECXmppO8PivLFyi7A0ZP4MRT1c-Fp8N0RpT3BlbkFJMHLP9okjWn24d7s_psSHxdebNpib1KxqcnVeLpNJIA")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Variables globales
 SIMULATED_BALANCE = 1000  # Balance inicial en USD para la simulación
