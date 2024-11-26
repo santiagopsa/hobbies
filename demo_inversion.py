@@ -3,7 +3,6 @@ import pandas as pd
 from openai import OpenAI
 import time
 from elegir_cripto import choose_best_cryptos  # Importar la función de selección de criptos
-import matplotlib.pyplot as plt
 from dotenv import load_dotenv
 import os
 
