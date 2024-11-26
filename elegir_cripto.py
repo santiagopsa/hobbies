@@ -96,4 +96,3 @@ def choose_best_cryptos(base_currency="USDT", top_n=10):
 
 # Ejemplo de uso
 selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=10)
-print(f"Criptos seleccionadas: {selected_cryptos}")

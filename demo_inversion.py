@@ -12,6 +12,7 @@ exchange = ccxt.binance({
     "rateLimit": 1200,
     "enableRateLimit": True
 })
+load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -39,36 +40,64 @@ def update_portfolio(symbol, action, amount):
             return False
     return True
 
-# Función para analizar con GPT
 def gpt_decision(data):
+
+        # Dividir la respuesta de GPT entre la acción y la explicación
+    action = None
+    explanation = None
     """
-    Utiliza GPT para analizar los datos de mercado y decidir si comprar, vender o mantener.
+    Utiliza GPT para analizar los datos de mercado y decidir si comprar, vender o mantener,
+    devolviendo la acción y la explicación por separado, tu primera palabra de respuesta debe ser la acción.
     """
+    datos = data.tail(10).to_string(index=False)
     prompt = f"""
     Eres un experto en trading. Basándote en los siguientes datos de mercado, decide si comprar, vender o mantener.
-    Proporciona una breve explicación de tu decisión.
+    Proporciona una breve explicación de tu decisión, tu primera palabra de respuesta debe ser la acción.
 
     Datos:
-    {data.tail(10).to_string(index=False)}
+    {datos}
 
-    Responde con: "comprar", "vender" o "mantener" y la explicación.
+    Inicia tu respuesta con: "comprar", "vender" o "mantener" y después la explicación.
     """
+    
     response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model="gpt-4-turbo",
         messages=[
             {"role": "system", "content": "Eres un experto en trading."},
             {"role": "user", "content": prompt}
         ],
         temperature=0.7
     )
-    return response.choices[0].message.content.strip()
+    
+    # Extraemos la respuesta de GPT, separamos la acción y la explicación
+    message = response.choices[0].message.content.strip()
+    print(message)
 
-# Función para simular una operación
+    if message.lower().startswith('comprar'):
+        action = "comprar"
+        explanation = message[7:].strip()  # Eliminar "comprar" y los espacios al inicio
+    elif message.lower().startswith('vender'):
+        action = "vender"
+        explanation = message[6:].strip()  # Eliminar "vender" y los espacios al inicio
+    elif message.lower().startswith('mantener'):
+        action = "mantener"
+        explanation = message[8:].strip()  # Eliminar "mantener" y los espacios al inicio
+    else:
+        action = "mantener"
+        explanation = "No hay una recomendación clara."
+
+
+    return action, explanation
+
+
 def execute_simulated_order(symbol, action, price):
     global SIMULATED_BALANCE, TRANSACTION_LOG
+
     if action == "comprar":
+        # Calculate how much can be bought with TRADE_SIZE
         amount = TRADE_SIZE / price
         if SIMULATED_BALANCE >= TRADE_SIZE:
+            # Deduct balance and update portfolio
             SIMULATED_BALANCE -= TRADE_SIZE
             update_portfolio(symbol, "buy", amount)
             TRANSACTION_LOG.append({
@@ -81,11 +110,14 @@ def execute_simulated_order(symbol, action, price):
             print(f"Simulación: Comprado {amount:.6f} {symbol} a {price:.2f} USD.")
         else:
             print(f"Error: No tienes suficiente saldo para comprar {symbol}.")
+
     elif action == "vender":
         if symbol in PORTFOLIO and PORTFOLIO[symbol] > 0:
-            amount = TRADE_SIZE / price
-            if PORTFOLIO[symbol] >= amount:
-                SIMULATED_BALANCE += TRADE_SIZE
+            # Determine the amount to sell (minimum of TRADE_SIZE / price or current balance)
+            amount = min(TRADE_SIZE / price, PORTFOLIO[symbol])
+            if amount > 1e-6:  # Ensure meaningful transaction
+                # Increase balance and update portfolio
+                SIMULATED_BALANCE += amount * price
                 if update_portfolio(symbol, "sell", amount):
                     TRANSACTION_LOG.append({
                         "symbol": symbol,
@@ -95,10 +127,16 @@ def execute_simulated_order(symbol, action, price):
                         "balance": SIMULATED_BALANCE
                     })
                     print(f"Simulación: Vendido {amount:.6f} {symbol} a {price:.2f} USD.")
+                else:
+                    print(f"Error: No se pudo actualizar el portafolio al vender {symbol}.")
+            else:
+                print(f"Error: La cantidad a vender de {symbol} es demasiado pequeña.")
         else:
             print(f"Error: No tienes suficiente {symbol} para vender.")
+
     else:
         print(f"Simulación: Mantener posición para {symbol}.")
+
 
 # Función para obtener y procesar datos
 def fetch_and_prepare_data(symbol):
@@ -132,17 +170,18 @@ def demo_trading():
             current_price = df['close'].iloc[-1]
 
             # Analizar con GPT
-            decision = gpt_decision(df)
-            print(f"Decisión para {symbol}: {decision}")
+            action, explanation = gpt_decision(df)
+            print(f"Decisión para {symbol}: {action} - {explanation}")
+
+            # Almacenar la transacción
+            TRANSACTION_LOG.append({
+                "symbol": symbol,
+                "action": action,
+                "price": current_price,
+                "explanation": explanation
+            })
 
             # Determinar acción a realizar
-            action = "mantener"
-            if "comprar" in decision.lower() and "mantener" not in decision.lower():
-                action = "comprar"
-            elif "vender" in decision.lower():
-                action = "vender"
-
-            # Ejecutar acción
             if action == "comprar":
                 execute_simulated_order(symbol, "comprar", current_price)
             elif action == "vender":
@@ -165,6 +204,7 @@ def demo_trading():
 
     # Generar gráfica de precios
     generate_price_graph(selected_cryptos)
+
 
 # Función para generar gráfica de precios
 def generate_price_graph(cryptos):
