@@ -2,10 +2,10 @@ import ccxt
 import pandas as pd
 from openai import OpenAI
 import time
+import celery_app
 from elegir_cripto import choose_best_cryptos  # Importar la función de selección de criptos
 from dotenv import load_dotenv
 import os
-from celery_app import Celery
 
 
 # Configurar APIs de OpenAI y CCXT
