@@ -5,7 +5,8 @@ import time
 from elegir_cripto import choose_best_cryptos  # Importar la función de selección de criptos
 from dotenv import load_dotenv
 import os
-from celery import celery_app
+from celery_app import celery_app
+
 
 # Configurar APIs de OpenAI y CCXT
 exchange = ccxt.binanceus({
