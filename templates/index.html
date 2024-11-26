@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simulador de Trading</title>
+    <script>
+        // JavaScript para manejar el loader y consultar el estado de la tarea
+        async function iniciarSimulacion() {
+            // Mostrar el loader
+            document.getElementById("loader").style.display = "block";
+            document.getElementById("resultado").innerText = "";
+
+            // Llamar al backend para iniciar la simulación
+            const response = await fetch('/simular');
+            const data = await response.json();
+
+            if (data.task_id) {
+                // Consultar el estado periódicamente
+                const taskId = data.task_id;
+                let status = "PENDING";
+
+                while (status === "PENDING") {
+                    const statusResponse = await fetch(`/status/${taskId}`);
+                    const statusData = await statusResponse.json();
+
+                    status = statusData.status;
+                    if (status === "SUCCESS") {
+                        document.getElementById("resultado").innerText = JSON.stringify(statusData.result, null, 2);
+                        break;
+                    } else if (status === "FAILURE") {
+                        document.getElementById("resultado").innerText = "Error: " + statusData.result;
+                        break;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 2000)); // Esperar 2 segundos
+                }
+
+                // Ocultar el loader
+                document.getElementById("loader").style.display = "none";
+            } else {
+                document.getElementById("resultado").innerText = "No se pudo iniciar la simulación.";
+            }
+        }
+    </script>
+</head>
+<body>
+    <h1>Simulador de Trading</h1>
+    <button onclick="iniciarSimulacion()">Iniciar Simulación</button>
+    <p id="loader" style="display: none;">Cargando...</p>
+    <pre id="resultado"></pre>
+</body>
+</html>

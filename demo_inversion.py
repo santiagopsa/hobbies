@@ -5,6 +5,7 @@ import time
 from elegir_cripto import choose_best_cryptos  # Importar la función de selección de criptos
 from dotenv import load_dotenv
 import os
+from celery import celery_app
 
 # Configurar APIs de OpenAI y CCXT
 exchange = ccxt.binanceus({
@@ -158,6 +159,7 @@ def fetch_and_prepare_data(symbol):
         return None
 
 # Función principal
+@celery_app.task
 def demo_trading():
     global TRANSACTION_LOG
     print("Iniciando demo de inversión...")

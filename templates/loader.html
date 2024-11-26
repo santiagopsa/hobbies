@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simulación en Progreso</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #f4f4f9;
+        }
+        .loader {
+            text-align: center;
+        }
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .message {
+            color: #333;
+        }
+    </style>
+</head>
+<body>
+    <div class="loader">
+        <div class="spinner"></div>
+        <p class="message" id="message">Iniciando simulación...</p>
+    </div>
+    <script>
+        // Lanza la simulación
+        fetch('/simular')
+            .then(response => response.json())
+            .then(data => {
+                const taskId = data.task_id;
+
+                // Verifica el estado de la tarea periódicamente
+                const interval = setInterval(() => {
+                    fetch(`/status/${taskId}`)
+                        .then(response => response.json())
+                        .then(statusData => {
+                            if (statusData.status === 'SUCCESS') {
+                                clearInterval(interval);  // Detén el intervalo
+                                document.getElementById('message').textContent = 'Simulación completada: ' + JSON.stringify(statusData.result);
+                            } else if (statusData.status === 'FAILURE') {
+                                clearInterval(interval);  // Detén el intervalo
+                                document.getElementById('message').textContent = 'Error: ' + statusData.result;
+                            } else {
+                                document.getElementById('message').textContent = 'Estado: ' + statusData.status;
+                            }
+                        });
+                }, 2000); // Verifica cada 2 segundos
+            })
+            .catch(err => {
+                console.error(err);
+                document.getElementById('message').textContent = 'Ocurrió un error al iniciar la simulación.';
+            });
+    </script>
+</body>
+</html>
