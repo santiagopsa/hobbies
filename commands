@@ -1,0 +1,1 @@
+heroku logs --tail # para ver log de heroku

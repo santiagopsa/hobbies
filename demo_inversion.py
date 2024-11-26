@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 import os
 
 # Configurar APIs de OpenAI y CCXT
-exchange = ccxt.binance({
+exchange = ccxt.binanceus({
     "rateLimit": 1200,
     "enableRateLimit": True
 })
