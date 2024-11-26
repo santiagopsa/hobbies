@@ -200,32 +200,6 @@ def demo_trading():
     for log in TRANSACTION_LOG:
         print(log)
 
-    # Generar gráfica de precios
-    generate_price_graph(selected_cryptos)
-
-
-# Función para generar gráfica de precios
-def generate_price_graph(cryptos):
-    """
-    Genera una gráfica tipo mosaico de los precios de cierre de las criptos seleccionadas.
-    """
-    fig, axes = plt.subplots(5, 2, figsize=(15, 20))
-    axes = axes.flatten()
-
-    for i, symbol in enumerate(cryptos):
-        try:
-            df = fetch_and_prepare_data(symbol)
-            if df is not None and not df.empty:
-                axes[i].plot(pd.to_datetime(df['timestamp'], unit='ms'), df['close'])
-                axes[i].set_title(symbol)
-                axes[i].set_xlabel("Timestamp")
-                axes[i].set_ylabel("Precio de Cierre")
-        except Exception as e:
-            print(f"No se pudo generar gráfica para {symbol}: {e}")
-            continue
-
-    plt.tight_layout()
-    plt.show()
 
 # Ejecutar demo
 if __name__ == "__main__":
