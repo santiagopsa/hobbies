@@ -1,1 +1,6 @@
 heroku logs --tail # para ver log de heroku
+
+git add .
+git commit -m "Fix Redis SSL configuration"
+git push heroku main
+

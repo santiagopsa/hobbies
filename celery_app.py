@@ -26,3 +26,6 @@ celery_app.conf.update(
     timezone='UTC',
     enable_utc=True,
 )
+
+# Asegúrate de importar el módulo que contiene las tareas
+import demo_inversion
