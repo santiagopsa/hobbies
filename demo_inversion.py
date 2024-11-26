@@ -71,7 +71,6 @@ def gpt_decision(data):
     
     # Extraemos la respuesta de GPT, separamos la acción y la explicación
     message = response.choices[0].message.content.strip()
-    print(message)
 
     if message.lower().startswith('comprar'):
         action = "comprar"
@@ -171,7 +170,6 @@ def demo_trading():
 
             # Analizar con GPT
             action, explanation = gpt_decision(df)
-            print(f"Decisión para {symbol}: {action} - {explanation}")
 
             # Almacenar la transacción
             TRANSACTION_LOG.append({
@@ -197,7 +195,7 @@ def demo_trading():
     # Mostrar resultados finales
     print("\n--- Resultados de la simulación ---")
     print(f"Balance final simulado: {SIMULATED_BALANCE:.2f} USD")
-    print(f"Transacciones realizadas: {len(TRANSACTION_LOG)}")
+    print(f"Transacciones analizadas: {len(TRANSACTION_LOG)}")
     print(f"Portafolio actual: {PORTFOLIO}")
     for log in TRANSACTION_LOG:
         print(log)
