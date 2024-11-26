@@ -1,5 +1,5 @@
-from celery_app import Celery
 import os
+from celery import Celery
 
 # Configuración de Celery
 celery_app = Celery(
