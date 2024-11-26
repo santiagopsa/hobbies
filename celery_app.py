@@ -1,22 +1,25 @@
 import os
 from celery import Celery
 
-# Configuración de Celery
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
+# Configuración de Celery
 celery_app = Celery(
     'tasks',
-    broker=REDIS_URL,  # URL del broker (Redis en este caso)
-    backend=REDIS_URL  # Backend para almacenar resultados
+    broker=REDIS_URL,
+    backend=REDIS_URL
 )
 
+# Agregar opciones de SSL si se utiliza rediss://
+if REDIS_URL.startswith("rediss://"):
+    celery_app.conf.broker_use_ssl = {
+        "ssl_cert_reqs": "none"  # Cambiar a "required" si tienes certificados válidos
+    }
+    celery_app.conf.redis_backend_use_ssl = {
+        "ssl_cert_reqs": "none"  # Cambiar a "required" si tienes certificados válidos
+    }
+
 celery_app.conf.update(
-    broker_use_ssl={
-        'ssl_cert_reqs': 'CERT_NONE'  # Puedes usar 'CERT_REQUIRED' en producción con certificados válidos
-    },
-    redis_backend_use_ssl={
-        'ssl_cert_reqs': 'CERT_NONE'  # Configuración para backend
-    },
     task_serializer='json',
     accept_content=['json'],
     result_serializer='json',
