@@ -11,8 +11,16 @@ exchange = ccxt.binance({
     "rateLimit": 1200,
     "enableRateLimit": True
 })
-load_dotenv()
+# Cargar variables de entorno desde .env solo en desarrollo local
+if os.getenv("HEROKU") is None:  # Usamos esta lógica para saber si estamos en Heroku
+    load_dotenv()
+
+# Obtener la API Key de OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not OPENAI_API_KEY:
+    raise ValueError("La variable de entorno OPENAI_API_KEY no está configurada")
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Variables globales
