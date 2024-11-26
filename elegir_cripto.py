@@ -1,8 +1,8 @@
 import ccxt
 import pandas as pd
 
-# Configuración del exchange (ejemplo: Binance)
-exchange = ccxt.binance({
+# Configuración del exchange para Binance US
+exchange = ccxt.binanceus({
     "rateLimit": 1200,
     "enableRateLimit": True
 })
@@ -96,3 +96,4 @@ def choose_best_cryptos(base_currency="USDT", top_n=10):
 
 # Ejemplo de uso
 selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=10)
+print(selected_cryptos)
