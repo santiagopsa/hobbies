@@ -2,73 +2,90 @@ import ccxt
 import pandas as pd
 from openai import OpenAI
 import time
-from celery_app import celery_app
 from elegir_cripto import choose_best_cryptos  # Importar la función de selección de criptos
 from dotenv import load_dotenv
 import os
 
-
 # Configurar APIs de OpenAI y CCXT
 exchange = ccxt.binanceus({
-    "rateLimit": 1200,
+    "apiKey": os.getenv("BINANCE_API_KEY_TESTNET"),
+    "secret": os.getenv("BINANCE_SECRET_KEY_TESTNET"),
     "enableRateLimit": True
 })
-# Cargar variables de entorno desde .env solo en desarrollo local
-if os.getenv("HEROKU") is None:  # Usamos esta lógica para saber si estamos en Heroku
+
+exchange.set_sandbox_mode(True)
+
+if os.getenv("HEROKU") is None:
     load_dotenv()
 
-# Obtener la API Key de OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 if not OPENAI_API_KEY:
     raise ValueError("La variable de entorno OPENAI_API_KEY no está configurada")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Variables globales
-SIMULATED_BALANCE = 1000  # Balance inicial en USD para la simulación
-TRADE_SIZE = 100          # Tamaño de cada operación en USD
-TRANSACTION_LOG = []      # Registro de transacciones simuladas
-PORTFOLIO = {}            # Portafolio de activos actuales
+TRADE_SIZE = 100  # Tamaño de cada operación en USD
+TRANSACTION_LOG = []
 
-# Función para actualizar el portafolio
-def update_portfolio(symbol, action, amount):
-    global PORTFOLIO
-    if action == "buy":
-        if symbol in PORTFOLIO:
-            PORTFOLIO[symbol] += amount
-        else:
-            PORTFOLIO[symbol] = amount
-    elif action == "sell":
-        if symbol in PORTFOLIO:
-            PORTFOLIO[symbol] -= amount
-            if PORTFOLIO[symbol] <= 0:
-                del PORTFOLIO[symbol]
-        else:
-            print(f"Error: No tienes {symbol} en el portafolio para vender.")
-            return False
-    return True
+# Obtener balance inicial del sandbox
+def get_sandbox_balance():
+    try:
+        balance = exchange.fetch_balance()
+        usdt_balance = balance['free']['USDT']  # Balance disponible en USDT
+        print(f"Balance inicial del sandbox: {usdt_balance} USDT")
+        return usdt_balance
+    except Exception as e:
+        print(f"Error al obtener el balance del sandbox: {e}")
+        return 0  # Fallback a 0 en caso de error
 
+# Obtener portafolio inicial del sandbox
+def get_sandbox_portfolio():
+    try:
+        balance = exchange.fetch_balance()
+        portfolio = {asset: details['free'] for asset, details in balance['total'].items() if details > 0}
+        print(f"Portafolio actual en el sandbox: {portfolio}")
+        return portfolio
+    except Exception as e:
+        print(f"Error al obtener el portafolio del sandbox: {e}")
+        return {}
+
+# Ejecutar orden de compra
+def execute_order_buy(symbol, amount):
+    try:
+        order = exchange.create_market_buy_order(symbol, amount)
+        print(f"Orden de compra ejecutada: {order}")
+        return order
+    except Exception as e:
+        print(f"Error al ejecutar la orden de compra para {symbol}: {e}")
+        return None
+
+# Ejecutar orden de venta
+def execute_order_sell(symbol, amount):
+    try:
+        order = exchange.create_market_sell_order(symbol, amount)
+        print(f"Orden de venta ejecutada: {order}")
+        return order
+    except Exception as e:
+        print(f"Error al ejecutar la orden de venta para {symbol}: {e}")
+        return None
+
+# Decisión de trading con GPT
 def gpt_decision(data):
-
-        # Dividir la respuesta de GPT entre la acción y la explicación
-    action = None
-    explanation = None
     """
     Utiliza GPT para analizar los datos de mercado y decidir si comprar, vender o mantener,
-    devolviendo la acción y la explicación por separado, tu primera palabra de respuesta debe ser la acción.
+    devolviendo la acción y la explicación por separado.
     """
     datos = data.tail(10).to_string(index=False)
     prompt = f"""
     Eres un experto en trading. Basándote en los siguientes datos de mercado, decide si comprar, vender o mantener.
-    Proporciona una breve explicación de tu decisión, tu primera palabra de respuesta debe ser la acción.
+    Proporciona una breve explicación de tu decisión.
 
     Datos:
     {datos}
 
-    Inicia tu respuesta con: "comprar", "vender" o "mantener" y después la explicación.
+    Inicia tu respuesta con: "comprar", "vender" o "mantener" seguido de la explicación.
     """
-    
+
     response = client.chat.completions.create(
         model="gpt-4-turbo",
         messages=[
@@ -77,80 +94,20 @@ def gpt_decision(data):
         ],
         temperature=0.7
     )
-    
-    # Extraemos la respuesta de GPT, separamos la acción y la explicación
+
     message = response.choices[0].message.content.strip()
 
     if message.lower().startswith('comprar'):
-        action = "comprar"
-        explanation = message[7:].strip()  # Eliminar "comprar" y los espacios al inicio
+        return "comprar", message[7:].strip()
     elif message.lower().startswith('vender'):
-        action = "vender"
-        explanation = message[6:].strip()  # Eliminar "vender" y los espacios al inicio
+        return "vender", message[6:].strip()
     elif message.lower().startswith('mantener'):
-        action = "mantener"
-        explanation = message[8:].strip()  # Eliminar "mantener" y los espacios al inicio
+        return "mantener", message[8:].strip()
     else:
-        action = "mantener"
-        explanation = "No hay una recomendación clara."
+        return "mantener", "No hay una recomendación clara."
 
-
-    return action, explanation
-
-
-def execute_simulated_order(symbol, action, price):
-    global SIMULATED_BALANCE, TRANSACTION_LOG
-
-    if action == "comprar":
-        # Calculate how much can be bought with TRADE_SIZE
-        amount = TRADE_SIZE / price
-        if SIMULATED_BALANCE >= TRADE_SIZE:
-            # Deduct balance and update portfolio
-            SIMULATED_BALANCE -= TRADE_SIZE
-            update_portfolio(symbol, "buy", amount)
-            TRANSACTION_LOG.append({
-                "symbol": symbol,
-                "action": "buy",
-                "price": price,
-                "amount": amount,
-                "balance": SIMULATED_BALANCE
-            })
-            print(f"Simulación: Comprado {amount:.6f} {symbol} a {price:.2f} USD.")
-        else:
-            print(f"Error: No tienes suficiente saldo para comprar {symbol}.")
-
-    elif action == "vender":
-        if symbol in PORTFOLIO and PORTFOLIO[symbol] > 0:
-            # Determine the amount to sell (minimum of TRADE_SIZE / price or current balance)
-            amount = min(TRADE_SIZE / price, PORTFOLIO[symbol])
-            if amount > 1e-6:  # Ensure meaningful transaction
-                # Increase balance and update portfolio
-                SIMULATED_BALANCE += amount * price
-                if update_portfolio(symbol, "sell", amount):
-                    TRANSACTION_LOG.append({
-                        "symbol": symbol,
-                        "action": "sell",
-                        "price": price,
-                        "amount": amount,
-                        "balance": SIMULATED_BALANCE
-                    })
-                    print(f"Simulación: Vendido {amount:.6f} {symbol} a {price:.2f} USD.")
-                else:
-                    print(f"Error: No se pudo actualizar el portafolio al vender {symbol}.")
-            else:
-                print(f"Error: La cantidad a vender de {symbol} es demasiado pequeña.")
-        else:
-            print(f"Error: No tienes suficiente {symbol} para vender.")
-
-    else:
-        print(f"Simulación: Mantener posición para {symbol}.")
-
-
-# Función para obtener y procesar datos
+# Obtener y preparar datos
 def fetch_and_prepare_data(symbol):
-    """
-    Obtiene datos históricos en diferentes marcos temporales.
-    """
     try:
         ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
         df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -160,15 +117,15 @@ def fetch_and_prepare_data(symbol):
         return None
 
 # Función principal
-@celery_app.task
 def demo_trading():
-    global TRANSACTION_LOG
-    print("Iniciando demo de inversión...")
+    print("Iniciando demo de inversión en el sandbox...")
+
+    portfolio = get_sandbox_portfolio()
+    print(f"Portafolio inicial: {portfolio}")
 
     selected_cryptos = choose_best_cryptos()
     print(f"Criptos seleccionadas para trading: {selected_cryptos}")
 
-    # Ciclo de simulación
     for symbol in selected_cryptos:
         try:
             df = fetch_and_prepare_data(symbol)
@@ -177,39 +134,37 @@ def demo_trading():
                 continue
 
             current_price = df['close'].iloc[-1]
-
-            # Analizar con GPT
             action, explanation = gpt_decision(df)
 
-            # Almacenar la transacción
-            TRANSACTION_LOG.append({
-                "symbol": symbol,
-                "action": action,
-                "price": current_price,
-                "explanation": explanation
-            })
-
-            # Determinar acción a realizar
             if action == "comprar":
-                execute_simulated_order(symbol, "comprar", current_price)
+                # Comprar basado en balance disponible
+                usdt_balance = get_sandbox_balance()
+                trade_amount = TRADE_SIZE / current_price
+                if usdt_balance >= TRADE_SIZE:
+                    execute_order_buy(symbol, trade_amount)
+                    portfolio = get_sandbox_portfolio()  # Actualiza portafolio
+                else:
+                    print(f"Saldo insuficiente para comprar {symbol}. Saldo disponible: {usdt_balance} USDT.")
+
             elif action == "vender":
-                execute_simulated_order(symbol, "vender", current_price)
+                if symbol in portfolio and portfolio[symbol] > 0:
+                    execute_order_sell(symbol, portfolio[symbol])
+                    portfolio = get_sandbox_portfolio()  # Actualiza portafolio
+                else:
+                    print(f"No tienes suficiente {symbol} para vender en el sandbox.")
+
             else:
                 print(f"No se realiza ninguna acción para {symbol} (mantener).")
 
-            time.sleep(1)  # Pausa entre análisis
+            time.sleep(1)
+
         except Exception as e:
             print(f"Error procesando {symbol}: {e}")
             continue
 
-    # Mostrar resultados finales
-    print("\n--- Resultados de la simulación ---")
-    print(f"Balance final simulado: {SIMULATED_BALANCE:.2f} USD")
-    print(f"Transacciones analizadas: {len(TRANSACTION_LOG)}")
-    print(f"Portafolio actual: {PORTFOLIO}")
-    for log in TRANSACTION_LOG:
-        print(log)
-
+    print("\n--- Resultados finales en el sandbox ---")
+    print(f"Portafolio final: {get_sandbox_portfolio()}")
+    print(f"Balance final: {get_sandbox_balance()} USDT")
 
 # Ejecutar demo
 if __name__ == "__main__":
