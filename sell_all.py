@@ -172,37 +172,6 @@ def execute_order_sell(symbol, amount):
 def demo_trading():
     print("Iniciando demo de inversión...")
 
-    # Elegir las mejores criptos para compra
-    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=10)
-    print(f"Criptos seleccionadas para compra: {selected_cryptos}")
-
-    # Realizar análisis para compra
-    for symbol in selected_cryptos:
-        try:
-            df = fetch_and_prepare_data(symbol)
-            if df is None or df.empty:
-                print(f"⚠️ Datos insuficientes para {symbol}.")
-                continue
-
-            current_price = df['close'].iloc[-1]
-            action, explanation = gpt_decision(df)
-
-            if action == "comprar":
-                usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
-                trade_amount = TRADE_SIZE / current_price
-                if usdt_balance >= TRADE_SIZE:
-                    execute_order_buy(symbol, trade_amount)
-                else:
-                    print(f"⚠️ Saldo insuficiente para comprar {symbol}. Saldo disponible: {usdt_balance} USDT.")
-            else:
-                print(f"↔️ No se realiza ninguna acción para {symbol} (mantener).")
-
-            time.sleep(1)
-
-        except Exception as e:
-            print(f"Error procesando {symbol}: {e}")
-            continue
-
     # Analizar portafolio para venta
     portfolio_cryptos = get_portfolio_cryptos()
     print(f"Criptos en portafolio para analizar venta: {portfolio_cryptos}")
@@ -220,14 +189,11 @@ def demo_trading():
             current_price = df['close'].iloc[-1]
             action, explanation = gpt_decision(df)
 
-            if action == "vender":
-                crypto_balance = exchange.fetch_balance()['free'].get(symbol, 0)
-                if crypto_balance > 0:
-                    execute_order_sell(market_symbol, crypto_balance)
-                else:
-                    print(f"⚠️ No tienes suficiente {symbol} para vender.")
+            crypto_balance = exchange.fetch_balance()['free'].get(symbol, 0)
+            if crypto_balance > 0:
+                execute_order_sell(market_symbol, crypto_balance)
             else:
-                print(f"↔️ No se realiza ninguna acción para {market_symbol} (mantener).")
+                print(f"⚠️ No tienes suficiente {symbol} para vender.")
 
             time.sleep(1)
 
@@ -235,8 +201,14 @@ def demo_trading():
             print(f"Error procesando {symbol}: {e}")
             continue
 
+        # Filtrar y mostrar solo los valores diferentes de cero
+    balance = exchange.fetch_balance()['free']
+    non_zero_balance = {currency: amount for currency, amount in balance.items() if amount != 0}
+
     print("\n--- Resultados finales ---")
-    print(f"Portafolio final: {exchange.fetch_balance()['free']}")
+    print("Portafolio final (solo valores no cero):")
+    for currency, amount in non_zero_balance.items():
+        print(f"{currency}: {amount}")
 
 # Ejecutar demo
 if __name__ == "__main__":
