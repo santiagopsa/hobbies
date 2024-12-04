@@ -43,7 +43,7 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Variables globales
-TRADE_SIZE = 10
+TRADE_SIZE = 5
 TRANSACTION_LOG = []
 
 def calculate_macd(series, short_window=12, long_window=26, signal_window=9):
