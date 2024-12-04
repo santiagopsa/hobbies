@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 import os
 import csv
 from db_manager_real import initialize_db, insert_transaction, fetch_all_transactions, upgrade_db_schema
+import requests
 
 initialize_db()
 #upgrade_db_schema()
@@ -44,6 +45,46 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # Variables globales
 TRADE_SIZE = 10
 TRANSACTION_LOG = []
+
+def calculate_macd(series, short_window=12, long_window=26, signal_window=9):
+    short_ema = series.ewm(span=short_window, adjust=False).mean()
+    long_ema = series.ewm(span=long_window, adjust=False).mean()
+    macd = short_ema - long_ema
+    signal = macd.ewm(span=signal_window, adjust=False).mean()
+    return macd, signal
+
+def fetch_market_cap(symbol):
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+        return ticker['quoteVolume'] * ticker['last']  # Aproximado como volumen * precio
+    except Exception as e:
+        print(f"Error al obtener el market cap para {symbol}: {e}")
+        return None
+
+def calculate_relative_volume(volume_series):
+    return volume_series.iloc[-1] / volume_series.mean() # Último volumen comparado con la media
+
+def calculate_spread(symbol):
+    try:
+        order_book = exchange.fetch_order_book(symbol)
+        spread = order_book['asks'][0][0] - order_book['bids'][0][0]
+        return spread
+    except Exception as e:
+        print(f"Error al calcular el spread para {symbol}: {e}")
+        return None
+
+def fetch_fear_greed_index():
+    url = "https://api.alternative.me/fng/"
+    try:
+        response = requests.get(url)
+        data = response.json()
+        return data['data'][0]['value']  # Índice de miedo/codicia
+    except Exception as e:
+        print(f"Error al obtener el Fear & Greed Index: {e}")
+        return None
+    
+def calculate_price_std_dev(price_series):
+    return price_series.std()
 
 def get_portfolio_cryptos():
     """
@@ -101,6 +142,8 @@ def fetch_and_prepare_data(symbol):
         # Definir marcos temporales y cantidad de datos a obtener
         timeframes = ['1h', '4h', '1d']  # Horas, 4 horas, días
         data = {}
+        volume_series = None
+        price_series = None
 
         # Obtener datos para cada marco temporal
         for timeframe in timeframes:
@@ -108,6 +151,11 @@ def fetch_and_prepare_data(symbol):
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
+
+            # Solo guardar los datos de 1h para las series de volumen y precio
+            if timeframe == '1h':
+                volume_series = df['volume']
+                price_series = df['close']
 
             # Calcular indicadores técnicos
             df['MA_20'] = df['close'].rolling(window=20).mean()  # Media móvil de 20 periodos
@@ -117,11 +165,10 @@ def fetch_and_prepare_data(symbol):
 
             data[timeframe] = df  # Almacenar datos por marco temporal
 
-        return data  # Devuelve un diccionario con los datos de cada marco temporal
-
+        return data, volume_series, price_series  # Devuelve los datos y las series
     except Exception as e:
         print(f"Error al obtener datos para {symbol}: {e}")
-        return None
+        return None, None, None
 
 # Función para calcular el RSI
 def calculate_rsi(series, period=14):
@@ -147,29 +194,45 @@ def calculate_bollinger_bands(series, window=20, num_std_dev=2):
     return upper_band, rolling_mean, lower_band
 
 # Decisión de trading con GPT
-def gpt_prepare_data(data_by_timeframe):
+# Decisión de trading con GPT
+def gpt_prepare_data(data_by_timeframe, additional_data):
     """
-    Usa GPT-3.5 Turbo para preparar el texto estructurado basado en los datos de mercado.
+    Usa GPT-3.5 Turbo para preparar un resumen estructurado basado en datos de mercado e indicadores adicionales.
     """
     combined_data = ""
+
+    # Incorporar datos de marcos temporales
     for timeframe, df in data_by_timeframe.items():
         if df is not None and not df.empty:
             combined_data += f"\nDatos de {timeframe}:\n"
             combined_data += df.tail(5).to_string(index=False)
 
+    # Preparar el prompt con métricas adicionales
     prompt = f"""
-    Basándote en los datos de mercado en múltiples marcos temporales, organiza esta información en un texto estructurado.
-    El texto debe incluir los indicadores clave (RSI, Bandas de Bollinger, Medias Móviles) y patrones identificados.
+    Eres un experto en análisis financiero y trading. Basándote en los siguientes datos de mercado en múltiples marcos temporales
+    e indicadores adicionales, organiza la información en un resumen estructurado. Este resumen será usado por un sistema más
+    avanzado para tomar decisiones de compra, venta o mantenimiento.
 
-    Datos:
+    Indicadores por marcos temporales:
     {combined_data}
 
-    Proporciona una salida que pueda ser procesada por GPT-4 Turbo para decidir comprar, vender o mantener.
+    Métricas adicionales:
+    - Volumen relativo: {additional_data.get('relative_volume', 'No disponible')}
+    - Promedio de volumen (últimas 24h): {additional_data.get('avg_volume_24h', 'No disponible')}
+    - Market cap: {additional_data.get('market_cap', 'No disponible')}
+    - Spread actual: {additional_data.get('spread', 'No disponible')}
+    - Fear & Greed Index: {additional_data.get('fear_greed', 'No disponible')}
+    - Desviación estándar del precio: {additional_data.get('price_std_dev', 'No disponible')}
+
+    Proporciona:
+    1. Un análisis breve de los patrones identificados en los datos técnicos (tendencias, rangos, volatilidad).
+    2. Una evaluación del contexto basado en las métricas adicionales (volumen, market cap, etc.).
+    3. Información que pueda ser procesada eficientemente por un sistema avanzado para decidir si comprar, vender o mantener.
     """
     response = client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[
-            {"role": "system", "content": "Eres un experto en análisis de datos financieros."},
+            {"role": "system", "content": "Eres un experto en análisis financiero y trading."},
             {"role": "user", "content": prompt}
         ],
         temperature=0.5
@@ -400,6 +463,14 @@ def calculate_trade_amount(symbol, current_price, confidence, trade_size, min_no
 
     return trade_amount
 
+def fetch_avg_volume_24h(volume_series):
+    """
+    Calcula el volumen promedio de las últimas 24 horas basado en la serie de volumen.
+    """
+    if volume_series is None or len(volume_series) < 24:
+        print("⚠️ Datos insuficientes para calcular el volumen promedio de 24h.")
+        return None
+    return volume_series.tail(24).mean()
 
 # Función principal
 def demo_trading():
@@ -412,73 +483,84 @@ def demo_trading():
     # Realizar análisis para compra
     for symbol in selected_cryptos:
         try:
-            # Obtener datos históricos de múltiples marcos temporales
-            data_by_timeframe = fetch_and_prepare_data(symbol)
+            # Obtener datos históricos de múltiples marcos temporales y las series
+            data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(symbol)
 
-            if not data_by_timeframe:
+            # Validar datos obtenidos
+            if not data_by_timeframe or volume_series is None or price_series is None:
                 print(f"⚠️ Datos insuficientes para {symbol}.")
                 continue
 
-            # Primera etapa: preparar texto con GPT-3.5 Turbo
-            prepared_text = gpt_prepare_data(data_by_timeframe)
+            # Calcular métricas adicionales
+            additional_data = {
+                "relative_volume": calculate_relative_volume(volume_series),
+                "avg_volume_24h": fetch_avg_volume_24h(volume_series),
+                "market_cap": fetch_market_cap(symbol),
+                "spread": calculate_spread(symbol),
+                "fear_greed": fetch_fear_greed_index(),
+                "price_std_dev": calculate_price_std_dev(price_series),
+            }
 
-            # Segunda etapa: análisis final con GPT-4 Turbo
+            # Preparar texto con GPT-3.5 Turbo
+            prepared_text = gpt_prepare_data(data_by_timeframe, additional_data)
+
+            # Analizar la decisión con GPT-4 Turbo
             action, confidence, explanation = gpt_decision(prepared_text)
 
-            # Dentro de demo_trading(), durante una decisión de compra:
+            # Decidir acción de compra
             if action == "comprar":
                 usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
                 current_price = data_by_timeframe["1h"]['close'].iloc[-1]
                 market_info = exchange.load_markets().get(symbol)
-                min_notional = market_info['limits']['cost']['min'] if market_info else 10  # Default to 10 if notional not available
+                min_notional = market_info['limits']['cost']['min'] if market_info else 10  # Default if no data
 
                 trade_amount = calculate_trade_amount(
                     symbol=symbol,
                     current_price=current_price,
                     confidence=confidence,
                     trade_size=TRADE_SIZE,
-                    min_notional=min_notional
+                    min_notional=min_notional,
                 )
 
-                print(trade_amount)
+                print(f"💰 Trade Amount Calculado para {symbol}: {trade_amount}")
 
-                # Verificar si el saldo es suficiente para ejecutar la compra
+                # Verificar saldo antes de ejecutar la compra
                 if usdt_balance >= trade_amount * current_price:
                     execute_order_buy(symbol, trade_amount, confidence, explanation)
                 else:
                     print(f"⚠️ Saldo insuficiente para comprar {symbol}. Saldo disponible: {usdt_balance} USDT.")
-
             else:
                 print(f"↔️ No se realiza ninguna acción para {symbol} (mantener).")
 
             time.sleep(1)
 
         except Exception as e:
-            print(f"Error procesando {symbol}: {e}")
+            print(f"❌ Error procesando {symbol}: {e}")
             continue
 
-    # Analizar portafolio para venta
+    # Analizar portafolio para ventas
     portfolio_cryptos = get_portfolio_cryptos()
-    print(f"Criptos en portafolio para analizar venta: {portfolio_cryptos}")
+    print(f"📊 Criptos en portafolio para analizar venta: {portfolio_cryptos}")
 
     for symbol in portfolio_cryptos:
         try:
-            # Asegurarse de usar el formato correcto de símbolo (por ejemplo, BTC/USDT)
+            # Usar formato de símbolo correcto (e.g., BTC/USDT)
             market_symbol = f"{symbol}/USDT"
 
-            # Obtener datos históricos de múltiples marcos temporales
-            data_by_timeframe = fetch_and_prepare_data(market_symbol)
+            # Obtener datos históricos y series
+            data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(market_symbol)
 
-            if not data_by_timeframe:
+            if not data_by_timeframe or volume_series is None or price_series is None:
                 print(f"⚠️ Datos insuficientes para {market_symbol}.")
                 continue
 
-            # Primera etapa: preparar texto con GPT-3.5 Turbo
-            prepared_text = gpt_prepare_data(data_by_timeframe)
+            # Preparar texto para venta
+            prepared_text = gpt_prepare_data(data_by_timeframe, additional_data)
 
-            # Segunda etapa: análisis final con GPT-4 Turbo
+            # Analizar la decisión
             action, confidence, explanation = gpt_decision(prepared_text)
 
+            # Decidir acción de venta
             if action == "vender":
                 crypto_balance = exchange.fetch_balance()['free'].get(symbol, 0)
                 if crypto_balance > 0:
@@ -491,9 +573,10 @@ def demo_trading():
             time.sleep(1)
 
         except Exception as e:
-            print(f"Error procesando {symbol}: {e}")
+            print(f"❌ Error procesando {symbol}: {e}")
             continue
 
+    # Mostrar resultados finales
     print("\n--- Resultados finales ---")
     print(f"Portafolio final: {exchange.fetch_balance()['free']}")
 
