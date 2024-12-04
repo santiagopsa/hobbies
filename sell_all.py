@@ -39,6 +39,17 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 TRADE_SIZE = 100
 TRANSACTION_LOG = []
 
+# Calcular monto dinámico basado en confianza
+def calculate_trade_amount(confidence):
+    """
+    Calcula el monto en USD basado en la confianza (entre 0 y 1).
+    Retorna un valor entre 1 y 10 USD.
+    """
+    min_amount = 1  # Mínimo en dólares
+    max_amount = 10  # Máximo en dólares
+    trade_amount = min_amount + (max_amount - min_amount) * confidence
+    return round(trade_amount, 2)  # Redondear a 2 decimales
+
 def get_portfolio_cryptos():
     """
     Obtiene las criptos del portafolio con saldo mayor a 0.
@@ -104,17 +115,17 @@ def fetch_and_prepare_data(symbol):
 def gpt_decision(data):
     """
     Utiliza GPT para analizar los datos de mercado y decidir si comprar, vender o mantener,
-    devolviendo la acción y la explicación por separado.
+    devolviendo la acción, la confianza y la explicación por separado.
     """
     datos = data.tail(10).to_string(index=False)
     prompt = f"""
     Eres un experto en trading. Basándote en los siguientes datos de mercado, decide si comprar, vender o mantener.
-    Proporciona una breve explicación de tu decisión.
+    Proporciona una breve explicación de tu decisión y una puntuación de confianza entre 0 (muy baja) y 1 (muy alta).
 
     Datos:
     {datos}
 
-    Inicia tu respuesta con: "comprar", "vender" o "mantener" seguido de la explicación.
+    Inicia tu respuesta con: "comprar", "vender" o "mantener", seguido de la puntuación de confianza y la explicación.
     """
 
     response = client.chat.completions.create(
@@ -128,14 +139,37 @@ def gpt_decision(data):
 
     message = response.choices[0].message.content.strip()
 
-    if message.lower().startswith('comprar'):
-        return "comprar", message[7:].strip()
-    elif message.lower().startswith('vender'):
-        return "vender", message[6:].strip()
-    elif message.lower().startswith('mantener'):
-        return "mantener", message[8:].strip()
-    else:
-        return "mantener", "No hay una recomendación clara."
+    # Analizar respuesta de GPT
+    try:
+        parts = message.split(",")
+        action = parts[0].strip().lower()  # "comprar", "vender" o "mantener"
+        confidence = float(parts[1].strip())  # Confianza como número entre 0 y 1
+        explanation = ",".join(parts[2:]).strip()  # Explicación restante
+    except Exception as e:
+        print(f"⚠️ Error procesando respuesta de GPT: {e}")
+        action, confidence, explanation = "mantener", 0, "Respuesta no válida."
+
+    return action, confidence, explanation
+
+# Ejecutar orden de compra con monto dinámico
+def execute_order_buy(symbol, amount_in_usd):
+    """
+    Ejecuta una orden de compra utilizando el monto en USD calculado dinámicamente.
+    """
+    try:
+        # Obtener precio actual para calcular la cantidad
+        ticker = exchange.fetch_ticker(symbol)
+        price = ticker['last']
+        amount = amount_in_usd / price  # Calcular cantidad de cripto a comprar
+
+        # Ejecutar la orden
+        order = exchange.create_market_buy_order(symbol, amount)
+        log_transaction(order)  # Registrar la orden en el CSV
+        print(f"✅ Orden de compra ejecutada: {symbol}, Monto: {amount_in_usd} USD, Cantidad: {amount:.8f}")
+        return order
+    except Exception as e:
+        print(f"❌ Error al ejecutar la orden de compra para {symbol}: {e}")
+        return None
 
 # Ejecutar orden de compra
 def execute_order_buy(symbol, amount):
@@ -168,32 +202,45 @@ def execute_order_sell(symbol, amount):
         return None
 
 
-# Función principal
+
+# Función principal ajustada
 def demo_trading():
     print("Iniciando demo de inversión...")
 
-    # Analizar portafolio para venta
-    portfolio_cryptos = get_portfolio_cryptos()
-    print(f"Criptos en portafolio para analizar venta: {portfolio_cryptos}")
+    # Elegir las mejores criptos
+    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=10)
+    print(f"Criptos seleccionadas para trading: {selected_cryptos}")
 
-    for symbol in portfolio_cryptos:
+    for symbol in selected_cryptos:
         try:
-            # Asegurarse de usar el formato correcto de símbolo (por ejemplo, BTC/USDT)
-            market_symbol = f"{symbol}/USDT"
-
-            df = fetch_and_prepare_data(market_symbol)
+            df = fetch_and_prepare_data(symbol)
             if df is None or df.empty:
-                print(f"⚠️ Datos insuficientes para {market_symbol}.")
+                print(f"⚠️ Datos insuficientes para {symbol}.")
                 continue
 
             current_price = df['close'].iloc[-1]
-            action, explanation = gpt_decision(df)
+            action, confidence, explanation = gpt_decision(df)
 
-            crypto_balance = exchange.fetch_balance()['free'].get(symbol, 0)
-            if crypto_balance > 0:
-                execute_order_sell(market_symbol, crypto_balance)
+            if action == "comprar":
+                # Calcular monto dinámico en USD basado en confianza
+                trade_amount_in_usd = calculate_trade_amount(confidence)
+
+                # Verificar saldo disponible
+                usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
+                if usdt_balance >= trade_amount_in_usd:
+                    execute_order_buy(symbol, trade_amount_in_usd)
+                else:
+                    print(f"⚠️ Saldo insuficiente para comprar {symbol}. Saldo disponible: {usdt_balance} USDT.")
+
+            elif action == "vender":
+                crypto_balance = exchange.fetch_balance()['free'].get(symbol.split('/')[0], 0)
+                if crypto_balance > 0:
+                    execute_order_sell(symbol, crypto_balance)
+                else:
+                    print(f"⚠️ No tienes suficiente {symbol.split('/')[0]} para vender.")
+
             else:
-                print(f"⚠️ No tienes suficiente {symbol} para vender.")
+                print(f"↔️ No se realiza ninguna acción para {symbol} (mantener).")
 
             time.sleep(1)
 

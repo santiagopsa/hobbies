@@ -4,5 +4,4 @@ openai
 python-dotenv
 flask
 gunicorn
-celery
-redis
+sqlite3

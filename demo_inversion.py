@@ -6,6 +6,11 @@ from elegir_cripto import choose_best_cryptos  # Importar la función de selecci
 from dotenv import load_dotenv
 import os
 import csv
+from db_manager import initialize_db, insert_transaction, fetch_all_transactions, upgrade_db_schema
+
+initialize_db()
+upgrade_db_schema()
+
 
 if os.getenv("HEROKU") is None:
     load_dotenv()
@@ -36,7 +41,7 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Variables globales
-TRADE_SIZE = 100
+TRADE_SIZE = 20
 TRANSACTION_LOG = []
 
 def get_portfolio_cryptos():
@@ -87,85 +92,312 @@ def log_transaction(order):
         print(f"❌ Error al registrar la orden en el archivo: {e}")
     
 
-# Función para obtener y procesar datos
 def fetch_and_prepare_data(symbol):
     """
-    Obtiene datos históricos en diferentes marcos temporales.
+    Obtiene datos históricos en múltiples marcos temporales y calcula indicadores técnicos.
     """
     try:
-        ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
-        df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        return df_1h
+        # Definir marcos temporales y cantidad de datos a obtener
+        timeframes = ['1h', '4h', '1d']  # Horas, 4 horas, días
+        data = {}
+
+        # Obtener datos para cada marco temporal
+        for timeframe in timeframes:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=50)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+
+            # Calcular indicadores técnicos
+            df['MA_20'] = df['close'].rolling(window=20).mean()  # Media móvil de 20 periodos
+            df['MA_50'] = df['close'].rolling(window=50).mean()  # Media móvil de 50 periodos
+            df['RSI'] = calculate_rsi(df['close'])  # Índice de Fuerza Relativa
+            df['BB_upper'], df['BB_middle'], df['BB_lower'] = calculate_bollinger_bands(df['close'])  # Bandas de Bollinger
+
+            data[timeframe] = df  # Almacenar datos por marco temporal
+
+        return data  # Devuelve un diccionario con los datos de cada marco temporal
+
     except Exception as e:
         print(f"Error al obtener datos para {symbol}: {e}")
         return None
 
+# Función para calcular el RSI
+def calculate_rsi(series, period=14):
+    """
+    Calcula el Índice de Fuerza Relativa (RSI).
+    """
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+# Función para calcular Bandas de Bollinger
+def calculate_bollinger_bands(series, window=20, num_std_dev=2):
+    """
+    Calcula las Bandas de Bollinger.
+    """
+    rolling_mean = series.rolling(window=window).mean()
+    rolling_std = series.rolling(window=window).std()
+    upper_band = rolling_mean + (rolling_std * num_std_dev)
+    lower_band = rolling_mean - (rolling_std * num_std_dev)
+    return upper_band, rolling_mean, lower_band
+
 # Decisión de trading con GPT
-def gpt_decision(data):
+def gpt_prepare_data(data_by_timeframe):
     """
-    Utiliza GPT para analizar los datos de mercado y decidir si comprar, vender o mantener,
-    devolviendo la acción y la explicación por separado.
+    Usa GPT-3.5 Turbo para preparar el texto estructurado basado en los datos de mercado.
     """
-    datos = data.tail(10).to_string(index=False)
+    combined_data = ""
+    for timeframe, df in data_by_timeframe.items():
+        if df is not None and not df.empty:
+            combined_data += f"\nDatos de {timeframe}:\n"
+            combined_data += df.tail(5).to_string(index=False)
+
     prompt = f"""
-    Eres un experto en trading. Basándote en los siguientes datos de mercado, decide si comprar, vender o mantener.
-    Proporciona una breve explicación de tu decisión.
+    Basándote en los datos de mercado en múltiples marcos temporales, organiza esta información en un texto estructurado.
+    El texto debe incluir los indicadores clave (RSI, Bandas de Bollinger, Medias Móviles) y patrones identificados.
 
     Datos:
-    {datos}
+    {combined_data}
 
-    Inicia tu respuesta con: "comprar", "vender" o "mantener" seguido de la explicación.
+    Proporciona una salida que pueda ser procesada por GPT-4 Turbo para decidir comprar, vender o mantener.
     """
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "Eres un experto en análisis de datos financieros."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.5
+    )
 
+    return response.choices[0].message.content.strip()
+
+
+def gpt_decision(prepared_text):
+    """
+    Usa GPT-4 Turbo para analizar el texto preparado y decidir si comprar, vender o mantener.
+    """
+    prompt = f"""
+    Eres un experto en trading. Basándote en el siguiente texto estructurado, decide si comprar, vender o mantener.
+
+    Texto:
+    {prepared_text}
+
+    Inicia tu respuesta con: "comprar", "vender" o "mantener". Incluye un resumen de la decisión y un porcentaje de confianza.
+    """
     response = client.chat.completions.create(
         model="gpt-4-turbo",
         messages=[
             {"role": "system", "content": "Eres un experto en trading."},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.7
+        temperature=0.5
     )
 
     message = response.choices[0].message.content.strip()
 
     if message.lower().startswith('comprar'):
-        return "comprar", message[7:].strip()
+        action = "comprar"
+        confidence = extract_confidence(message)
+        explanation = message[7:].strip()
     elif message.lower().startswith('vender'):
-        return "vender", message[6:].strip()
+        action = "vender"
+        confidence = extract_confidence(message)
+        explanation = message[6:].strip()
     elif message.lower().startswith('mantener'):
-        return "mantener", message[8:].strip()
+        action = "mantener"
+        confidence = extract_confidence(message)
+        explanation = message[8:].strip()
     else:
-        return "mantener", "No hay una recomendación clara."
+        action = "mantener"
+        confidence = 50  # Valor predeterminado
+        explanation = "No hay una recomendación clara."
 
-# Ejecutar orden de compra
-def execute_order_buy(symbol, amount):
+    return action, confidence, explanation
+
+
+def extract_confidence(message):
     """
-    Ejecuta una orden de compra y registra la transacción en un archivo CSV.
+    Extrae el porcentaje de confianza de la respuesta.
+    """
+    import re
+    match = re.search(r'(\d+)%', message)
+    if match:
+        return int(match.group(1))
+    return 50  # Valor predeterminado si no se encuentra un porcentaje
+
+def is_valid_notional(symbol, amount):
+    """
+    Verifica si el valor notional cumple con los requisitos mínimos de Binance.
     """
     try:
+        # Cargar los datos del mercado para el símbolo
+        markets = exchange.load_markets()
+        market = markets.get(symbol)
+
+        # Obtener el precio actual del símbolo
+        ticker = exchange.fetch_ticker(symbol)
+        current_price = ticker['last']  # Último precio del par
+
+        # Calcular el valor notional
+        notional = current_price * amount
+
+        # Obtener el valor mínimo de notional desde el mercado
+        if market and 'limits' in market and 'cost' in market['limits']:
+            min_notional = market['limits']['cost']['min']
+        else:
+            min_notional = 10  # Valor mínimo genérico si no está definido
+
+        print(f"🔍 Verificación para {symbol}:")
+        print(f"    Precio actual: {current_price} USDT")
+        print(f"    Cantidad: {amount}")
+        print(f"    Valor notional: {notional} USDT")
+        print(f"    Mínimo permitido: {min_notional} USDT")
+
+        # Validar si el notional cumple con el requisito
+        is_valid = notional >= min_notional
+        if not is_valid:
+            print(f"⚠️ El valor notional para {symbol} es {notional:.2f} USDT, menor al mínimo permitido de {min_notional:.2f} USDT.")
+        return is_valid
+    except Exception as e:
+        print(f"❌ Error al verificar el valor notional para {symbol}: {e}")
+        return False
+
+
+# Ejecutar orden de compra
+def execute_order_buy(symbol, amount, confidence, explanation):
+    """
+    Ejecuta una orden de compra y registra la transacción en la base de datos.
+    """
+    try:
+        # Validar el notional antes de ejecutar la orden
+        if not is_valid_notional(symbol, amount):
+            print(f"⚠️ Orden de compra para {symbol} no válida debido al valor notional.")
+            return None
+
+        # Ejecutar la orden de compra
         order = exchange.create_market_buy_order(symbol, amount)
-        print(f"Debug: Orden devuelta por el exchange: {order}")  # Ver contenido del objeto
-        log_transaction(order)  # Registrar la orden en el CSV
-        print(f"✅ Orden de compra ejecutada: {symbol}")
+        price = order["price"] or 0
+        timestamp = pd.Timestamp.now().isoformat()
+
+        # Registrar en la base de datos
+        insert_transaction(
+            symbol=symbol,
+            action="buy",
+            price=price,
+            amount=amount,
+            timestamp=timestamp,
+            profit_loss=None,
+            confidence_percentage=confidence,
+            summary=explanation
+        )
+
+        print(f"✅ Orden de compra ejecutada: {symbol}, Precio: {price}, Cantidad: {amount}")
         return order
     except Exception as e:
         print(f"❌ Error al ejecutar la orden de compra para {symbol}: {e}")
         return None
 
-# Ejecutar orden de venta
-def execute_order_sell(symbol, amount):
+def execute_order_sell(symbol, confidence, explanation):
     """
-    Ejecuta una orden de venta y registra la transacción en un archivo CSV.
+    Ejecuta una orden de venta y registra la transacción en la base de datos.
     """
     try:
+        # Obtener el saldo disponible
+        balance = exchange.fetch_balance()
+        amount = balance['free'].get(symbol.split('/')[0], 0)
+
+        if amount <= 0:
+            print(f"⚠️ No tienes suficiente saldo para vender {symbol}.")
+            return None
+
+        # Validar el notional
+        if not is_valid_notional(symbol, amount):
+            print(f"⚠️ Orden de venta para {symbol} no válida debido al valor notional mínimo.")
+            return None
+
+        # Ejecutar la orden de venta
         order = exchange.create_market_sell_order(symbol, amount)
-        print(f"Debug: Orden devuelta por el exchange: {order}")  # Ver contenido del objeto
-        log_transaction(order)  # Registrar la orden en el CSV
-        print(f"✅ Orden de venta ejecutada: {symbol}")
+
+        # Obtener el precio actual si no está en la orden
+        ticker = exchange.fetch_ticker(symbol)
+        price = order.get("price") or ticker["last"]
+        timestamp = pd.Timestamp.now().isoformat()
+
+        # Recuperar todas las compras del símbolo
+        transactions = fetch_all_transactions()
+        buys = [t for t in transactions if t[1] == symbol and t[2] == "buy"]
+
+        # Calcular el precio promedio de compra
+        if buys:
+            total_cost = sum(buy[3] * buy[4] for buy in buys)  # Precio * Cantidad
+            total_amount = sum(buy[4] for buy in buys)  # Suma de cantidades
+            average_price = total_cost / total_amount
+        else:
+            average_price = 0
+
+        # Calcular ganancia/pérdida
+        profit_loss = (price - average_price) * amount
+
+        # Registrar en la base de datos
+        insert_transaction(
+            symbol=symbol,
+            action="sell",
+            price=price,
+            amount=amount,
+            timestamp=timestamp,
+            profit_loss=profit_loss,
+            confidence_percentage=confidence,
+            summary=explanation
+        )
+
+        print(f"✅ Orden de venta ejecutada: {symbol}, Precio: {price}, Cantidad: {amount}, Ganancia/Pérdida: {profit_loss}")
         return order
     except Exception as e:
         print(f"❌ Error al ejecutar la orden de venta para {symbol}: {e}")
         return None
+
+
+def show_transactions():
+    transactions = fetch_all_transactions()
+    print("Historial de transacciones:")
+    for t in transactions:
+        print(f"ID: {t[0]}, Symbol: {t[1]}, Action: {t[2]}, Price: {t[3]}, Amount: {t[4]}, Timestamp: {t[5]}, Profit/Loss: {t[6]}, Confidence %: {t[7]}, Summary: {t[8]}")
+
+def calculate_trade_amount(symbol, current_price, confidence, trade_size, min_notional):
+    """
+    Calcula la cantidad a negociar basada en el precio actual, la confianza, el tamaño máximo permitido y el notional mínimo.
+
+    Args:
+        symbol (str): El par de criptomonedas (e.g., BTC/USDT).
+        current_price (float): El precio actual de la criptomoneda.
+        confidence (float): El porcentaje de confianza de la decisión.
+        trade_size (float): El tamaño máximo del trade en USD.
+        min_notional (float): El valor notional mínimo permitido por el exchange.
+
+    Returns:
+        float: La cantidad de criptomoneda a negociar.
+    """
+    # Calcular el valor notional basado en la confianza
+    desired_notional = trade_size * (confidence / 100)
+
+    # Ajustar el notional si está por debajo del mínimo permitido
+    if desired_notional < min_notional and confidence > 80:
+        print(f"⚠️ Ajustando el trade a cumplir con el notional mínimo para {symbol}.")
+        desired_notional = min_notional
+
+    # Calcular la cantidad en criptomoneda basada en el notional final
+    trade_amount = desired_notional / current_price
+
+    # Garantizar que la cantidad esté dentro de los límites
+    max_trade_amount = trade_size / current_price
+    trade_amount = min(trade_amount, max_trade_amount)
+
+    return trade_amount
 
 
 # Función principal
@@ -179,21 +411,42 @@ def demo_trading():
     # Realizar análisis para compra
     for symbol in selected_cryptos:
         try:
-            df = fetch_and_prepare_data(symbol)
-            if df is None or df.empty:
+            # Obtener datos históricos de múltiples marcos temporales
+            data_by_timeframe = fetch_and_prepare_data(symbol)
+
+            if not data_by_timeframe:
                 print(f"⚠️ Datos insuficientes para {symbol}.")
                 continue
 
-            current_price = df['close'].iloc[-1]
-            action, explanation = gpt_decision(df)
+            # Primera etapa: preparar texto con GPT-3.5 Turbo
+            prepared_text = gpt_prepare_data(data_by_timeframe)
 
+            # Segunda etapa: análisis final con GPT-4 Turbo
+            action, confidence, explanation = gpt_decision(prepared_text)
+
+            # Dentro de demo_trading(), durante una decisión de compra:
             if action == "comprar":
                 usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
-                trade_amount = TRADE_SIZE / current_price
-                if usdt_balance >= TRADE_SIZE:
-                    execute_order_buy(symbol, trade_amount)
+                current_price = data_by_timeframe["1h"]['close'].iloc[-1]
+                market_info = exchange.load_markets().get(symbol)
+                min_notional = market_info['limits']['cost']['min'] if market_info else 10  # Default to 10 if notional not available
+
+                trade_amount = calculate_trade_amount(
+                    symbol=symbol,
+                    current_price=current_price,
+                    confidence=confidence,
+                    trade_size=TRADE_SIZE,
+                    min_notional=min_notional
+                )
+
+                print(trade_amount)
+
+                # Verificar si el saldo es suficiente para ejecutar la compra
+                if usdt_balance >= trade_amount * current_price:
+                    execute_order_buy(symbol, trade_amount, confidence, explanation)
                 else:
                     print(f"⚠️ Saldo insuficiente para comprar {symbol}. Saldo disponible: {usdt_balance} USDT.")
+
             else:
                 print(f"↔️ No se realiza ninguna acción para {symbol} (mantener).")
 
@@ -212,18 +465,23 @@ def demo_trading():
             # Asegurarse de usar el formato correcto de símbolo (por ejemplo, BTC/USDT)
             market_symbol = f"{symbol}/USDT"
 
-            df = fetch_and_prepare_data(market_symbol)
-            if df is None or df.empty:
+            # Obtener datos históricos de múltiples marcos temporales
+            data_by_timeframe = fetch_and_prepare_data(market_symbol)
+
+            if not data_by_timeframe:
                 print(f"⚠️ Datos insuficientes para {market_symbol}.")
                 continue
 
-            current_price = df['close'].iloc[-1]
-            action, explanation = gpt_decision(df)
+            # Primera etapa: preparar texto con GPT-3.5 Turbo
+            prepared_text = gpt_prepare_data(data_by_timeframe)
+
+            # Segunda etapa: análisis final con GPT-4 Turbo
+            action, confidence, explanation = gpt_decision(prepared_text)
 
             if action == "vender":
                 crypto_balance = exchange.fetch_balance()['free'].get(symbol, 0)
                 if crypto_balance > 0:
-                    execute_order_sell(market_symbol, crypto_balance)
+                    execute_order_sell(market_symbol, confidence, explanation)
                 else:
                     print(f"⚠️ No tienes suficiente {symbol} para vender.")
             else:
@@ -241,3 +499,4 @@ def demo_trading():
 # Ejecutar demo
 if __name__ == "__main__":
     demo_trading()
+    show_transactions()
