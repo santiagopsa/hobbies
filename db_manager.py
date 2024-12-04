@@ -70,3 +70,6 @@ def upgrade_db_schema():
 
     conn.commit()
     conn.close()
+
+if __name__ == "__main__":
+    print(fetch_all_transactions())

@@ -19,6 +19,7 @@ if os.getenv("HEROKU") is None:
 exchange = ccxt.binance({
     "enableRateLimit": True
 })
+
 exchange.apiKey = os.getenv("BINANCE_API_KEY_TESTNET")
 exchange.secret = os.getenv("BINANCE_SECRET_KEY_TESTNET")
 
