@@ -31,9 +31,9 @@ exchange.secret = os.getenv("BINANCE_SECRET_KEY_REAL")
 try:
     print("Conectando a Binance REAL...")
     balance = exchange.fetch_balance()
-    print("Conexión exitosa. Balance:", balance)
+    #print("Conexión exitosa. Balance:", balance)
 except Exception as e:
-    print("Error al conectar con Binance Testnet:", e)
+    print("Error al conectar con Binance:", e)
 
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -43,7 +43,7 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Variables globales
-TRADE_SIZE = 5
+TRADE_SIZE = 10
 TRANSACTION_LOG = []
 
 def calculate_macd(series, short_window=12, long_window=26, signal_window=9):
@@ -194,7 +194,6 @@ def calculate_bollinger_bands(series, window=20, num_std_dev=2):
     return upper_band, rolling_mean, lower_band
 
 # Decisión de trading con GPT
-# Decisión de trading con GPT
 def gpt_prepare_data(data_by_timeframe, additional_data):
     """
     Usa GPT-3.5 Turbo para preparar un resumen estructurado basado en datos de mercado e indicadores adicionales.
@@ -225,9 +224,9 @@ def gpt_prepare_data(data_by_timeframe, additional_data):
     - Desviación estándar del precio: {additional_data.get('price_std_dev', 'No disponible')}
 
     Proporciona:
-    1. Un análisis breve de los patrones identificados en los datos técnicos (tendencias, rangos, volatilidad).
-    2. Una evaluación del contexto basado en las métricas adicionales (volumen, market cap, etc.).
-    3. Información que pueda ser procesada eficientemente por un sistema avanzado para decidir si comprar, vender o mantener.
+    1. Un análisis breve resumido pero completo de los patrones identificados en los datos técnicos (tendencias, rangos, volatilidad).
+    2. Una evaluación resumida de las variables mas importantes con el contexto basado en las métricas adicionales (volumen, market cap, etc.).
+    3. Información resumida que pueda ser procesada eficientemente por un sistema avanzado para decidir si comprar, vender o mantener.
     """
     response = client.chat.completions.create(
         model="gpt-3.5-turbo",
@@ -251,7 +250,7 @@ def gpt_decision(prepared_text):
     Texto:
     {prepared_text}
 
-    Inicia tu respuesta con: "comprar", "vender" o "mantener". Incluye un resumen de la decisión y un porcentaje de confianza.
+    Inicia tu respuesta con: "comprar", "vender" o "mantener". Incluye un resumen extremadamente corto de la decisión y un porcentaje de confianza.
     """
     response = client.chat.completions.create(
         model="gpt-4-turbo",
@@ -472,9 +471,81 @@ def fetch_avg_volume_24h(volume_series):
         return None
     return volume_series.tail(24).mean()
 
+def identify_candlestick_patterns(df):
+    """
+    Identifica patrones básicos de velas japonesas.
+    """
+    last_candle = df.iloc[-1]
+    body = abs(last_candle['close'] - last_candle['open'])
+    upper_shadow = last_candle['high'] - max(last_candle['close'], last_candle['open'])
+    lower_shadow = min(last_candle['close'], last_candle['open']) - last_candle['low']
+
+    if lower_shadow > body * 2 and upper_shadow < body:
+        return "hammer"  # Martillo
+    elif upper_shadow > body * 2 and lower_shadow < body:
+        return "shooting_star"  # Estrella fugaz
+    else:
+        return "none"
+
+def calculate_market_depth(symbol, depth=10):
+    """
+    Calcula la profundidad del mercado basado en las 10 mejores órdenes de compra y venta.
+    """
+    try:
+        order_book = exchange.fetch_order_book(symbol)
+        total_bids = sum([bid[1] for bid in order_book['bids'][:depth]])  # Volumen total en bids
+        total_asks = sum([ask[1] for ask in order_book['asks'][:depth]])  # Volumen total en asks
+        return {"total_bids": total_bids, "total_asks": total_asks}
+    except Exception as e:
+        print(f"Error al calcular la profundidad del mercado para {symbol}: {e}")
+        return {"total_bids": None, "total_asks": None}
+
+def calculate_support_resistance(price_series, period=14):
+    """
+    Calcula niveles de soporte y resistencia basado en máximos y mínimos locales.
+    """
+    rolling_max = price_series.rolling(window=period).max()
+    rolling_min = price_series.rolling(window=period).min()
+
+    support = rolling_min.iloc[-1]
+    resistance = rolling_max.iloc[-1]
+    return support, resistance
+
+def calculate_correlation_with_btc(symbol_price_series, btc_price_series):
+    """
+    Calcula la correlación entre el precio de una cripto y BTC.
+    """
+    if len(symbol_price_series) != len(btc_price_series):
+        print("⚠️ Las series de precios tienen tamaños diferentes.")
+        return None
+
+    correlation = symbol_price_series.corr(btc_price_series)
+    return correlation
+
+def calculate_adx(df, period=14):
+    """
+    Calcula el Índice Direccional Promedio (ADX) usando los datos OHLC.
+    """
+    high = df['high']
+    low = df['low']
+    close = df['close']
+
+    plus_dm = high.diff().clip(lower=0)
+    minus_dm = low.diff().clip(upper=0).abs()
+
+    atr = (plus_dm + minus_dm).rolling(window=period).mean()
+
+    plus_di = (plus_dm / atr) * 100
+    minus_di = (minus_dm / atr) * 100
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di)) * 100
+
+    adx = dx.rolling(window=period).mean()
+    return adx.iloc[-1]  # Último valor del ADX
+
+
 # Función principal
 def demo_trading():
-    print("Iniciando demo de inversión...")
+    print("Iniciando proceso de inversión...")
 
     # Elegir las mejores criptos para compra
     selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=10)
@@ -485,6 +556,17 @@ def demo_trading():
         try:
             # Obtener datos históricos de múltiples marcos temporales y las series
             data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(symbol)
+
+            support, resistance = calculate_support_resistance(price_series)
+
+            market_depth = calculate_market_depth(symbol)
+
+            candlestick_pattern = identify_candlestick_patterns(data_by_timeframe["1h"])
+
+            adx = calculate_adx(data_by_timeframe["1h"])
+
+            btc_series = fetch_and_prepare_data("BTC/USDT")[2]
+            correlation_with_btc = calculate_correlation_with_btc(price_series, btc_series)
 
             # Validar datos obtenidos
             if not data_by_timeframe or volume_series is None or price_series is None:
@@ -499,6 +581,13 @@ def demo_trading():
                 "spread": calculate_spread(symbol),
                 "fear_greed": fetch_fear_greed_index(),
                 "price_std_dev": calculate_price_std_dev(price_series),
+                "adx": adx,
+                "correlation_with_btc": correlation_with_btc,
+                "support": support,
+                "resistance": resistance,
+                "market_depth_bids": market_depth["total_bids"],
+                "market_depth_asks": market_depth["total_asks"],
+                "candlestick_pattern": candlestick_pattern,
             }
 
             # Preparar texto con GPT-3.5 Turbo
@@ -577,8 +666,8 @@ def demo_trading():
             continue
 
     # Mostrar resultados finales
-    print("\n--- Resultados finales ---")
-    print(f"Portafolio final: {exchange.fetch_balance()['free']}")
+    #print("\n--- Resultados finales ---")
+    #print(f"Portafolio final: {exchange.fetch_balance()['free']}")
 
 # Ejecutar demo
 if __name__ == "__main__":

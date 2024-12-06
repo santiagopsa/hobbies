@@ -1,6 +1,5 @@
 import time
 import datetime
-from threading import Timer
 import ccxt
 import os
 
@@ -12,8 +11,8 @@ exchange = ccxt.binance({
 })
 
 # Definir variables globales
-THRESHOLD_VOLUME_CHANGE = 0.2  # Porcentaje de cambio en el volumen (20%)
-INTERVAL_SECONDS = 3600  # Intervalo por defecto: 1 hora
+THRESHOLD_VOLUME_CHANGE = 0.1  # Porcentaje de cambio en el volumen (10%)
+INTERVAL_SECONDS = 3600  # Intervalo por defecto: una hora
 last_volumes = {}
 
 def fetch_volume(symbol):
@@ -64,30 +63,35 @@ def monitor_and_run():
     """
     global INTERVAL_SECONDS
     symbols = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "ADA/USDT"]  # Ajusta según tus criptos
-    execute_now = False
 
-    # Ejecutar inmediatamente al iniciar
-    print("🔄 Ejecutando inmediatamente en el inicio...")
-    run_trading()
+    while True:
+        try:
+            execute_now = False
 
-    for symbol in symbols:
-        current_volume = fetch_volume(symbol)
-        if current_volume is None:
-            continue
+            # Ejecutar monitoreo
+            for symbol in symbols:
+                current_volume = fetch_volume(symbol)
+                if current_volume is None:
+                    continue
 
-        if significant_volume_change(symbol, current_volume):
-            print(f"⚠️ Cambio significativo detectado en {symbol}. Ejecutando ahora.")
-            execute_now = True
+                if significant_volume_change(symbol, current_volume):
+                    print(f"⚠️ Cambio significativo detectado en {symbol}. Ejecutando ahora.")
+                    execute_now = True
 
-    if execute_now:
-        run_trading()
-    else:
-        print(f"⏳ Esperando el siguiente intervalo de {INTERVAL_SECONDS} segundos.")
+            if execute_now:
+                run_trading()
+            else:
+                print(f"⏳ Esperando el siguiente intervalo de {INTERVAL_SECONDS} segundos.")
 
-    # Configurar el siguiente monitoreo
-    Timer(INTERVAL_SECONDS, monitor_and_run).start()
+            # Esperar el siguiente intervalo
+            time.sleep(INTERVAL_SECONDS)
+
+        except KeyboardInterrupt:
+            print("\n❌ Monitoreo detenido por el usuario.")
+            break
+        except Exception as e:
+            print(f"❌ Error durante el monitoreo: {e}")
 
 if __name__ == "__main__":
     print("Iniciando monitoreo de trading...")
     monitor_and_run()
-

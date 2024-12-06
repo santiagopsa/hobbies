@@ -31,21 +31,40 @@ def initialize_db():
 
 def insert_transaction(symbol, action, price, amount, timestamp, profit_loss=None, confidence_percentage=None, summary=None):
     """
-    Inserta una nueva transacción en la base de datos.
+    Inserta una nueva transacción en la base de datos con reintentos en caso de bloqueo.
     """
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO transactions (symbol, action, price, amount, timestamp, profit_loss, confidence_percentage, summary)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (symbol, action, price, amount, timestamp, profit_loss, confidence_percentage, summary))
-        conn.commit()
-    except sqlite3.Error as e:
-        print(f"❌ Error al insertar la transacción: {e}")
-    finally:
-        conn.close()
+    max_retries = 5
+    retry_delay = 2  # Segundos entre reintentos
+    attempt = 0
 
+    while attempt < max_retries:
+        try:
+            conn = sqlite3.connect(DB_NAME, timeout=10)  # Añadimos un timeout
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO transactions (symbol, action, price, amount, timestamp, profit_loss, confidence_percentage, summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (symbol, action, price, amount, timestamp, profit_loss, confidence_percentage, summary))
+            conn.commit()
+            print(f"✅ Transacción insertada: {symbol}, {action}, {amount}")
+            break
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e):
+                attempt += 1
+                print(f"⚠️ La base de datos está bloqueada. Intentando nuevamente ({attempt}/{max_retries})...")
+                time.sleep(retry_delay)  # Esperar antes de reintentar
+            else:
+                print(f"❌ Error al insertar la transacción: {e}")
+                break
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    else:
+        print("❌ No se pudo insertar la transacción después de varios intentos.")
+
+        
 def fetch_all_transactions():
     """
     Recupera todas las transacciones almacenadas.
