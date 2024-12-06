@@ -116,7 +116,7 @@ def significant_volume_change(symbol, current_volume, last_conditions):
         last_conditions[symbol] = {}
     last_conditions[symbol]["volume"] = current_volume
 
-    print(f"⚠️ Cambio significativo detectado en el volumen de {symbol}.")
+    print(f"⚠️ Cambio significativo detectado en el volumen de {symbol}, entrando al proceso de trading......")
     return True
 
 # Función para obtener precios actuales
@@ -160,11 +160,13 @@ def monitor_and_run():
     run_trading()
 
     while True:
+        print("Esperando 20 minutos para revisión de niveles para definir si se adelanta la siguiente operación")
         time.sleep(1200)  # Espera 20 minutos antes de la próxima evaluación
         try:
             execute_now = False
+            print(f"🔍 Monitoreando Simbolos para definir si entrar trading")
             for symbol, binance_symbol in zip(symbols, binance_symbols):
-                print(f"🔍 Monitoreando {symbol}")
+                
 
                 # Obtener precios y volúmenes actuales
                 current_price = fetch_price(binance_symbol)
