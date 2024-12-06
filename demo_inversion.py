@@ -180,7 +180,7 @@ def gpt_prepare_data(data_by_timeframe):
 
 def gpt_decision(prepared_text):
     """
-    Usa GPT-4 Turbo para analizar el texto preparado y decidir si comprar, vender o mantener.
+    Usa GPT-4 para analizar el texto preparado y decidir si comprar, vender o mantener.
     """
     prompt = f"""
     Eres un experto en trading. Basándote en el siguiente texto estructurado, decide si comprar, vender o mantener.
@@ -188,37 +188,43 @@ def gpt_decision(prepared_text):
     Texto:
     {prepared_text}
 
-    Inicia tu respuesta con: "comprar", "vender" o "mantener". Incluye un resumen de la decisión y un porcentaje de confianza.
+    Responde exclusivamente:
+    - "comprar", "vender" o "mantener" al inicio de la respuesta.
+    - Incluye un porcentaje de confianza (e.g., 80%).
+    - Justifica muy brevemente la decisión.
     """
+
     response = client.chat.completions.create(
         model="gpt-4-turbo",
         messages=[
-            {"role": "system", "content": "Eres un experto en trading."},
+            {"role": "system", "content": "Eres un asesor financiero experto en trading."},
             {"role": "user", "content": prompt}
         ],
         temperature=0.5
     )
 
+    # Validar y extraer acción/confianza
     message = response.choices[0].message.content.strip()
+    action, confidence = "mantener", 50
+    explanation = "No hay una recomendación clara."
 
-    if message.lower().startswith('comprar'):
-        action = "comprar"
+    try:
+        if "comprar" in message.lower():
+            action = "comprar"
+        elif "vender" in message.lower():
+            action = "vender"
+        elif "mantener" in message.lower():
+            action = "mantener"
+
+        # Extraer porcentaje de confianza
         confidence = extract_confidence(message)
-        explanation = message[7:].strip()
-    elif message.lower().startswith('vender'):
-        action = "vender"
-        confidence = extract_confidence(message)
-        explanation = message[6:].strip()
-    elif message.lower().startswith('mantener'):
-        action = "mantener"
-        confidence = extract_confidence(message)
-        explanation = message[8:].strip()
-    else:
-        action = "mantener"
-        confidence = 50  # Valor predeterminado
-        explanation = "No hay una recomendación clara."
+        explanation = message.split(":")[-1].strip()  # Extraer explicación corta
+
+    except Exception as e:
+        print(f"❌ Error procesando la decisión de GPT: {e}")
 
     return action, confidence, explanation
+
 
 
 def extract_confidence(message):

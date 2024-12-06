@@ -18,6 +18,8 @@ THRESHOLD_PRICE_CHANGE = 0.05  # Cambio del 5%
 INTERVAL_SECONDS = 14400  # Intervalo de 4 horas
 last_volumes = {}
 last_prices = {}
+last_conditions = {}  # Global para registrar última revisión por símbolo
+
 
 # Función para obtener velas históricas
 def fetch_klines(symbol, interval="1h", limit=100):
@@ -58,24 +60,36 @@ def calculate_rsi(prices, period=14):
     return rsis
 
 # Función para monitorear RSI y decidir trading
-def should_trade(symbol):
+def should_trade(symbol, last_conditions):
     data = fetch_klines(symbol, "1h")
     if len(data) == 0:
         print(f"⚠️ No se recibieron datos de velas para {symbol}")
         return False
+
     closing_prices = [float(candle[4]) for candle in data if len(candle) > 4]
     if len(closing_prices) < 14:
         print(f"⚠️ No hay suficientes datos para calcular RSI de {symbol}")
         return False
-    rsi = calculate_rsi(closing_prices, period=14)
-    if rsi[-1] > 70:
-        print(f"⚠️ RSI de {symbol} está sobrecomprado ({rsi[-1]}). Podría ser un buen momento para vender.")
+
+    rsi = calculate_rsi(closing_prices, period=14)[-1]
+
+    # Comparar RSI con el último registrado
+    last_rsi = last_conditions.get(symbol, {}).get("rsi", None)
+    if last_rsi and abs(rsi - last_rsi) < 2:  # Cambios menores de 2 se ignoran
+        print(f"⚠️ RSI no cambió significativamente para {symbol} ({rsi}).")
+        return False
+
+    # Actualizar condición para el símbolo
+    last_conditions[symbol] = {"rsi": rsi}
+
+    if rsi > 70:
+        print(f"⚠️ RSI de {symbol} está sobrecomprado ({rsi}). Podría ser un buen momento para vender.")
         return True
-    elif rsi[-1] < 30:
-        print(f"⚠️ RSI de {symbol} está sobrevendido ({rsi[-1]}). Podría ser un buen momento para comprar.")
+    elif rsi < 30:
+        print(f"⚠️ RSI de {symbol} está sobrevendido ({rsi}). Podría ser un buen momento para comprar.")
         return True
     else:
-        print(f"RSI de {symbol}: {rsi[-1]}. No se toman acciones.")
+        print(f"RSI de {symbol}: {rsi}. No se toman acciones.")
         return False
 
 # Función para detectar cambios significativos de precio
@@ -90,17 +104,20 @@ def significant_price_change(symbol, current_price):
     return price_change > THRESHOLD_PRICE_CHANGE
 
 # Función para detectar cambios significativos de volumen
-def significant_volume_change(symbol, current_volume):
-    global last_volumes
-    if symbol not in last_volumes:
-        last_volumes[symbol] = current_volume
+def significant_volume_change(symbol, current_volume, last_conditions):
+    last_volume = last_conditions.get(symbol, {}).get("volume", None)
+
+    if last_volume is not None and abs(current_volume - last_volume) / last_volume < THRESHOLD_VOLUME_CHANGE:
+        print(f"⚠️ Cambio de volumen insignificante para {symbol}.")
         return False
-    last_volume = last_volumes[symbol]
-    if last_volume == 0:
-        return False
-    volume_change = abs((current_volume - last_volume) / last_volume)
-    last_volumes[symbol] = current_volume
-    return volume_change > THRESHOLD_VOLUME_CHANGE
+
+    # Actualizar el volumen en las condiciones
+    if symbol not in last_conditions:
+        last_conditions[symbol] = {}
+    last_conditions[symbol]["volume"] = current_volume
+
+    print(f"⚠️ Cambio significativo detectado en el volumen de {symbol}.")
+    return True
 
 # Función para obtener precios actuales
 def fetch_price(symbol):
@@ -137,7 +154,8 @@ def monitor_and_run():
     binance_symbols = [symbol.replace("/", "") for symbol in symbols]
     next_execution_time = time.time() + INTERVAL_SECONDS
 
-    # Ejecución inicial
+    last_conditions = {}  # Almacena RSI, volumen, precios, etc.
+
     print("🚀 Ejecución inicial al iniciar el programa.")
     run_trading()
 
@@ -147,33 +165,31 @@ def monitor_and_run():
             for symbol, binance_symbol in zip(symbols, binance_symbols):
                 print(f"🔍 Monitoreando {symbol}")
 
-                # Verificar precio y volumen
+                # Obtener precios y volúmenes actuales
                 current_price = fetch_price(binance_symbol)
                 current_volume = fetch_volume(binance_symbol)
                 if current_price is None or current_volume is None:
                     continue
 
-                if significant_price_change(symbol, current_price):
-                    print(f"⚠️ Cambio significativo en el precio de {symbol}. Ejecutando ahora.")
+                # Verificar condiciones para trading
+                if should_trade(binance_symbol, last_conditions):
                     execute_now = True
 
-                if significant_volume_change(symbol, current_volume):
-                    print(f"⚠️ Cambio significativo detectado en {symbol}. Ejecutando ahora.")
+                if significant_volume_change(binance_symbol, current_volume, last_conditions):
                     execute_now = True
 
-                # RSI y lógica de trading
-                if should_trade(binance_symbol):
+                if significant_price_change(binance_symbol, current_price):
                     execute_now = True
 
-            # Ejecutar trading si se cumplen condiciones
+            # Ejecutar si hay cambios significativos
             if execute_now or time.time() >= next_execution_time:
                 run_trading()
                 next_execution_time = time.time() + INTERVAL_SECONDS
                 print(f"⏳ Próxima ejecución programada a las {datetime.datetime.fromtimestamp(next_execution_time)}")
             else:
-                print(f"⏳ No se cumplen las condiciones. Próxima evaluación en 10 segundos.")
+                print(f"⏳ No se cumplen las condiciones. Próxima evaluación en 10 minutos.")
 
-            time.sleep(10)
+            time.sleep(1200)  # Espera 20 minutos antes de la próxima evaluación
 
         except KeyboardInterrupt:
             print("\n❌ Monitoreo detenido por el usuario.")
