@@ -196,7 +196,7 @@ def calculate_bollinger_bands(series, window=20, num_std_dev=2):
 # Decisión de trading con GPT
 def gpt_prepare_data(data_by_timeframe, additional_data):
     """
-    Usa GPT-3.5 Turbo para preparar un resumen estructurado basado en datos de mercado e indicadores adicionales.
+    Prepara un prompt estructurado para GPT basado en datos técnicos.
     """
     combined_data = ""
 
@@ -204,30 +204,35 @@ def gpt_prepare_data(data_by_timeframe, additional_data):
     for timeframe, df in data_by_timeframe.items():
         if df is not None and not df.empty:
             combined_data += f"\nDatos de {timeframe}:\n"
-            combined_data += df.tail(5).to_string(index=False)
+            combined_data += df.tail(3).to_string(index=False)  # Últimos 3 registros
 
-    # Preparar el prompt con métricas adicionales
+    # Priorizar indicadores críticos
     prompt = f"""
-    Eres un experto en análisis financiero y trading. Basándote en los siguientes datos de mercado en múltiples marcos temporales
-    e indicadores adicionales, organiza la información en un resumen estructurado. Este resumen será usado por un sistema más
-    avanzado para tomar decisiones de compra, venta o mantenimiento.
+    Eres un experto en análisis financiero y trading. Basándote en los siguientes datos de mercado e indicadores técnicos,
+    analiza y decide si debemos comprar, vender o mantener para optimizar el rendimiento del portafolio.
 
-    Indicadores por marcos temporales:
-    {combined_data}
+    Indicadores críticos:
+    - RSI (Índice de Fuerza Relativa): {additional_data.get('rsi', 'No disponible')}
+    - Soporte: {additional_data.get('support', 'No disponible')}
+    - Resistencia: {additional_data.get('resistance', 'No disponible')}
+    - ADX (Índice Direccional Promedio): {additional_data.get('adx', 'No disponible')}
+    - Precio actual: {additional_data.get('current_price', 'No disponible')}
 
-    Métricas adicionales:
+    Indicadores secundarios:
     - Volumen relativo: {additional_data.get('relative_volume', 'No disponible')}
-    - Promedio de volumen (últimas 24h): {additional_data.get('avg_volume_24h', 'No disponible')}
-    - Market cap: {additional_data.get('market_cap', 'No disponible')}
-    - Spread actual: {additional_data.get('spread', 'No disponible')}
-    - Fear & Greed Index: {additional_data.get('fear_greed', 'No disponible')}
     - Desviación estándar del precio: {additional_data.get('price_std_dev', 'No disponible')}
+    - Market cap: {additional_data.get('market_cap', 'No disponible')}
+    - Fear & Greed Index: {additional_data.get('fear_greed', 'No disponible')}
 
-    Proporciona:
-    1. Un análisis breve resumido pero completo de los patrones identificados en los datos técnicos (tendencias, rangos, volatilidad).
-    2. Una evaluación resumida de las variables mas importantes con el contexto basado en las métricas adicionales (volumen, market cap, etc.).
-    3. Información resumida que pueda ser procesada eficientemente por un sistema avanzado para decidir si comprar, vender o mantener.
+    Contexto histórico de las últimas transacciones:
+    {fetch_all_transactions()}
+
+    Basándote en esta información:
+    1. Proporciona un resumen estructurado de los indicadores críticos y secundarios.
+    2. Decide si debemos "comprar", "vender" o "mantener".
+    3. Justifica tu decisión en 1-2 oraciones.
     """
+    
     response = client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[
@@ -566,6 +571,7 @@ def demo_trading():
             adx = calculate_adx(data_by_timeframe["1h"])
 
             btc_series = fetch_and_prepare_data("BTC/USDT")[2]
+
             correlation_with_btc = calculate_correlation_with_btc(price_series, btc_series)
 
             # Validar datos obtenidos
