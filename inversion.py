@@ -160,6 +160,7 @@ def monitor_and_run():
     run_trading()
 
     while True:
+        time.sleep(1200)  # Espera 20 minutos antes de la próxima evaluación
         try:
             execute_now = False
             for symbol, binance_symbol in zip(symbols, binance_symbols):
@@ -188,8 +189,6 @@ def monitor_and_run():
                 print(f"⏳ Próxima ejecución programada a las {datetime.datetime.fromtimestamp(next_execution_time)}")
             else:
                 print(f"⏳ No se cumplen las condiciones. Próxima evaluación en 10 minutos.")
-
-            time.sleep(1200)  # Espera 20 minutos antes de la próxima evaluación
 
         except KeyboardInterrupt:
             print("\n❌ Monitoreo detenido por el usuario.")

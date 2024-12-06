@@ -547,6 +547,17 @@ def calculate_adx(df, period=14):
     adx = dx.rolling(window=period).mean()
     return adx.iloc[-1]  # Último valor del ADX
 
+def fetch_price(symbol):
+    """
+    Obtiene el precio actual de un par de criptomonedas en USDT.
+    """
+    try:
+        ticker = exchange.fetch_ticker(symbol)  # Fetch ticker para obtener datos actuales del mercado
+        return ticker['last']  # Precio de la última transacción
+    except Exception as e:
+        print(f"❌ Error al obtener el precio para {symbol}: {e}")
+        return None
+
 
 # Función principal
 def demo_trading():
@@ -635,65 +646,89 @@ def demo_trading():
                 print(f"❌ Error procesando {symbol}: {e}")
                 continue
 
-    # Analizar portafolio para ventas
-    portfolio_cryptos = get_portfolio_cryptos()
-    print(f"📊 Criptos en portafolio para analizar venta: {portfolio_cryptos}")
+# Analizar portafolio para ventas
+portfolio_cryptos = get_portfolio_cryptos()
+filtered_portfolio = []
 
-    for symbol in portfolio_cryptos:
-        try:
-            # Usar formato de símbolo correcto (e.g., BTC/USDT)
-            market_symbol = f"{symbol}/USDT"
+# Filtrar criptos con valor en USDT mayor a 0.1
+for symbol in portfolio_cryptos:
+    try:
+        # Obtener el balance y precio actual
+        crypto_balance = exchange.fetch_balance()['free'].get(symbol, 0)
+        market_symbol = f"{symbol}/USDT"
+        current_price = fetch_price(market_symbol)  # Obtener precio actual en USDT
 
-            # Obtener datos históricos y series
-            data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(market_symbol)
-
-            # Verificar si los datos son válidos
-            if not data_by_timeframe or volume_series is None or price_series is None:
-                print(f"⚠️ Datos insuficientes para {market_symbol}.")
-                continue
-
-            # Calcular métricas adicionales
-            support, resistance = calculate_support_resistance(price_series)
-            market_depth = calculate_market_depth(market_symbol)
-            candlestick_pattern = identify_candlestick_patterns(data_by_timeframe["1h"])
-            adx = calculate_adx(data_by_timeframe["1h"])
-            additional_data = {
-                "relative_volume": calculate_relative_volume(volume_series),
-                "avg_volume_24h": fetch_avg_volume_24h(volume_series),
-                "market_cap": fetch_market_cap(market_symbol),
-                "spread": calculate_spread(market_symbol),
-                "fear_greed": fetch_fear_greed_index(),
-                "price_std_dev": calculate_price_std_dev(price_series),
-                "adx": adx,
-                "support": support,
-                "resistance": resistance,
-                "market_depth_bids": market_depth["total_bids"],
-                "market_depth_asks": market_depth["total_asks"],
-                "candlestick_pattern": candlestick_pattern,
-            }
-
-            # Preparar texto para venta
-            prepared_text = gpt_prepare_data(data_by_timeframe, additional_data)
-
-            # Analizar la decisión
-            action, confidence, explanation = gpt_decision(prepared_text)
-
-            # Decidir acción de venta
-            if action == "vender":
-                crypto_balance = exchange.fetch_balance()['free'].get(symbol, 0)
-                if crypto_balance > 0:
-                    execute_order_sell(market_symbol, confidence, explanation)
-                else:
-                    print(f"⚠️ No tienes suficiente {symbol} para vender.")
-            else:
-                print(f"↔️ No se realiza ninguna acción para {market_symbol} (mantener).")
-
-            time.sleep(1)
-
-        except Exception as e:
-            print(f"❌ Error procesando {symbol}: {e}")
+        if current_price is None:
+            print(f"⚠️ No se pudo obtener el precio actual para {symbol}.")
             continue
 
+        # Calcular el valor en USDT
+        value_in_usdt = crypto_balance * current_price
+
+        if value_in_usdt > 0.1:
+            filtered_portfolio.append(symbol)
+        else:
+            print(f"⚠️ {symbol} tiene un valor insuficiente en USDT ({value_in_usdt:.2f}). Se omite de la venta.")
+    except Exception as e:
+        print(f"❌ Error al procesar {symbol} para filtrado: {e}")
+        continue
+
+print(f"📊 Criptos en portafolio con valor en USDT suficiente para analizar venta: {filtered_portfolio}")
+
+for symbol in filtered_portfolio:
+    try:
+        # Usar formato de símbolo correcto (e.g., BTC/USDT)
+        market_symbol = f"{symbol}/USDT"
+
+        # Obtener datos históricos y series
+        data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(market_symbol)
+
+        # Verificar si los datos son válidos
+        if not data_by_timeframe or volume_series is None or price_series is None:
+            print(f"⚠️ Datos insuficientes para {market_symbol}.")
+            continue
+
+        # Calcular métricas adicionales
+        support, resistance = calculate_support_resistance(price_series)
+        market_depth = calculate_market_depth(market_symbol)
+        candlestick_pattern = identify_candlestick_patterns(data_by_timeframe["1h"])
+        adx = calculate_adx(data_by_timeframe["1h"])
+        additional_data = {
+            "relative_volume": calculate_relative_volume(volume_series),
+            "avg_volume_24h": fetch_avg_volume_24h(volume_series),
+            "market_cap": fetch_market_cap(market_symbol),
+            "spread": calculate_spread(market_symbol),
+            "fear_greed": fetch_fear_greed_index(),
+            "price_std_dev": calculate_price_std_dev(price_series),
+            "adx": adx,
+            "support": support,
+            "resistance": resistance,
+            "market_depth_bids": market_depth["total_bids"],
+            "market_depth_asks": market_depth["total_asks"],
+            "candlestick_pattern": candlestick_pattern,
+        }
+
+        # Preparar texto para venta
+        prepared_text = gpt_prepare_data(data_by_timeframe, additional_data)
+
+        # Analizar la decisión
+        action, confidence, explanation = gpt_decision(prepared_text)
+
+        # Decidir acción de venta
+        if action == "vender":
+            crypto_balance = exchange.fetch_balance()['free'].get(symbol, 0)
+            if crypto_balance > 0:
+                execute_order_sell(market_symbol, confidence, explanation)
+            else:
+                print(f"⚠️ No tienes suficiente {symbol} para vender.")
+        else:
+            print(f"↔️ No se realiza ninguna acción para {market_symbol} (mantener).")
+
+        time.sleep(1)
+
+    except Exception as e:
+        print(f"❌ Error procesando {symbol}: {e}")
+        continue
 
     # Mostrar resultados finales
     #print("\n--- Resultados finales ---")
