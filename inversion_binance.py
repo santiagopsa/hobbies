@@ -8,6 +8,7 @@ import os
 import csv
 from db_manager_real import initialize_db, insert_transaction, fetch_all_transactions, upgrade_db_schema, insert_market_condition, fetch_last_resistance_levels
 import requests
+import numpy as np
 
 initialize_db()
 #upgrade_db_schema()
@@ -75,11 +76,10 @@ def gpt_prepare_data(data_by_timeframe, additional_data):
     - Spread: {additional_data.get('spread', 'No disponible')}
     - Market Depth Bids: {additional_data.get('market_depth_bids', 'No disponible')}
     - Market Depth Asks: {additional_data.get('market_depth_asks', 'No disponible')}
-
     - Se necesita liquidez?: {additional_data.get('liquidity_need', 'No disponible')}
-    
-    Contexto histórico de las últimas transacciones:
-    {fetch_all_transactions()}
+
+    Historial de transacciones recientes realizadas por mi para la moneda actual (no es informacion del mercado sino de nuestras transacciones):
+    {additional_data.get('recent_transactions', 'No disponible')}
 
     Basándote en esta información:
     1. Proporciona un resumen estructurado de los indicadores críticos y secundarios.
@@ -96,16 +96,17 @@ def gpt_prepare_data(data_by_timeframe, additional_data):
         ],
         temperature=0.5
     )
+    print(combined_data)
     return response.choices[0].message.content.strip()
 
-def gpt_decision(prepared_text):
+def gpt_decision_buy(prepared_text):
     prompt = f"""
     Eres un experto en trading. Basándote en el siguiente texto estructurado, decide si comprar, vender o mantener.
 
     Texto:
     {prepared_text}
 
-    Inicia tu respuesta con: "comprar", "vender" o "mantener". Incluye un resumen extremadamente corto de la decisión y un porcentaje de confianza.
+    Inicia tu respuesta con: "comprar" o "mantener". Incluye un resumen extremadamente corto de la decisión y un porcentaje de confianza.
     """
     response = client.chat.completions.create(
         model="gpt-4-turbo",
@@ -113,7 +114,7 @@ def gpt_decision(prepared_text):
             {"role": "system", "content": "Eres un experto en trading."},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.5
+        temperature=0.3
     )
     message = response.choices[0].message.content.strip().lower()
 
@@ -129,6 +130,41 @@ def gpt_decision(prepared_text):
     explanation = message.split("\n",1)[0]
 
     return action, confidence, explanation
+
+def gpt_decision_sell(prepared_text):
+    """
+    Decide si vender un activo basado en los datos proporcionados.
+    """
+    prompt = f"""
+    Eres un asesor financiero especializado en trading. Basándote en el siguiente texto estructurado, decide si debo vender este activo.
+
+    Texto:
+    {prepared_text}
+
+    Inicia UNICAMENTE tu respuesta con: "vender" o "mantener" teniendo muy encuenta la variable "recent_transactions" y teniendo en cuenta que el objetivo es aumentar el USDT. Incluye un breve resumen de tu decisión y un porcentaje de confianza.
+    """
+    response = client.chat.completions.create(
+        model="gpt-4-turbo",
+        messages=[
+            {"role": "system", "content": "Eres un asesor experto en trading."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3
+    )
+    message = response.choices[0].message.content.strip().lower()
+
+    # Extraer la decisión y el nivel de confianza
+    import re
+    action = "mantener"
+    if message.startswith("vender"):
+        action = "vender"
+
+    match = re.search(r'(\d+)%', message)
+    confidence = int(match.group(1)) if match else 50
+    explanation = message.split("\n", 1)[0]
+
+    return action, confidence, explanation
+
 
 
 def chunk_list(lst, chunk_size):
@@ -361,16 +397,25 @@ def fetch_and_prepare_data(symbol):
         return None, None, None
 
 # Función para calcular el RSI
-def calculate_rsi(series, period=14):
-    """
-    Calcula el Índice de Fuerza Relativa (RSI).
-    """
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
+# Función para calcular RSI
+def calculate_rsi(prices, period=14):
+    if len(prices) < period:
+        print("⚠️ No hay suficientes datos para calcular RSI.")
+        return [np.nan]
+    deltas = np.diff(prices)
+    gains = np.where(deltas > 0, deltas, 0)
+    losses = np.where(deltas < 0, -deltas, 0)
+    avg_gain = np.mean(gains[:period])
+    avg_loss = np.mean(losses[:period])
+    rs = avg_gain / avg_loss if avg_loss != 0 else 0
     rsi = 100 - (100 / (1 + rs))
-    return rsi
+    rsis = [np.nan] * period
+    for i in range(period, len(prices)):
+        avg_gain = (avg_gain * (period - 1) + gains[i - 1]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i - 1]) / period
+        rs = avg_gain / avg_loss if avg_loss != 0 else 0
+        rsis.append(100 - (100 / (1 + rs)))
+    return rsis
 
 # Función para calcular Bandas de Bollinger
 def calculate_bollinger_bands(series, window=20, num_std_dev=2):
@@ -708,10 +753,14 @@ def demo_trading():
             if data_by_timeframe and volume_series is not None and price_series is not None:
                 support, resistance = calculate_support_resistance(price_series)
                 adx = calculate_adx(data_by_timeframe["1h"])
-                rsi = data_by_timeframe["1h"]["RSI"].iloc[-1] if "RSI" in data_by_timeframe["1h"].columns else "No disponible"
+                if "close" in data_by_timeframe["1h"].columns:
+                    prices = data_by_timeframe["1h"]["close"].values  # Extraer precios de cierre
+                    rsis = calculate_rsi(prices, period=14)  # Calcular RSI
+                    rsi = rsis[-1] if not np.isnan(rsis[-1]) else "No disponible"  # Último RSI calculado
+                else:
+                    rsi = "No disponible"
                 market_depth = calculate_market_depth(symbol)
                 candlestick_pattern = identify_candlestick_patterns(data_by_timeframe["1h"])
-
                 additional_data = {
                 "current_price": final_price,
                 "relative_volume": calculate_relative_volume(volume_series),
@@ -726,7 +775,7 @@ def demo_trading():
                 "resistance": resistance,
                 "market_depth_bids": market_depth["total_bids"],
                 "market_depth_asks": market_depth["total_asks"],
-                "candlestick_pattern": candlestick_pattern,
+                "candlestick_pattern": candlestick_pattern
             }
                 data_by_symbol[symbol] = (data_by_timeframe, additional_data)
             else:
@@ -741,11 +790,23 @@ def demo_trading():
         if not final_winner:
             print("⚠️ No se pudo determinar una cripto ganadora.")
             return
+        
+        # Verificar si la cripto ganadora fue comprada en las últimas 2 horas
+        recent_transactions = fetch_all_transactions()
+        now = pd.Timestamp.now()
+        recent_buys = [
+            tx for tx in recent_transactions
+            if tx[1] == final_winner and tx[2] == "buy" and now - pd.Timestamp(tx[5]) <= pd.Timedelta(hours=2)
+        ]
+
+        if recent_buys:
+            print(f"⚠️ {final_winner} ya fue comprada en las últimas 2 horas. No se realiza nueva compra.")
+            return
 
         # Ahora que tenemos la cripto ganadora, consultamos a GPT si realmente debemos comprarla
         winner_data_by_timeframe, winner_additional_data = data_by_symbol[final_winner]
         prepared_text = gpt_prepare_data(winner_data_by_timeframe, winner_additional_data)
-        action, confidence, explanation = gpt_decision(prepared_text)
+        action, confidence, explanation = gpt_decision_buy(prepared_text)
 
         if action == "comprar":
             final_price = fetch_price(final_winner)
@@ -823,6 +884,12 @@ def demo_trading():
             price_std_dev = calculate_price_std_dev(price_series)
             candlestick_pattern = identify_candlestick_patterns(data_by_timeframe["1h"])
             market_depth = calculate_market_depth(market_symbol)
+            if "close" in data_by_timeframe["1h"].columns:
+                prices = data_by_timeframe["1h"]["close"].values  # Extraer precios de cierre
+                rsis = calculate_rsi(prices, period=14)  # Calcular RSI
+                rsi = rsis[-1] if not np.isnan(rsis[-1]) else "No disponible"  # Último RSI calculado
+            else:
+                rsi = "No disponible"
 
             # Insertar los datos actuales en la tabla `market_conditions`
             insert_market_condition(
@@ -831,7 +898,7 @@ def demo_trading():
                 resistance=resistance,
                 support=support,
                 adx=adx,
-                rsi=data_by_timeframe["1h"]["RSI"].iloc[-1] if "RSI" in data_by_timeframe["1h"].columns else None,
+                rsi=rsi,
                 relative_volume=relative_volume,
                 avg_volume_24h=avg_volume_24h,
                 market_cap=market_cap,
@@ -850,14 +917,31 @@ def demo_trading():
             if not historical_resistances:
                 print(f"⚠️ No se encontraron resistencias históricas para {symbol}.")
                 continue
+            # Preparar contexto adicional específico para ventas
+            transaction_history = fetch_all_transactions()
+            recent_transactions = [
+                tx for tx in transaction_history if tx[1] == market_symbol
+            ]
 
+            # Crear tabla de transacciones recientes en formato legible
+            if recent_transactions:
+                transaction_table = pd.DataFrame(recent_transactions, columns=[
+                    "ID", "Symbol", "Action", "Price", "Amount", "Timestamp", 
+                    "Profit/Loss", "Confidence %", "Summary"
+                ])
+                transaction_table_summary = transaction_table.tail(5).to_string(index=False)
+            else:
+                transaction_table_summary = "No recent transactions available."
+            
             # Preparar datos para GPT, incluyendo resistencias históricas
             resistances_to_consider = [resistance] + [r[0] for r in historical_resistances]
             additional_data = {
+                
+                "rsi":rsi,
                 "current_price": current_price,
                 "support": support,
                 "resistance": resistance,
-                "historical_supports": resistances_to_consider,
+                "historical_resistances": resistances_to_consider,
                 "adx": adx,
                 "relative_volume": relative_volume,
                 "avg_volume_24h": avg_volume_24h,
@@ -866,14 +950,24 @@ def demo_trading():
                 "price_std_dev": price_std_dev,
                 "candlestick_pattern": candlestick_pattern,
                 "liquidity_need": True,
-                "Instruction": "If liquidity is True, try to sell if close to the levels of resistance based on historical supports"
+                "recent_transactions":transaction_table_summary,
+                "Instruction": "Incremental USDT growth through strategic sales near resistance levels.",
+                "fear_greed": fetch_fear_greed_index(),
+                "market_depth_bids": market_depth["total_bids"],
+                "market_depth_asks": market_depth["total_asks"],
+                "candlestick_pattern": candlestick_pattern
             }
 
             # Preparar texto para GPT con los datos
             prepared_text = gpt_prepare_data(data_by_timeframe, additional_data)
+            print(f"El texto preparado que nos saca GPT-3 es:*********************************************************************************************** {prepared_text}")
 
             # Decisión de GPT
-            action, confidence, explanation = gpt_decision(prepared_text)
+            action, confidence, explanation = gpt_decision_sell(prepared_text)
+            print("********************************************************************************")
+            print(f"La accion a realizar es:......................... {action}")
+            print(f"El nivel de confianza es:....................... {confidence}")
+            print(f"La explicacion es:....................            .......... {explanation}")
 
             # Ejecutar venta si GPT lo decide
             if action == "vender":
