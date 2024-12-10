@@ -6,7 +6,7 @@ from elegir_cripto import choose_best_cryptos  # Importar la función de selecci
 from dotenv import load_dotenv
 import os
 import csv
-from db_manager_real import initialize_db, insert_transaction, fetch_all_transactions, upgrade_db_schema
+from db_manager_real import initialize_db, insert_transaction, fetch_all_transactions, upgrade_db_schema, insert_market_condition, fetch_last_resistance_levels
 import requests
 
 initialize_db()
@@ -45,6 +45,196 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # Variables globales
 TRADE_SIZE = 10
 TRANSACTION_LOG = []
+
+def gpt_prepare_data(data_by_timeframe, additional_data):
+    combined_data = ""
+    for timeframe, df in data_by_timeframe.items():
+        if df is not None and not df.empty:
+            combined_data += f"\nDatos de {timeframe} (últimos 3 registros):\n"
+            combined_data += df.tail(3).to_string(index=False) + "\n"
+
+    prompt = f"""
+    Eres un experto en análisis financiero y trading. Basándote en los siguientes datos de mercado e indicadores técnicos,
+    analiza y decide si debemos comprar, vender o mantener para optimizar el rendimiento del portafolio.
+
+    {combined_data}
+    Indicadores críticos:
+    - RSI: {additional_data.get('rsi', 'No disponible')}
+    - Soporte: {additional_data.get('support', 'No disponible')}
+    - Resistencia: {additional_data.get('resistance', 'No disponible')}
+    - ADX: {additional_data.get('adx', 'No disponible')}
+    - Precio actual: {additional_data.get('current_price', 'No disponible')}
+
+    Indicadores secundarios:
+    - Volumen relativo: {additional_data.get('relative_volume', 'No disponible')}
+    - Desviación estándar del precio: {additional_data.get('price_std_dev', 'No disponible')}
+    - Market cap: {additional_data.get('market_cap', 'No disponible')}
+    - Fear & Greed Index: {additional_data.get('fear_greed', 'No disponible')}
+    - Promedio 24h: {additional_data.get('avg_volume_24h', 'No disponible')}
+    - Niveles historicos de resistencia recientes: {additional_data.get('historical_resistances', 'No disponible')}
+    - Spread: {additional_data.get('spread', 'No disponible')}
+    - Market Depth Bids: {additional_data.get('market_depth_bids', 'No disponible')}
+    - Market Depth Asks: {additional_data.get('market_depth_asks', 'No disponible')}
+
+    - Se necesita liquidez?: {additional_data.get('liquidity_need', 'No disponible')}
+    
+    Contexto histórico de las últimas transacciones:
+    {fetch_all_transactions()}
+
+    Basándote en esta información:
+    1. Proporciona un resumen estructurado de los indicadores críticos y secundarios.
+    2. Decide si debemos "comprar", "vender" o "mantener".
+    3. Justifica tu decisión en 1-2 oraciones.
+    4. Instrucciones adicionales {additional_data.get('instruction', 'No disponible')}
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "Eres un experto en análisis financiero y trading."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.5
+    )
+    return response.choices[0].message.content.strip()
+
+def gpt_decision(prepared_text):
+    prompt = f"""
+    Eres un experto en trading. Basándote en el siguiente texto estructurado, decide si comprar, vender o mantener.
+
+    Texto:
+    {prepared_text}
+
+    Inicia tu respuesta con: "comprar", "vender" o "mantener". Incluye un resumen extremadamente corto de la decisión y un porcentaje de confianza.
+    """
+    response = client.chat.completions.create(
+        model="gpt-4-turbo",
+        messages=[
+            {"role": "system", "content": "Eres un experto en trading."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.5
+    )
+    message = response.choices[0].message.content.strip().lower()
+
+    import re
+    action = "mantener"
+    if message.startswith("comprar"):
+        action = "comprar"
+    elif message.startswith("vender"):
+        action = "vender"
+
+    match = re.search(r'(\d+)%', message)
+    confidence = int(match.group(1)) if match else 50
+    explanation = message.split("\n",1)[0]
+
+    return action, confidence, explanation
+
+
+def chunk_list(lst, chunk_size):
+    """Divide una lista en sublistas de tamaño chunk_size."""
+    for i in range(0, len(lst), chunk_size):
+        yield lst[i:i + chunk_size]
+
+def gpt_group_selection(data_by_symbol):
+    """
+    data_by_symbol: dict con {symbol: (data_by_timeframe, additional_data)}
+    Selecciona la mejor cripto en dos fases:
+    1. Divide en grupos pequeños y elige la mejor de cada grupo.
+    2. De las ganadoras de cada grupo, elige la final con GPT-4.
+    """
+    symbols = list(data_by_symbol.keys())
+    selected_per_group = {}
+
+    # Primera fase: Selección por grupos (usando GPT-3.5)
+    print("=== Iniciando selección por grupos ===")
+    for group in chunk_list(symbols, 3):
+        print(f"\nAnalizando grupo: {group}")
+        prompt_for_group = "Eres un experto en análisis financiero. Aquí tienes datos de varias criptomonedas. Necesito que elijas la mejor para comprar de este grupo.\n"
+
+        for symbol in group:
+            data_by_timeframe, additional_data = data_by_symbol[symbol]
+            sub_text = gpt_prepare_data(data_by_timeframe, additional_data)
+            # Imprimimos una parte del sub_text para no saturar
+            print(f"\n--- Datos para {symbol} ---\n{sub_text[:500]}...\n")  # Muestra primeros 500 caracteres
+            prompt_for_group += f"\n### {symbol}\n{sub_text}\n"
+
+        prompt_for_group += "\nBasándote en la información anterior, ¿cuál de estas criptos es la mejor opción para comprar? Devuelve solo el símbolo."
+        
+        # Imprimimos el prompt completo que se envía a GPT-3.5
+        print(f"\n[Prompt a GPT-3.5 para el grupo {group}]:\n{prompt_for_group}\n")
+
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "Eres un experto en análisis financiero y trading."},
+                {"role": "user", "content": prompt_for_group}
+            ],
+            temperature=0.5
+        )
+        answer = response.choices[0].message.content.strip()
+        print(f"[Respuesta GPT-3.5 para el grupo {group}]: {answer}")
+
+        chosen_symbol = None
+        for s in group:
+            # Extraer la parte base del símbolo (antes de /USDT)
+            base_name = s.split('/')[0].upper()  # Por ejemplo, PEPE/USDT -> PEPE
+            # Comprobar si el nombre base está en la respuesta de GPT (ignorar mayúsculas/minúsculas)
+            if base_name in answer.upper():
+                chosen_symbol = s
+                break
+
+        if chosen_symbol:
+            print(f"✔ Grupo {group}: GPT eligió {chosen_symbol} como ganador.")
+            selected_per_group[chosen_symbol] = "winner"
+        else:
+            print(f"⚠ Grupo {group}: No se reconoció un símbolo claro en la respuesta. Se elige {group[0]} por defecto.")
+            selected_per_group[group[0]] = "default_winner"
+
+    # Segunda fase: Selección final entre ganadoras (usando GPT-4)
+    finalists = list(selected_per_group.keys())
+    print(f"\n=== Finalistas tras la primera fase: {finalists} ===")
+    if len(finalists) == 1:
+        final_winner = finalists[0]
+        print(f"Solo hay un finalista: {final_winner}. No se requiere segunda fase.")
+    else:
+        prompt_final = "Tengo estas criptos finalistas, elige la mejor de entre ellas para comprar:\n"
+        for sym in finalists:
+            data_by_timeframe, additional_data = data_by_symbol[sym]
+            sub_prepared = gpt_prepare_data(data_by_timeframe, additional_data)
+            print(f"\n--- Datos finalistas para {sym} ---\n{sub_prepared[:500]}...\n")
+            prompt_final += f"\n### {sym}\n{sub_prepared}\n"
+
+        prompt_final += "\n¿Cuál es la mejor cripto para comprar? Devuelve solo su símbolo."
+
+        # Imprimimos el prompt completo que se envía a GPT-4
+        print(f"\n[Prompt a GPT-4 para finalistas]:\n{prompt_final}\n")
+
+        final_response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "Eres un experto en análisis financiero y trading."},
+                {"role": "user", "content": prompt_final}
+            ],
+            temperature=0.5
+        )
+        final_answer = final_response.choices[0].message.content.strip()
+        print(f"[Respuesta GPT-4 para finalistas]: {final_answer}")
+
+        final_winner = None
+        for s in finalists:
+            if s in final_answer:
+                final_winner = s
+                break
+
+        if not final_winner:
+            print("⚠ GPT-4 no reconoció un finalista claro. Se toma el primero por defecto.")
+            final_winner = finalists[0]
+        else:
+            print(f"✔ GPT-4 eligió {final_winner} como el ganador final.")
+
+    return final_winner
+
 
 def calculate_macd(series, short_window=12, long_window=26, signal_window=9):
     short_ema = series.ewm(span=short_window, adjust=False).mean()
@@ -192,101 +382,6 @@ def calculate_bollinger_bands(series, window=20, num_std_dev=2):
     upper_band = rolling_mean + (rolling_std * num_std_dev)
     lower_band = rolling_mean - (rolling_std * num_std_dev)
     return upper_band, rolling_mean, lower_band
-
-# Decisión de trading con GPT
-def gpt_prepare_data(data_by_timeframe, additional_data):
-    """
-    Prepara un prompt estructurado para GPT basado en datos técnicos.
-    """
-    combined_data = ""
-
-    # Incorporar datos de marcos temporales
-    for timeframe, df in data_by_timeframe.items():
-        if df is not None and not df.empty:
-            combined_data += f"\nDatos de {timeframe}:\n"
-            combined_data += df.tail(3).to_string(index=False)  # Últimos 3 registros
-
-    # Priorizar indicadores críticos
-    prompt = f"""
-    Eres un experto en análisis financiero y trading. Basándote en los siguientes datos de mercado e indicadores técnicos,
-    analiza y decide si debemos comprar, vender o mantener para optimizar el rendimiento del portafolio.
-
-    Indicadores críticos:
-    - RSI (Índice de Fuerza Relativa): {additional_data.get('rsi', 'No disponible')}
-    - Soporte: {additional_data.get('support', 'No disponible')}
-    - Resistencia: {additional_data.get('resistance', 'No disponible')}
-    - ADX (Índice Direccional Promedio): {additional_data.get('adx', 'No disponible')}
-    - Precio actual: {additional_data.get('current_price', 'No disponible')}
-
-    Indicadores secundarios:
-    - Volumen relativo: {additional_data.get('relative_volume', 'No disponible')}
-    - Desviación estándar del precio: {additional_data.get('price_std_dev', 'No disponible')}
-    - Market cap: {additional_data.get('market_cap', 'No disponible')}
-    - Fear & Greed Index: {additional_data.get('fear_greed', 'No disponible')}
-
-    Contexto histórico de las últimas transacciones:
-    {fetch_all_transactions()}
-
-    Basándote en esta información:
-    1. Proporciona un resumen estructurado de los indicadores críticos y secundarios.
-    2. Decide si debemos "comprar", "vender" o "mantener".
-    3. Justifica tu decisión en 1-2 oraciones.
-    """
-
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "Eres un experto en análisis financiero y trading."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.5
-    )
-
-    return response.choices[0].message.content.strip()
-
-
-def gpt_decision(prepared_text):
-    """
-    Usa GPT-4 Turbo para analizar el texto preparado y decidir si comprar, vender o mantener.
-    """
-    prompt = f"""
-    Eres un experto en trading. Basándote en el siguiente texto estructurado, decide si comprar, vender o mantener.
-
-    Texto:
-    {prepared_text}
-
-    Inicia tu respuesta con: "comprar", "vender" o "mantener". Incluye un resumen extremadamente corto de la decisión y un porcentaje de confianza.
-    """
-    response = client.chat.completions.create(
-        model="gpt-4-turbo",
-        messages=[
-            {"role": "system", "content": "Eres un experto en trading."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.5
-    )
-
-    message = response.choices[0].message.content.strip()
-
-    if message.lower().startswith('comprar'):
-        action = "comprar"
-        confidence = extract_confidence(message)
-        explanation = message[7:].strip()
-    elif message.lower().startswith('vender'):
-        action = "vender"
-        confidence = extract_confidence(message)
-        explanation = message[6:].strip()
-    elif message.lower().startswith('mantener'):
-        action = "mantener"
-        confidence = extract_confidence(message)
-        explanation = message[8:].strip()
-    else:
-        action = "mantener"
-        confidence = 50  # Valor predeterminado
-        explanation = "No hay una recomendación clara."
-
-    return action, confidence, explanation
-
 
 def extract_confidence(message):
     """
@@ -530,22 +625,54 @@ def calculate_correlation_with_btc(symbol_price_series, btc_price_series):
 def calculate_adx(df, period=14):
     """
     Calcula el Índice Direccional Promedio (ADX) usando los datos OHLC.
+    Parámetros:
+        df: DataFrame con columnas ['high', 'low', 'close'].
+        period: Periodo para calcular el ADX.
+    Retorno:
+        Último valor del ADX o None si no se puede calcular.
     """
-    high = df['high']
-    low = df['low']
-    close = df['close']
+    try:
+        # Validar que el DataFrame tiene suficientes datos
+        if len(df) < period:
+            print(f"⚠️ No hay suficientes datos para calcular el ADX. Se requieren al menos {period} filas.")
+            return None
 
-    plus_dm = high.diff().clip(lower=0)
-    minus_dm = low.diff().clip(upper=0).abs()
+        high = df['high']
+        low = df['low']
+        close = df['close']
 
-    atr = (plus_dm + minus_dm).rolling(window=period).mean()
+        # Cálculo del DM+ y DM-
+        plus_dm = high.diff().clip(lower=0)
+        minus_dm = low.diff().clip(upper=0).abs()
 
-    plus_di = (plus_dm / atr) * 100
-    minus_di = (minus_dm / atr) * 100
-    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di)) * 100
+        # Cálculo del ATR
+        true_range = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs()
+        ], axis=1).max(axis=1)
+        atr = true_range.rolling(window=period).mean()
 
-    adx = dx.rolling(window=period).mean()
-    return adx.iloc[-1]  # Último valor del ADX
+        # Cálculo del DI+ y DI-
+        plus_di = (plus_dm / atr).rolling(window=period).mean() * 100
+        minus_di = (minus_dm / atr).rolling(window=period).mean() * 100
+
+        # Cálculo del DX
+        dx = ((plus_di - minus_di).abs() / (plus_di + minus_di)) * 100
+
+        # Cálculo del ADX
+        adx = dx.rolling(window=period).mean()
+
+        # Retornar el último valor del ADX
+        if adx.iloc[-1] is not None and not pd.isna(adx.iloc[-1]):
+            return adx.iloc[-1]
+        else:
+            print("⚠️ ADX no calculable debido a datos insuficientes o NaN intermedios.")
+            return None
+    except Exception as e:
+        print(f"❌ Error al calcular el ADX: {e}")
+        return None
+
 
 def fetch_price(symbol):
     """
@@ -557,147 +684,41 @@ def fetch_price(symbol):
     except Exception as e:
         print(f"❌ Error al obtener el precio para {symbol}: {e}")
         return None
+    
+
 
 # Función principal
 # Función principal
 def demo_trading():
     print("Iniciando proceso de inversión...")
-
-    # Obtener saldo en USDT
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
     print(f"Saldo disponible en USDT: {usdt_balance}")
 
-    # Si no hay saldo suficiente, omitir compras
     if usdt_balance <= 5:
-        print("⚠️ Sin saldo suficiente en USDT. Se omiten compras y se pasa directamente a analizar ventas.")
+        print("⚠️ Sin saldo suficiente en USDT. Se omite el proceso de compra.")
     else:
-        # Elegir las mejores criptos para compra
+
         selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=10)
-        print(f"Criptos seleccionadas para compra: {selected_cryptos}")
+        print(f"Criptos seleccionadas para análisis: {selected_cryptos}")
 
-        # Realizar análisis para compra
+        data_by_symbol = {}
         for symbol in selected_cryptos:
-            try:
-                # Obtener datos históricos de múltiples marcos temporales y las series
-                data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(symbol)
-
-                # Verificar si los datos son válidos
-                if not data_by_timeframe or volume_series is None or price_series is None:
-                    print(f"⚠️ Datos insuficientes para {symbol}.")
-                    continue
-
-                # Calcular métricas adicionales
+            data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(symbol)
+            final_price = fetch_price(symbol)
+            if data_by_timeframe and volume_series is not None and price_series is not None:
                 support, resistance = calculate_support_resistance(price_series)
+                adx = calculate_adx(data_by_timeframe["1h"])
+                rsi = data_by_timeframe["1h"]["RSI"].iloc[-1] if "RSI" in data_by_timeframe["1h"].columns else "No disponible"
                 market_depth = calculate_market_depth(symbol)
                 candlestick_pattern = identify_candlestick_patterns(data_by_timeframe["1h"])
-                adx = calculate_adx(data_by_timeframe["1h"])
-                btc_series = fetch_and_prepare_data("BTC/USDT")[2]
-                correlation_with_btc = calculate_correlation_with_btc(price_series, btc_series)
 
                 additional_data = {
-                    "relative_volume": calculate_relative_volume(volume_series),
-                    "avg_volume_24h": fetch_avg_volume_24h(volume_series),
-                    "market_cap": fetch_market_cap(symbol),
-                    "spread": calculate_spread(symbol),
-                    "fear_greed": fetch_fear_greed_index(),
-                    "price_std_dev": calculate_price_std_dev(price_series),
-                    "adx": adx,
-                    "correlation_with_btc": correlation_with_btc,
-                    "support": support,
-                    "resistance": resistance,
-                    "market_depth_bids": market_depth["total_bids"],
-                    "market_depth_asks": market_depth["total_asks"],
-                    "candlestick_pattern": candlestick_pattern,
-                }
-
-                # Preparar texto con GPT-3.5 Turbo
-                prepared_text = gpt_prepare_data(data_by_timeframe, additional_data)
-
-                # Analizar la decisión con GPT-4 Turbo
-                action, confidence, explanation = gpt_decision(prepared_text)
-
-                # Decidir acción de compra
-                if action == "comprar":
-                    current_price = data_by_timeframe["1h"]['close'].iloc[-1]
-                    market_info = exchange.load_markets().get(symbol)
-                    min_notional = market_info['limits']['cost']['min'] if market_info else 10  # Default if no data
-
-                    trade_amount = calculate_trade_amount(
-                        symbol=symbol,
-                        current_price=current_price,
-                        confidence=confidence,
-                        trade_size=TRADE_SIZE,
-                        min_notional=min_notional,
-                    )
-
-                    print(f"💰 Trade Amount Calculado para {symbol}: {trade_amount}")
-
-                    # Verificar saldo antes de ejecutar la compra
-                    if usdt_balance >= trade_amount * current_price:
-                        execute_order_buy(symbol, trade_amount, confidence, explanation)
-                    else:
-                        print(f"⚠️ Saldo insuficiente para comprar {symbol}. Saldo disponible: {usdt_balance} USDT.")
-                else:
-                    print(f"↔️ No se realiza ninguna acción para {symbol} (mantener).")
-
-                time.sleep(1)
-
-            except Exception as e:
-                print(f"❌ Error procesando {symbol}: {e}")
-                continue
-
-    # **Siempre analizar portafolio para ventas**
-    portfolio_cryptos = get_portfolio_cryptos()
-    filtered_portfolio = []
-
-    # Filtrar criptos con valor en USDT mayor a 0.1
-    for symbol in portfolio_cryptos:
-        try:
-            # Obtener el balance y precio actual
-            crypto_balance = exchange.fetch_balance()['free'].get(symbol, 0)
-            market_symbol = f"{symbol}/USDT"
-            current_price = fetch_price(market_symbol)  # Obtener precio actual en USDT
-
-            if current_price is None:
-                print(f"⚠️ No se pudo obtener el precio actual para {symbol}.")
-                continue
-
-            # Calcular el valor en USDT
-            value_in_usdt = crypto_balance * current_price
-
-            if value_in_usdt > 0.1:
-                filtered_portfolio.append(symbol)
-            else:
-                print(f"⚠️ {symbol} tiene un valor insuficiente en USDT ({value_in_usdt:.2f}). Se omite de la venta.")
-        except Exception as e:
-            print(f"❌ Error al procesar {symbol} para filtrado: {e}")
-            continue
-
-    print(f"📊 Criptos en portafolio con valor en USDT suficiente para analizar venta: {filtered_portfolio}")
-
-    for symbol in filtered_portfolio:
-        try:
-            # Usar formato de símbolo correcto (e.g., BTC/USDT)
-            market_symbol = f"{symbol}/USDT"
-
-            # Obtener datos históricos y series
-            data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(market_symbol)
-
-            # Verificar si los datos son válidos
-            if not data_by_timeframe or volume_series is None or price_series is None:
-                print(f"⚠️ Datos insuficientes para {market_symbol}.")
-                continue
-
-            # Calcular métricas adicionales
-            support, resistance = calculate_support_resistance(price_series)
-            market_depth = calculate_market_depth(market_symbol)
-            candlestick_pattern = identify_candlestick_patterns(data_by_timeframe["1h"])
-            adx = calculate_adx(data_by_timeframe["1h"])
-            additional_data = {
+                "current_price": final_price,
                 "relative_volume": calculate_relative_volume(volume_series),
+                "rsi": rsi,
                 "avg_volume_24h": fetch_avg_volume_24h(volume_series),
-                "market_cap": fetch_market_cap(market_symbol),
-                "spread": calculate_spread(market_symbol),
+                "market_cap": fetch_market_cap(symbol),
+                "spread": calculate_spread(symbol),
                 "fear_greed": fetch_fear_greed_index(),
                 "price_std_dev": calculate_price_std_dev(price_series),
                 "adx": adx,
@@ -707,28 +728,182 @@ def demo_trading():
                 "market_depth_asks": market_depth["total_asks"],
                 "candlestick_pattern": candlestick_pattern,
             }
+                data_by_symbol[symbol] = (data_by_timeframe, additional_data)
+            else:
+                print(f"⚠️ Datos insuficientes para {symbol}, se omite.")
 
-            # Preparar texto para venta
+        if not data_by_symbol:
+            print("⚠️ No hay criptos con datos válidos para analizar.")
+            return
+
+        # Seleccionar la mejor cripto entre todas (fase grupal y luego final)
+        final_winner = gpt_group_selection(data_by_symbol)
+        if not final_winner:
+            print("⚠️ No se pudo determinar una cripto ganadora.")
+            return
+
+        # Ahora que tenemos la cripto ganadora, consultamos a GPT si realmente debemos comprarla
+        winner_data_by_timeframe, winner_additional_data = data_by_symbol[final_winner]
+        prepared_text = gpt_prepare_data(winner_data_by_timeframe, winner_additional_data)
+        action, confidence, explanation = gpt_decision(prepared_text)
+
+        if action == "comprar":
+            final_price = fetch_price(final_winner)
+            if final_price and (usdt_balance > final_price * 0.001):
+                amount_to_buy = TRADE_SIZE / final_price
+                order = execute_order_buy(final_winner, amount_to_buy, confidence, explanation)
+                if order:
+                    print(f"✅ Orden de compra ejecutada para {final_winner}")
+                    insert_transaction(
+                        symbol=final_winner,
+                        action="buy",
+                        price=final_price,
+                        amount=amount_to_buy,
+                        timestamp=pd.Timestamp.now().isoformat(),
+                        profit_loss=None,
+                        confidence_percentage=confidence,
+                        summary=explanation
+                    )
+                else:
+                    print("❌ No se pudo ejecutar la orden de compra.")
+            else:
+                print("⚠️ No hay saldo suficiente o no se pudo obtener el precio para la cripto finalista.")
+        else:
+            # GPT decidió que no es momento de comprar (mantener o vender)
+            print(f"↔️ GPT recomienda {action}. No se realiza compra de {final_winner}.")
+
+    # Lógica de ventas
+    portfolio_cryptos = get_portfolio_cryptos()
+    filtered_portfolio = []
+    for symbol in portfolio_cryptos:
+        try:
+            crypto_balance = exchange.fetch_balance()['free'].get(symbol, 0)
+            market_symbol = f"{symbol}/USDT"
+            current_price = fetch_price(market_symbol)
+            if current_price is None:
+                print(f"⚠️ No se pudo obtener el precio actual para {symbol}.")
+                continue
+
+            value_in_usdt = crypto_balance * current_price
+
+            # Si el valor es menor a 0.1 USDT no vale la pena analizar venta
+            # Ajusta este valor según el mínimo notional del exchange o tu criterio
+            if value_in_usdt < 0.1:
+                print(f"⚠️ {symbol} tiene un valor en USDT muy bajo ({value_in_usdt:.5f}), se omite análisis de venta.")
+            else:
+                filtered_portfolio.append(symbol)
+                print(f"{symbol} vale {value_in_usdt:.2f} USDT, se incluye para análisis de venta.")
+
+        except Exception as e:
+            print(f"❌ Error al procesar {symbol} para filtrado: {e}")
+            continue
+
+    print(f"📊 Criptos en portafolio para analizar venta: {filtered_portfolio}")
+
+    for symbol in filtered_portfolio:
+        try:
+            market_symbol = f"{symbol}/USDT"
+
+            # Obtener datos históricos y preparar series de precios y volúmenes
+            data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(market_symbol)
+            if not data_by_timeframe or volume_series is None or price_series is None:
+                print(f"⚠️ Datos insuficientes para {market_symbol}.")
+                continue
+
+            # Calcular soporte y resistencia actuales
+            support, resistance = calculate_support_resistance(price_series)
+
+            # Calcular otros indicadores técnicos
+            adx = calculate_adx(data_by_timeframe["1h"])
+            current_price = fetch_price(market_symbol)
+            relative_volume = calculate_relative_volume(volume_series)
+            avg_volume_24h = fetch_avg_volume_24h(volume_series)
+            market_cap = fetch_market_cap(market_symbol)
+            spread = calculate_spread(market_symbol)
+            price_std_dev = calculate_price_std_dev(price_series)
+            candlestick_pattern = identify_candlestick_patterns(data_by_timeframe["1h"])
+            market_depth = calculate_market_depth(market_symbol)
+
+            # Insertar los datos actuales en la tabla `market_conditions`
+            insert_market_condition(
+                symbol=market_symbol,
+                timestamp=pd.Timestamp.now().isoformat(),
+                resistance=resistance,
+                support=support,
+                adx=adx,
+                rsi=data_by_timeframe["1h"]["RSI"].iloc[-1] if "RSI" in data_by_timeframe["1h"].columns else None,
+                relative_volume=relative_volume,
+                avg_volume_24h=avg_volume_24h,
+                market_cap=market_cap,
+                spread=spread,
+                price_std_dev=price_std_dev,
+                candlestick_pattern=candlestick_pattern,
+                current_price=current_price,
+                market_depth_bids=market_depth["total_bids"],
+                market_depth_asks=market_depth["total_asks"]
+            )
+
+            print(f"✅ Datos de mercado insertados para {symbol} en la base de datos.")
+
+            # Recuperar resistencias históricas
+            historical_resistances = fetch_last_resistance_levels(market_symbol)
+            if not historical_resistances:
+                print(f"⚠️ No se encontraron resistencias históricas para {symbol}.")
+                continue
+
+            # Preparar datos para GPT, incluyendo resistencias históricas
+            resistances_to_consider = [resistance] + [r[0] for r in historical_resistances]
+            additional_data = {
+                "current_price": current_price,
+                "support": support,
+                "resistance": resistance,
+                "historical_supports": resistances_to_consider,
+                "adx": adx,
+                "relative_volume": relative_volume,
+                "avg_volume_24h": avg_volume_24h,
+                "market_cap": market_cap,
+                "spread": spread,
+                "price_std_dev": price_std_dev,
+                "candlestick_pattern": candlestick_pattern,
+                "liquidity_need": True,
+                "Instruction": "If liquidity is True, try to sell if close to the levels of resistance based on historical supports"
+            }
+
+            # Preparar texto para GPT con los datos
             prepared_text = gpt_prepare_data(data_by_timeframe, additional_data)
 
-            # Analizar la decisión
+            # Decisión de GPT
             action, confidence, explanation = gpt_decision(prepared_text)
 
-            # Decidir acción de venta
+            # Ejecutar venta si GPT lo decide
             if action == "vender":
                 crypto_balance = exchange.fetch_balance()['free'].get(symbol, 0)
                 if crypto_balance > 0:
-                    execute_order_sell(market_symbol, confidence, explanation)
+                    order = execute_order_sell(market_symbol, confidence, explanation)
+                    if order:
+                        insert_transaction(
+                            symbol=market_symbol,
+                            action="sell",
+                            price=current_price,
+                            amount=crypto_balance,
+                            timestamp=pd.Timestamp.now().isoformat(),
+                            profit_loss=None,
+                            confidence_percentage=confidence,
+                            summary=explanation
+                        )
+                        print(f"✅ Venta realizada para {symbol} a {current_price} USDT.")
                 else:
                     print(f"⚠️ No tienes suficiente {symbol} para vender.")
             else:
-                print(f"↔️ No se realiza ninguna acción para {market_symbol} (mantener).")
+                print(f"↔️ Decisión de GPT: mantener {symbol}.")
 
+            # Pausa entre solicitudes para evitar limitaciones del exchange
             time.sleep(1)
 
         except Exception as e:
             print(f"❌ Error procesando {symbol}: {e}")
             continue
+
 
 
     # Mostrar resultados finales

@@ -13,7 +13,7 @@ exchange = ccxt.binance({
 })
 
 # Definir variables globales
-THRESHOLD_VOLUME_CHANGE = 0.05  # Porcentaje de cambio en el volumen (5%)
+THRESHOLD_VOLUME_CHANGE = 0.1  # Porcentaje de cambio en el volumen (5%)
 THRESHOLD_PRICE_CHANGE = 0.05  # Cambio del 5%
 INTERVAL_SECONDS = 14400  # Intervalo de 4 horas
 last_volumes = {}
