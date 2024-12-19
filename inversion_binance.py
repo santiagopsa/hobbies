@@ -44,8 +44,99 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Variables globales
-TRADE_SIZE = 10
+TRADE_SIZE = 20
 TRANSACTION_LOG = []
+
+# Filtrar cryptos con bajo volumen pero con crecimiento interesante
+def filter_low_volume_growth_cryptos(exchange, threshold=1.5):
+    markets = exchange.load_markets()
+    low_volume_cryptos = []
+    for symbol in markets:
+        if "USDT" not in symbol:  # Considera solo pares con USDT
+            continue
+        try:
+            ticker = exchange.fetch_ticker(symbol)
+            volume_relative = ticker['quoteVolume'] / ticker['average']
+            price_change = (ticker['last'] - ticker['open']) / ticker['open']
+            if volume_relative > threshold and price_change > 0.1:  # 10% de cambio en el precio
+                low_volume_cryptos.append(symbol)
+        except Exception as e:
+            print(f"Error al procesar {symbol}: {e}")
+    return low_volume_cryptos
+
+def validate_crypto_data(additional_data):
+    """
+    Verifica que todos los indicadores críticos estén presentes y sean válidos.
+    """
+    required_keys = [
+        "current_price", "relative_volume", "rsi", "avg_volume_24h",
+        "market_cap", "spread", "adx", "support", "resistance"
+    ]
+    for key in required_keys:
+        if key not in additional_data or additional_data[key] is None or np.isnan(additional_data[key]):
+            return False
+    return True
+
+def detect_exponential_growth(price_series, lookback=3, threshold=0.5):
+    recent_prices = price_series[-lookback:]
+    growth = (price_series.iloc[-1] - recent_prices.mean()) / recent_prices.mean()
+    return growth > threshold
+
+def filter_combined(exchange, threshold=1.5):
+    """
+    Filtra criptos con bajo volumen y crecimiento exponencial.
+    """
+    try:
+        markets = exchange.load_markets()
+        low_volume_cryptos = []
+        omitted_symbols = []  # Para registrar los pares omitidos
+        for symbol in markets:
+            if "USDT" not in symbol:  # Considera solo pares con USDT
+                continue
+            try:
+                ticker = exchange.fetch_ticker(symbol)
+                last_price = ticker.get('last')
+                open_price = ticker.get('open')
+                volume = ticker.get('quoteVolume')
+                avg_volume = ticker.get('average')
+
+                # Validar datos incompletos
+                missing_data = []
+                if last_price is None:
+                    missing_data.append("last_price")
+                if open_price is None:
+                    missing_data.append("open_price")
+                if volume is None:
+                    missing_data.append("quoteVolume")
+                if avg_volume is None:
+                    missing_data.append("average_volume")
+
+                if missing_data:
+                    #print(f"⚠️ Datos incompletos para {symbol}: {', '.join(missing_data)}. Se omite.")
+                    omitted_symbols.append((symbol, missing_data))
+                    continue
+
+                # Calcular volumen relativo y cambio de precio
+                volume_relative = volume / avg_volume if avg_volume > 0 else 0
+                price_change = (last_price - open_price) / open_price if open_price > 0 else 0
+
+                # Aplicar filtros de crecimiento exponencial
+                if volume_relative > threshold and price_change > 0.1:  # 10% de cambio en precio
+                    low_volume_cryptos.append((symbol, volume_relative, price_change))
+            except Exception as e:
+                print(f"Error en {symbol}: {e}")
+        # Opcional: Guardar pares omitidos para análisis posterior
+        if omitted_symbols:
+            with open("omitted_symbols_log.csv", "w") as f:
+                f.write("Symbol,MissingData\n")
+                for symbol, missing in omitted_symbols:
+                    f.write(f"{symbol},{','.join(missing)}\n")
+
+        return low_volume_cryptos
+    except Exception as e:
+        print(f"Error general al filtrar criptos: {e}")
+        return []
+
 
 def gpt_prepare_data(data_by_timeframe, additional_data):
     combined_data = ""
@@ -76,7 +167,6 @@ def gpt_prepare_data(data_by_timeframe, additional_data):
     - Spread: {additional_data.get('spread', 'No disponible')}
     - Market Depth Bids: {additional_data.get('market_depth_bids', 'No disponible')}
     - Market Depth Asks: {additional_data.get('market_depth_asks', 'No disponible')}
-    - Se necesita liquidez?: {additional_data.get('liquidity_need', 'No disponible')}
 
     Historial de transacciones recientes realizadas por mi para la moneda actual (no es informacion del mercado sino de nuestras transacciones):
     {additional_data.get('recent_transactions', 'No disponible')}
@@ -84,37 +174,41 @@ def gpt_prepare_data(data_by_timeframe, additional_data):
     Basándote en esta información:
     1. Proporciona un resumen estructurado de los indicadores críticos y secundarios.
     2. Decide si debemos "comprar", "vender" o "mantener".
-    3. Justifica tu decisión en 1-2 oraciones.
+    3. Justifica tu decisión en 1 oracion.
     4. Instrucciones adicionales {additional_data.get('instruction', 'No disponible')}
     """
 
     response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "Eres un experto en análisis financiero y trading."},
             {"role": "user", "content": prompt}
         ],
         temperature=0.5
     )
-    print(combined_data)
+    #print(combined_data)
     return response.choices[0].message.content.strip()
 
 def gpt_decision_buy(prepared_text):
     prompt = f"""
-    Eres un experto en trading. Basándote en el siguiente texto estructurado, decide si comprar, vender o mantener.
+    Eres un experto en trading. Basándote en el siguiente texto estructurado, decide si COMPRAR esta criptomoneda.
 
     Texto:
     {prepared_text}
 
-    Inicia tu respuesta con: "comprar" o "mantener". Incluye un resumen extremadamente corto de la decisión y un porcentaje de confianza.
+    **Objetivo principal**:
+    - Maximizar el uso del capital mientras aceptamos un riesgo moderado.
+    - Si las condiciones son razonables pero no ideales, decide COMPRAR para mantener el capital en movimiento.
+
+    Inicia el texto con "comprar" o "mantener". después Incluye un porcentaje de confianza y finalmente una breve explicación.
     """
     response = client.chat.completions.create(
-        model="gpt-4-turbo",
+        model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "Eres un experto en trading."},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.3
+        temperature=0.7
     )
     message = response.choices[0].message.content.strip().lower()
 
@@ -141,15 +235,15 @@ def gpt_decision_sell(prepared_text):
     Texto:
     {prepared_text}
 
-    Inicia UNICAMENTE tu respuesta con: "vender" o "mantener" teniendo muy encuenta la variable "recent_transactions" y teniendo en cuenta que el objetivo es aumentar el USDT. Incluye un breve resumen de tu decisión y un porcentaje de confianza.
+    Inicia tu respuesta UNICAMENTE con: "vender" o "mantener" no me interesa comprar teniendo muy encuenta la variable "recent_transactions" y teniendo en cuenta que el objetivo es aumentar el USDT que es mi moneda base. Incluye un resumen de 1 oracion de la decision y un porcentaje de confianza.
     """
     response = client.chat.completions.create(
-        model="gpt-4-turbo",
+        model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "Eres un asesor experto en trading."},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.3
+        temperature=0.5
     )
     message = response.choices[0].message.content.strip().lower()
 
@@ -184,32 +278,33 @@ def gpt_group_selection(data_by_symbol):
 
     # Primera fase: Selección por grupos (usando GPT-3.5)
     print("=== Iniciando selección por grupos ===")
-    for group in chunk_list(symbols, 3):
+    for group in chunk_list(symbols, 6):
         print(f"\nAnalizando grupo: {group}")
-        prompt_for_group = "Eres un experto en análisis financiero. Aquí tienes datos de varias criptomonedas. Necesito que elijas la mejor para comprar de este grupo.\n"
+        prompt_for_group = "Eres un experto en análisis financiero. Aquí tienes datos de varias criptomonedas. Necesito que elijas SOLO la mejor (SOLO UNA) para comprar de este grupo y me digas cual es.\n"
 
         for symbol in group:
             data_by_timeframe, additional_data = data_by_symbol[symbol]
             sub_text = gpt_prepare_data(data_by_timeframe, additional_data)
             # Imprimimos una parte del sub_text para no saturar
-            print(f"\n--- Datos para {symbol} ---\n{sub_text[:500]}...\n")  # Muestra primeros 500 caracteres
+            #print(f"\n--- Datos para {symbol} ---\n{sub_text[:500]}...\n")  # Muestra primeros 500 caracteres
             prompt_for_group += f"\n### {symbol}\n{sub_text}\n"
 
-        prompt_for_group += "\nBasándote en la información anterior, ¿cuál de estas criptos es la mejor opción para comprar? Devuelve solo el símbolo."
+        prompt_for_group += "\nBasándote en la información anterior, ¿cuál de estas criptos es la mejor opción para comprar? Devuelve solo el símbolo de la mejor."
         
         # Imprimimos el prompt completo que se envía a GPT-3.5
-        print(f"\n[Prompt a GPT-3.5 para el grupo {group}]:\n{prompt_for_group}\n")
+        #print(f"\n[Prompt a GPT-3.5 para el grupo {group}]:\n{prompt_for_group}\n")
 
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "Eres un experto en análisis financiero y trading."},
                 {"role": "user", "content": prompt_for_group}
             ],
-            temperature=0.5
+            temperature=0.7
         )
         answer = response.choices[0].message.content.strip()
-        print(f"[Respuesta GPT-3.5 para el grupo {group}]: {answer}")
+        print(answer)
+        #print(f"[Respuesta GPT-3.5 para el grupo {group}]: {answer}")
 
         chosen_symbol = None
         for s in group:
@@ -238,22 +333,23 @@ def gpt_group_selection(data_by_symbol):
         for sym in finalists:
             data_by_timeframe, additional_data = data_by_symbol[sym]
             sub_prepared = gpt_prepare_data(data_by_timeframe, additional_data)
-            print(f"\n--- Datos finalistas para {sym} ---\n{sub_prepared[:500]}...\n")
+            #print(f"\n--- Datos finalistas para {sym} ---\n{sub_prepared[:500]}...\n")
             prompt_final += f"\n### {sym}\n{sub_prepared}\n"
 
         prompt_final += "\n¿Cuál es la mejor cripto para comprar? Devuelve solo su símbolo."
 
         # Imprimimos el prompt completo que se envía a GPT-4
-        print(f"\n[Prompt a GPT-4 para finalistas]:\n{prompt_final}\n")
+        #print(f"\n[Prompt a GPT-4 turbo para finalistas]:\n{prompt_final}\n")
 
         final_response = client.chat.completions.create(
-            model="gpt-4",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "Eres un experto en análisis financiero y trading."},
                 {"role": "user", "content": prompt_final}
             ],
             temperature=0.5
         )
+        print(final_response)
         final_answer = final_response.choices[0].message.content.strip()
         print(f"[Respuesta GPT-4 para finalistas]: {final_answer}")
 
@@ -510,6 +606,46 @@ def execute_order_buy(symbol, amount, confidence, explanation):
         print(f"❌ Error al ejecutar la orden de compra para {symbol}: {e}")
         return None
 
+def make_buy(symbol, budget, risk_type, confidence=None, explanation=None):
+    """
+    Realiza la compra de una cripto utilizando la función `execute_order_buy`, ajustando el presupuesto según la confianza.
+    """
+    # Ajustar el presupuesto en base al porcentaje de confianza
+    if confidence <= 70:
+        adjusted_budget = budget * 0.4  # 40% del presupuesto
+    elif 70 < confidence <= 75:
+        adjusted_budget = budget * 0.6  # 60% del presupuesto
+    elif 75 < confidence <= 85:
+        adjusted_budget = budget * 0.8  # 80% del presupuesto
+    elif confidence > 85:
+        adjusted_budget = budget  # 100% del presupuesto
+    else:
+        print(f"⚠️ Confianza no válida: {confidence}")
+        return
+
+    print(f"🔍 Presupuesto ajustado: {adjusted_budget:.2f} USDT (Confianza: {confidence}%)")
+
+    # Obtener el precio actual
+    final_price = fetch_price(symbol)
+    if not final_price:
+        print(f"⚠️ No se pudo obtener el precio para {symbol}.")
+        return
+
+    # Calcular la cantidad a comprar
+    amount_to_buy = adjusted_budget / final_price
+    print(f"Cantidad a comprar: {amount_to_buy:.6f}")
+
+    # Verificar si cumple con el mínimo notional
+    if amount_to_buy * final_price >= 2:  # Mínimo notional de Binance
+        order = execute_order_buy(symbol, amount_to_buy, confidence, explanation)
+        if order:
+            print(f"✅ Compra ejecutada para {symbol} ({risk_type})")
+        else:
+            print(f"❌ No se pudo ejecutar la compra para {symbol} ({risk_type}).")
+    else:
+        print(f"⚠️ La cantidad calculada para {symbol} no cumple con el mínimo notional.")
+
+
 def execute_order_sell(symbol, confidence, explanation):
     """
     Ejecuta una orden de venta y registra la transacción en la base de datos.
@@ -741,27 +877,33 @@ def demo_trading():
 
     if usdt_balance <= 5:
         print("⚠️ Sin saldo suficiente en USDT. Se omite el proceso de compra.")
-    else:
+        return
 
-        selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=10)
-        print(f"Criptos seleccionadas para análisis: {selected_cryptos}")
+    # Presupuesto máximo para criptos de bajo volumen (20% del saldo)
+    high_risk_budget = usdt_balance * 0.2
+    low_risk_budget = usdt_balance - high_risk_budget
 
-        data_by_symbol = {}
-        for symbol in selected_cryptos:
-            data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(symbol)
-            final_price = fetch_price(symbol)
-            if data_by_timeframe and volume_series is not None and price_series is not None:
-                support, resistance = calculate_support_resistance(price_series)
-                adx = calculate_adx(data_by_timeframe["1h"])
-                if "close" in data_by_timeframe["1h"].columns:
-                    prices = data_by_timeframe["1h"]["close"].values  # Extraer precios de cierre
-                    rsis = calculate_rsi(prices, period=14)  # Calcular RSI
-                    rsi = rsis[-1] if not np.isnan(rsis[-1]) else "No disponible"  # Último RSI calculado
-                else:
-                    rsi = "No disponible"
-                market_depth = calculate_market_depth(symbol)
-                candlestick_pattern = identify_candlestick_patterns(data_by_timeframe["1h"])
-                additional_data = {
+    # 1. Criptos de alto volumen (bajo riesgo)
+    print("Analizando criptos de alto volumen (bajo riesgo)...")
+    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=18)
+    print(f"Criptos seleccionadas para análisis: {selected_cryptos}")
+
+    data_by_symbol = {}
+    for symbol in selected_cryptos:
+        data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(symbol)
+        final_price = fetch_price(symbol)
+        if data_by_timeframe and volume_series is not None and price_series is not None:
+            support, resistance = calculate_support_resistance(price_series)
+            adx = calculate_adx(data_by_timeframe["1h"])
+            if "close" in data_by_timeframe["1h"].columns:
+                prices = data_by_timeframe["1h"]["close"].values  # Extraer precios de cierre
+                rsis = calculate_rsi(prices, period=14)  # Calcular RSI
+                rsi = rsis[-1] if not np.isnan(rsis[-1]) else "No disponible"
+            else:
+                rsi = "No disponible"
+            market_depth = calculate_market_depth(symbol)
+            candlestick_pattern = identify_candlestick_patterns(data_by_timeframe["1h"])
+            additional_data = {
                 "current_price": final_price,
                 "relative_volume": calculate_relative_volume(volume_series),
                 "rsi": rsi,
@@ -777,63 +919,114 @@ def demo_trading():
                 "market_depth_asks": market_depth["total_asks"],
                 "candlestick_pattern": candlestick_pattern
             }
-                data_by_symbol[symbol] = (data_by_timeframe, additional_data)
-            else:
-                print(f"⚠️ Datos insuficientes para {symbol}, se omite.")
-
-        if not data_by_symbol:
-            print("⚠️ No hay criptos con datos válidos para analizar.")
-            return
-
-        # Seleccionar la mejor cripto entre todas (fase grupal y luego final)
-        final_winner = gpt_group_selection(data_by_symbol)
-        if not final_winner:
-            print("⚠️ No se pudo determinar una cripto ganadora.")
-            return
-        
-        # Verificar si la cripto ganadora fue comprada en las últimas 2 horas
-        recent_transactions = fetch_all_transactions()
-        now = pd.Timestamp.now()
-        recent_buys = [
-            tx for tx in recent_transactions
-            if tx[1] == final_winner and tx[2] == "buy" and now - pd.Timestamp(tx[5]) <= pd.Timedelta(hours=2)
-        ]
-
-        if recent_buys:
-            print(f"⚠️ {final_winner} ya fue comprada en las últimas 2 horas. No se realiza nueva compra.")
-            return
-
-        # Ahora que tenemos la cripto ganadora, consultamos a GPT si realmente debemos comprarla
-        winner_data_by_timeframe, winner_additional_data = data_by_symbol[final_winner]
-        prepared_text = gpt_prepare_data(winner_data_by_timeframe, winner_additional_data)
-        action, confidence, explanation = gpt_decision_buy(prepared_text)
-
-        if action == "comprar":
-            final_price = fetch_price(final_winner)
-            if final_price and (usdt_balance > final_price * 0.001):
-                amount_to_buy = TRADE_SIZE / final_price
-                order = execute_order_buy(final_winner, amount_to_buy, confidence, explanation)
-                if order:
-                    print(f"✅ Orden de compra ejecutada para {final_winner}")
-                    insert_transaction(
-                        symbol=final_winner,
-                        action="buy",
-                        price=final_price,
-                        amount=amount_to_buy,
-                        timestamp=pd.Timestamp.now().isoformat(),
-                        profit_loss=None,
-                        confidence_percentage=confidence,
-                        summary=explanation
-                    )
-                else:
-                    print("❌ No se pudo ejecutar la orden de compra.")
-            else:
-                print("⚠️ No hay saldo suficiente o no se pudo obtener el precio para la cripto finalista.")
+            data_by_symbol[symbol] = (data_by_timeframe, additional_data)
         else:
-            # GPT decidió que no es momento de comprar (mantener o vender)
-            print(f"↔️ GPT recomienda {action}. No se realiza compra de {final_winner}.")
+            print(f"⚠️ Datos insuficientes para {symbol}, se omite.")
 
-    # Lógica de ventas
+    if data_by_symbol:
+        final_winner = gpt_group_selection(data_by_symbol)
+        if final_winner:
+            winner_data_by_timeframe, winner_additional_data = data_by_symbol[final_winner]
+            prepared_text = gpt_prepare_data(winner_data_by_timeframe, winner_additional_data)
+            action, confidence, explanation = gpt_decision_buy(prepared_text)
+            print(f"El ganador final es {final_winner}")
+            print(f"******************************************")
+            print(f"Se recomienda {action}")
+            print(f"******************************************")
+            print(f"La explicación es: {explanation}")
+
+            if action == "comprar":
+                make_buy(final_winner, low_risk_budget, "bajo riesgo", confidence, explanation)
+    else:
+        print("⚠️ No se encontraron criptos válidas de alto volumen.")
+
+    # 2. Criptos de bajo volumen (alto riesgo)
+    print("Analizando criptos de bajo volumen (alto riesgo)...")
+    low_volume_candidates = filter_combined(exchange)
+    print(f"Criptos de bajo volumen seleccionadas: {low_volume_candidates}")
+
+    # Inicializar la lista de criptos interesantes
+    valid_cryptos = []
+
+    # Evaluar las criptos de bajo volumen con validación de datos
+    for symbol, volume, price_change in low_volume_candidates:
+        try:
+            # Obtener datos y calcular indicadores
+            data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(symbol)
+            if not data_by_timeframe or volume_series is None or price_series is None:
+                print(f"⚠️ Datos insuficientes para {symbol}, se omite.")
+                continue
+
+            # Calcular indicadores técnicos
+            support, resistance = calculate_support_resistance(price_series)
+            adx = calculate_adx(data_by_timeframe["1h"])
+            prices = data_by_timeframe["1h"]["close"].values if "close" in data_by_timeframe["1h"].columns else None
+            rsi = calculate_rsi(prices, period=14)[-1] if prices is not None else None
+            additional_data = {
+                "current_price": fetch_price(symbol),
+                "relative_volume": calculate_relative_volume(volume_series),
+                "rsi": rsi,
+                "avg_volume_24h": fetch_avg_volume_24h(volume_series),
+                "market_cap": fetch_market_cap(symbol),
+                "spread": calculate_spread(symbol),
+                "fear_greed": fetch_fear_greed_index(),
+                "price_std_dev": calculate_price_std_dev(price_series),
+                "adx": adx,
+                "support": support,
+                "resistance": resistance,
+                "candlestick_pattern": identify_candlestick_patterns(data_by_timeframe["1h"]),
+            }
+
+            # Validar indicadores necesarios
+            if validate_crypto_data(additional_data):
+                valid_cryptos.append({
+                    "symbol": symbol,
+                    "price_change": price_change,
+                    "volume": volume,
+                    "additional_data": additional_data
+                })
+            else:
+                print(f"⚠️ {symbol} omitida por datos insuficientes.")
+        except Exception as e:
+            print(f"❌ Error al procesar {symbol}: {e}")
+
+    # Verificar si hay criptos válidas
+    if not valid_cryptos:
+        print("⚠️ No se encontraron criptos interesantes de bajo volumen. Finalizando.")
+        return
+
+    # Ordenar por volumen y cambio de precio
+    valid_cryptos.sort(key=lambda x: (x["price_change"], x["volume"]), reverse=True)
+    top_interesting_cryptos = valid_cryptos[:2]
+    print(f"Top 2 criptos interesantes de bajo volumen: {top_interesting_cryptos}")
+
+    # Evaluar con GPT si comprar las criptos seleccionadas
+    for crypto in top_interesting_cryptos:
+        try:
+            prepared_text = gpt_prepare_data(
+                fetch_and_prepare_data(crypto["symbol"])[0],
+                crypto["additional_data"]
+            )
+            action, confidence, explanation = gpt_decision_buy(prepared_text)
+            print(f"La cripto interesante de bajo volumen es: {crypto['symbol']}")
+            print(f"******************************************")
+            print(f"Se recomienda {action}")
+            print(f"******************************************")
+            print(f"La explicación es: {explanation}")
+            
+            # Ejecutar compra si GPT recomienda
+            if action == "comprar":
+                make_buy(
+                    crypto["symbol"],
+                    high_risk_budget / len(top_interesting_cryptos),
+                    "alto riesgo",
+                    confidence,
+                    explanation
+                )
+        except Exception as e:
+            print(f"❌ Error al evaluar {crypto['symbol']}: {e}")
+
+   # Lógica de ventas
     portfolio_cryptos = get_portfolio_cryptos()
     filtered_portfolio = []
     for symbol in portfolio_cryptos:
@@ -849,7 +1042,7 @@ def demo_trading():
 
             # Si el valor es menor a 0.1 USDT no vale la pena analizar venta
             # Ajusta este valor según el mínimo notional del exchange o tu criterio
-            if value_in_usdt < 0.1:
+            if value_in_usdt < 0.5:
                 print(f"⚠️ {symbol} tiene un valor en USDT muy bajo ({value_in_usdt:.5f}), se omite análisis de venta.")
             else:
                 filtered_portfolio.append(symbol)

@@ -4,12 +4,17 @@ import ccxt
 import os
 import requests
 import numpy as np
+import sqlite3
+from inversion_binance import execute_order_sell
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Configurar Binance
 exchange = ccxt.binance({
     "enableRateLimit": True,
-    "apiKey": os.getenv("BINANCE_API_KEY"),  # Cambia a tu clave real
-    "secret": os.getenv("BINANCE_SECRET_KEY"),
+    "apiKey": os.getenv("BINANCE_API_KEY_REAL"),  # Cambia a tu clave real
+    "secret": os.getenv("BINANCE_SECRET_KEY_REAL"),
 })
 
 # Definir variables globales
@@ -20,6 +25,37 @@ last_volumes = {}
 last_prices = {}
 last_conditions = {}  # Global para registrar última revisión por símbolo
 
+
+# Función para la lógica de inversión completa (ejecutar cada 20 minutos)
+def run_investment_logic():
+    print(f"🏁 Ejecutando lógica de inversión a las {datetime.datetime.now()}")
+    try:
+        # Llama a tu función de inversión principal
+        monitor_and_run()
+    except Exception as e:
+        print(f"⚠️ Error en la lógica de inversión: {e}")
+
+# Función principal para manejar ambos procesos
+def main_loop():
+    # Tiempos de última ejecución
+    last_trailing_stop_time = time.time()
+    last_investment_logic_time = time.time()
+
+    while True:
+        current_time = time.time()
+
+        # Verificar si es tiempo de ejecutar el trailing stop (cada 1 minuto)
+        if current_time - last_trailing_stop_time >= 60:  # 1 minuto
+            monitor_trailing_stops()
+            last_trailing_stop_time = current_time
+
+        # Verificar si es tiempo de ejecutar la lógica de inversión (cada 20 minutos)
+        if current_time - last_investment_logic_time >= 1200:  # 20 minutos
+            run_investment_logic()
+            last_investment_logic_time = current_time
+
+        # Pequeña pausa para evitar consumir demasiados recursos
+        time.sleep(1)
 
 # Función para obtener velas históricas
 def fetch_klines(symbol, interval="1h", limit=100):
@@ -136,6 +172,98 @@ def fetch_volume(symbol):
     except Exception as e:
         print(f"❌ Error al obtener el volumen para {symbol}: {e}")
         return None
+    
+# Función para implementar el trailing stop con validación de saldo mínimo y valor notional
+def trailing_stop(symbol, current_price, trailing_percentage):
+    """
+    Monitorea y ajusta el trailing stop en base al precio actual, el saldo y el trailing percentage.
+    """
+    try:
+        # Conectar con la base de datos de transacciones
+        conn = sqlite3.connect('trading_real.db')  # Reemplaza con la ruta real
+        cursor = conn.cursor()
+
+        # Consultar el precio de compra para el símbolo
+        cursor.execute("""
+            SELECT price FROM transactions
+            WHERE symbol = ? AND action = 'buy'
+            ORDER BY timestamp DESC LIMIT 1
+        """, (symbol,))
+        result = cursor.fetchone()
+
+        if not result:
+            print(f"⚠️ No se encontró precio de compra para {symbol} en la base de datos.")
+            return
+
+        buy_price = result[0]
+
+        # Obtener saldo disponible del portafolio
+        balance = exchange.fetch_balance()
+        asset = symbol.split('/')[0]  # Obtener el nombre del activo (e.g., LINK)
+        asset_balance = balance['free'].get(asset, 0)
+
+        if asset_balance <= 0:
+            print(f"⚠️ {asset} no tiene saldo disponible, se omite del trailing stop.")
+            return
+
+        # Calcular el valor notional en USDT
+        value_in_usdt = asset_balance * current_price
+
+        # Validar que el valor notional sea mayor al mínimo permitido
+        min_notional = 5.0  # Valor mínimo de Binance
+        if value_in_usdt < min_notional:
+            print(f"⚠️ El valor notional para {symbol} es {value_in_usdt:.2f} USDT, menor al mínimo permitido de {min_notional:.2f} USDT.")
+            return
+
+        # Calcular el nivel de trailing stop
+        max_price = max(buy_price, current_price)
+        stop_price = max_price * (1 - trailing_percentage)
+
+        print(f"🔍 {symbol}: Precio compra: {buy_price:.2f}, Máximo: {max_price:.2f}, Trailing Stop: {stop_price:.2f}")
+
+        # Si el precio cae por debajo del stop, vender
+        if current_price <= stop_price:
+            print(f"⚠️ Activando trailing stop para {symbol}. Vendiendo...")
+            execute_order_sell(symbol, confidence=100, explanation="Trailing stop activado.")
+
+        conn.close()
+
+    except Exception as e:
+        print(f"❌ Error en el trailing stop para {symbol}: {e}")
+
+# Ejecutar trailing stop para todo el portafolio
+# Función para monitorear trailing stops con validación de saldo mínimo
+def monitor_trailing_stops():
+    """
+    Monitorea el portafolio y aplica el trailing stop a cada activo con saldo mayor a 0.1 USDT.
+    """
+    try:
+        # Obtener el portafolio actual de Binance
+        balance = exchange.fetch_balance()
+
+        for asset, details in balance['total'].items():
+            # Ignorar USDT o activos con saldo cero
+            if asset == 'USDT' or details <= 0:
+                continue  
+
+            market_symbol = f"{asset}/USDT"
+            current_price = fetch_price(market_symbol)
+
+            if current_price:
+                # Calcular el valor en USDT
+                value_in_usdt = details * current_price
+
+                # Ignorar monedas con valor menor a 0.1 USDT
+                if value_in_usdt < 0.5:
+                    #print(f"⚠️ {asset} tiene un valor menor a 0.1 USDT, se omite del monitoreo.")
+                    continue  # Corregido: usar continue en lugar de return
+
+                # Aplicar el trailing stop si pasa la validación
+                trailing_stop(market_symbol, current_price, trailing_percentage=0.05)  # Ajusta el porcentaje según tu estrategia
+
+    except Exception as e:
+        print(f"❌ Error al monitorear trailing stops: {e}")
+
 
 # Función para ejecutar lógica de trading
 def run_trading():
@@ -147,13 +275,41 @@ def run_trading():
     except Exception as e:
         print(f"❌ Error al ejecutar demo_trading: {e}")
 
+def fetch_portfolio_symbols():
+    """
+    Obtiene las criptos del portafolio con saldo positivo desde Binance y las devuelve en formato "SYMBOL/USDT".
+    """
+    try:
+        balance = exchange.fetch_balance()
+        portfolio_symbols = []
+        for asset, details in balance['total'].items():
+            if asset == 'USDT' or details <= 0:
+                continue  # Ignorar USDT y activos sin saldo
+            portfolio_symbols.append(f"{asset}/USDT")
+        return portfolio_symbols
+    except Exception as e:
+        print(f"❌ Error al obtener criptos del portafolio: {e}")
+        return []
+
+
 # Monitoreo principal
 def monitor_and_run():
     global INTERVAL_SECONDS
-    symbols = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "ADA/USDT"]
-    binance_symbols = [symbol.replace("/", "") for symbol in symbols]
-    next_execution_time = time.time() + INTERVAL_SECONDS
 
+    # Obtener las criptos iniciales que siempre deseas monitorear
+    base_symbols = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "ADA/USDT"]
+    try:
+        exchange.check_required_credentials()
+    except Exception as e:
+        print(f"Error de credenciales: {e}")
+
+    
+    # Obtener criptos dinámicamente
+    portfolio_symbols = fetch_portfolio_symbols()
+    symbols = list(set(base_symbols + portfolio_symbols))  # Combina y elimina duplicados
+    binance_symbols = [symbol.replace("/", "") for symbol in symbols]
+
+    next_execution_time = time.time() + INTERVAL_SECONDS
     last_conditions = {}  # Almacena RSI, volumen, precios, etc.
 
     print("🚀 Ejecución inicial al iniciar el programa.")
@@ -164,10 +320,9 @@ def monitor_and_run():
         time.sleep(1200)  # Espera 20 minutos antes de la próxima evaluación
         try:
             execute_now = False
-            print(f"🔍 Monitoreando Simbolos para definir si entrar trading")
-            for symbol, binance_symbol in zip(symbols, binance_symbols):
-                
+            print(f"🔍 Monitoreando símbolos para definir si entrar en trading")
 
+            for symbol, binance_symbol in zip(symbols, binance_symbols):
                 # Obtener precios y volúmenes actuales
                 current_price = fetch_price(binance_symbol)
                 current_volume = fetch_volume(binance_symbol)
@@ -184,7 +339,7 @@ def monitor_and_run():
                 if significant_price_change(binance_symbol, current_price):
                     execute_now = True
 
-            # Ejecutar si hay cambios significativos
+            # Ejecutar si hay cambios significativos o se alcanza el tiempo de ejecución
             if execute_now or time.time() >= next_execution_time:
                 run_trading()
                 next_execution_time = time.time() + INTERVAL_SECONDS
@@ -198,7 +353,9 @@ def monitor_and_run():
         except Exception as e:
             print(f"❌ Error durante el monitoreo: {e}")
 
-if __name__ == "__main__":
-    print("Iniciando monitoreo de trading...")
-    monitor_and_run()
 
+# Llama a la función principal
+if __name__ == "__main__":
+    print("Iniciando el proceso principal...")
+    print("Se hace el analisis de volumenes cada 20 minutos y el trailing stop cada 1 minuto")
+    main_loop()
