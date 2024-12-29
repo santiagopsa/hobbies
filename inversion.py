@@ -174,16 +174,20 @@ def fetch_volume(symbol):
         return None
     
 # Función para implementar el trailing stop con validación de saldo mínimo y valor notional
-def trailing_stop(symbol, current_price, trailing_percentage):
+def trailing_stop(symbol, current_price, atr_multiplier=2):
     """
-    Monitorea y ajusta el trailing stop en base al precio actual, el saldo y el trailing percentage.
+    Monitorea y ajusta el trailing stop en base al ATR
     """
     try:
-        # Conectar con la base de datos de transacciones
-        conn = sqlite3.connect('trading_real.db')  # Reemplaza con la ruta real
-        cursor = conn.cursor()
+        # Obtener ATR
+        atr = calculate_atr(symbol)
+        if atr is None:
+            print(f"⚠️ No se pudo calcular ATR para {symbol}")
+            return
 
-        # Consultar el precio de compra para el símbolo
+        # Consultar el precio de compra
+        conn = sqlite3.connect('trading_real.db') 
+        cursor = conn.cursor()
         cursor.execute("""
             SELECT price FROM transactions
             WHERE symbol = ? AND action = 'buy'
@@ -217,7 +221,7 @@ def trailing_stop(symbol, current_price, trailing_percentage):
 
         # Calcular el nivel de trailing stop
         max_price = max(buy_price, current_price)
-        stop_price = max_price * (1 - trailing_percentage)
+        stop_price = max_price * (1 - atr_multiplier * atr)
 
         print(f"🔍 {symbol}: Precio compra: {buy_price:.2f}, Máximo: {max_price:.2f}, Trailing Stop: {stop_price:.2f}")
 
