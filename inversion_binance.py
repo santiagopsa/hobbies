@@ -392,7 +392,7 @@ def gpt_decision_buy(prepared_text):
     **Objetivo principal**:
     - Maximizar el uso del capital mientras aceptamos un riesgo alto.
     - Si las condiciones son razonables pero no ideales, decide COMPRAR para mantener el capital en movimiento.
-    - NO COMPRAR si hay divergencias bajistas o problemas de liquidez significativos.
+    - MANTENER si hay divergencias bajistas o problemas de liquidez significativos.
 
     Inicia el texto con "comprar" o "mantener". después Incluye un porcentaje de confianza y finalmente una breve explicación.
     """
@@ -1005,8 +1005,8 @@ def analyze_candlestick_patterns(df, pattern_type='all'):
     @param pattern_type: 'all', 'basic', o 'advanced'
     @return: Lista de tuplas (patrón, índice, dirección)
     """
+    patterns = []  # Inicializar la lista de patrones
     try:
-        patterns = []
         if not isinstance(df, pd.DataFrame) or df.empty:
             return patterns
             
@@ -1042,7 +1042,7 @@ def analyze_candlestick_patterns(df, pattern_type='all'):
         return patterns
     except Exception as e:
         print(f"Error en analyze_candlestick_patterns: {e}")
-        return []
+        return patterns  # Retornar la lista vacía en caso de error
 
 def calculate_market_depth(symbol, depth=10):
     """
@@ -1161,7 +1161,7 @@ def demo_trading():
 
     # 1. Criptos de alto volumen (bajo riesgo)
     print("Analizando criptos de alto volumen (bajo riesgo)...")
-    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=50)
+    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=18)
 
     data_by_symbol = {}
     for symbol in selected_cryptos:
@@ -1386,8 +1386,8 @@ def demo_trading():
                 market_cap=market_cap,
                 spread=spread,
                 price_std_dev=price_std_dev,
-                candlestick_pattern=candlestick_pattern,
                 current_price=current_price,
+                candlestick_pattern=None,
                 market_depth_bids=market_depth["total_bids"],
                 market_depth_asks=market_depth["total_asks"]
             )

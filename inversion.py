@@ -25,6 +25,35 @@ last_volumes = {}
 last_prices = {}
 last_conditions = {}  # Global para registrar última revisión por símbolo
 
+def calculate_atr(symbol, period=14):
+    try:
+        # Fetch historical data
+        klines = fetch_klines(symbol, interval="1h", limit=period+1)
+        if not klines:
+            return None
+            
+        # Calculate True Range for each period
+        true_ranges = []
+        for i in range(1, len(klines)):
+            high = float(klines[i][2])
+            low = float(klines[i][3])
+            prev_close = float(klines[i-1][4])
+            
+            tr = max(
+                high - low,
+                abs(high - prev_close),
+                abs(low - prev_close)
+            )
+            true_ranges.append(tr)
+            
+        # Calculate ATR as average of true ranges
+        atr = sum(true_ranges) / len(true_ranges)
+        return atr / float(klines[-1][4])  # Return as a percentage of current price
+        
+    except Exception as e:
+        print(f"Error calculating ATR for {symbol}: {e}")
+        return None
+
 
 # Función para la lógica de inversión completa (ejecutar cada 20 minutos)
 def run_investment_logic():
@@ -59,8 +88,11 @@ def main_loop():
 
 # Función para obtener velas históricas
 def fetch_klines(symbol, interval="1h", limit=100):
+    # Reemplazar la barra inclinada para cumplir con el formato de Binance
+    binance_symbol = symbol.replace("/", "")
+    
     url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    params = {"symbol": binance_symbol, "interval": interval, "limit": limit}
     response = requests.get(url, params=params)
     if response.status_code != 200:
         print(f"❌ Error al obtener velas para {symbol}: {response.text}")
@@ -184,7 +216,7 @@ def trailing_stop(symbol, current_price, atr_multiplier=2):
         if atr is None:
             print(f"⚠️ No se pudo calcular ATR para {symbol}")
             return
-
+        print(f"ATR para {symbol}: {atr}")
         # Consultar el precio de compra
         conn = sqlite3.connect('trading_real.db') 
         cursor = conn.cursor()
@@ -259,11 +291,10 @@ def monitor_trailing_stops():
 
                 # Ignorar monedas con valor menor a 0.1 USDT
                 if value_in_usdt < 0.5:
-                    #print(f"⚠️ {asset} tiene un valor menor a 0.1 USDT, se omite del monitoreo.")
-                    continue  # Corregido: usar continue en lugar de return
+                    continue
 
-                # Aplicar el trailing stop si pasa la validación
-                trailing_stop(market_symbol, current_price, trailing_percentage=0.05)  # Ajusta el porcentaje según tu estrategia
+                # Aplicar el trailing stop
+                trailing_stop(market_symbol, current_price)
 
     except Exception as e:
         print(f"❌ Error al monitorear trailing stops: {e}")
@@ -363,3 +394,4 @@ if __name__ == "__main__":
     print("Iniciando el proceso principal...")
     print("Se hace el analisis de volumenes cada 20 minutos y el trailing stop cada 1 minuto")
     main_loop()
+
