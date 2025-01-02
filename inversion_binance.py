@@ -44,7 +44,7 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Variables globales
-TRADE_SIZE = 20
+TRADE_SIZE = 40
 TRANSACTION_LOG = []
 
 
