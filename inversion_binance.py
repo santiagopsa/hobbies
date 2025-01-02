@@ -862,7 +862,7 @@ def make_buy(symbol, budget, risk_type, confidence=None, explanation=None):
     elif 70 < confidence <= 75:
         adjusted_budget = budget * 0.1  # 60% del presupuesto
     elif 75 < confidence <= 85:
-        adjusted_budget = budget * 0.15  # 80% del presupuesto
+        adjusted_budget = budget * 0.2  # 80% del presupuesto
     elif confidence > 85:
         adjusted_budget = budget * 0.3  # 100% del presupuesto
     else:
