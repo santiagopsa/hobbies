@@ -858,13 +858,13 @@ def make_buy(symbol, budget, risk_type, confidence=None, explanation=None):
     """
     # Ajustar el presupuesto en base al porcentaje de confianza
     if confidence <= 70:
-        adjusted_budget = budget * 0.08  # 40% del presupuesto
+        adjusted_budget = budget * 0.08  # 8% del presupuesto
     elif 70 < confidence <= 75:
-        adjusted_budget = budget * 0.1  # 60% del presupuesto
+        adjusted_budget = budget * 0.15  # 15% del presupuesto
     elif 75 < confidence <= 85:
-        adjusted_budget = budget * 0.2  # 80% del presupuesto
+        adjusted_budget = budget * 0.3  # 30% del presupuesto
     elif confidence > 85:
-        adjusted_budget = budget * 0.3  # 100% del presupuesto
+        adjusted_budget = budget * 0.5  # 50% del presupuesto
     else:
         print(f"⚠️ Confianza no válida: {confidence}")
         return
