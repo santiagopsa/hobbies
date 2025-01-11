@@ -1348,7 +1348,7 @@ def demo_trading():
                 )
                 try:
                     print(f"Comprando {crypto['symbol']} con éxito a un valor de {high_risk_budget / len(top_interesting_cryptos)} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
-                    send_telegram_message(f"Comprando {crypto['symbol']} con éxito")
+                    send_telegram_message(f"Comprando {crypto['symbol']} con éxito a un valor de {high_risk_budget / len(top_interesting_cryptos)} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
                 except Exception as e:
                     print(f"❌ Error enviando mensaje de prueba a Telegram: {e}")
         except Exception as e:
