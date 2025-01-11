@@ -47,6 +47,35 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 TRADE_SIZE = 40
 TRANSACTION_LOG = []
 
+def send_telegram_message(message):
+    """
+    Envía un mensaje de texto simple a tu bot de Telegram usando las variables de entorno:
+    - TELEGRAM_BOT_TOKEN
+    - TELEGRAM_CHAT_ID
+    """
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("No se configuró el token o chat ID de Telegram en las variables de entorno.")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': message
+    }
+    try:
+        response = requests.post(url, json=payload)
+        if response.status_code == 200:
+            print("✅ Mensaje enviado a Telegram con éxito.")
+        else:
+            print(f"❌ Error al enviar mensaje a Telegram: {response.text}")
+    except Exception as e:
+        print(f"❌ Error al conectar con Telegram: {str(e)}")
+
+# Llamada de prueba, por ejemplo justo después de tu verificación de conexión con Binance
+
 
 def detect_momentum_divergences(price_series, rsi_values):
     """
@@ -1226,6 +1255,11 @@ def demo_trading():
 
             if action == "comprar":
                 make_buy(final_winner, low_risk_budget, "bajo riesgo", confidence, explanation)
+                try:
+                    print(f"Comprando {final_winner} con éxito a un valor de {low_risk_budget} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
+                    send_telegram_message(f"Comprando {final_winner} con éxito a un valor de {low_risk_budget} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
+                except Exception as e:
+                    print(f"❌ Error enviando mensaje de prueba a Telegram: {e}")
     else:
         print("⚠️ No se encontraron criptos válidas de alto volumen.")
 
@@ -1312,6 +1346,11 @@ def demo_trading():
                     confidence,
                     explanation
                 )
+                try:
+                    print(f"Comprando {crypto['symbol']} con éxito a un valor de {high_risk_budget / len(top_interesting_cryptos)} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
+                    send_telegram_message(f"Comprando {crypto['symbol']} con éxito")
+                except Exception as e:
+                    print(f"❌ Error enviando mensaje de prueba a Telegram: {e}")
         except Exception as e:
             print(f"❌ Error al evaluar {crypto['symbol']}: {e}")
 
@@ -1468,6 +1507,11 @@ def demo_trading():
                             summary=explanation
                         )
                         print(f"✅ Venta realizada para {symbol} a {current_price} USDT.")
+                        try:
+                            print(f"Vendiendo {symbol} con éxito a un valor de {current_price} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
+                            send_telegram_message(f"Vendiendo {symbol} con éxito a un valor de {current_price} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
+                        except Exception as e:
+                            print(f"❌ Error enviando mensaje de prueba a Telegram: {e}")
                 else:
                     print(f"⚠️ No tienes suficiente {symbol} para vender.")
             else:
