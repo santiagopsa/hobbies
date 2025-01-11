@@ -1491,7 +1491,7 @@ def demo_trading():
             print(f"La explicacion es:.................... {explanation}")
 
             try:
-                send_telegram_message(f"la decision de vender es :..... {action}, en la cripto {market_symbol} El nivel de confianza es:.... {confidence}, La explicacion es:.... {explanation}")
+                send_telegram_message(f"la decision de vender es : {action}, en la cripto {market_symbol} El nivel de confianza es: {confidence}, La explicacion es: {explanation}")
             except Exception as e:
                 print(f"❌ Error enviando mensaje de prueba a Telegram: {e}")
 
