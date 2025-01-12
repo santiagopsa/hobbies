@@ -1845,9 +1845,16 @@ def demo_trading():
 
             # Crear tabla de transacciones recientes en formato legible
             if recent_transactions:
-                transaction_table = pd.DataFrame(recent_transactions, columns=[
+                print("Datos de recent_transactions:", recent_transactions)
+                print("Número de columnas esperadas:", len([
                     "ID", "Symbol", "Action", "Price", "Amount", "Timestamp", 
                     "Profit/Loss", "Confidence %", "Summary"
+                ]))
+                print("Número de columnas en datos recibidos:", len(recent_transactions[0]) if recent_transactions else 0)
+
+                transaction_table = pd.DataFrame(recent_transactions, columns=[
+                    "ID", "Symbol", "Action", "Price", "Amount", "Timestamp", 
+                    "Profit/Loss", "Confidence %", "Summary", "Extra"
                 ])
                 transaction_table_summary = transaction_table.tail(5).to_string(index=False)
             else:

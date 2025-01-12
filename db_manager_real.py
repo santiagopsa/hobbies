@@ -49,20 +49,22 @@ def insert_market_condition(symbol, timestamp, resistance, support, adx, rsi, re
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO market_conditions (
-                symbol, timestamp, resistance, support, adx, rsi, relative_volume,
-                avg_volume_24h, market_cap, spread, price_std_dev, candlestick_pattern,
-                current_price, market_depth_bids, market_depth_asks
+                symbol, timestamp, resistance, support, adx, rsi,
+                relative_volume, avg_volume_24h, market_cap, spread, price_std_dev,
+                candlestick_pattern, current_price, market_depth_bids, market_depth_asks
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (symbol, timestamp, resistance, support, adx, rsi, relative_volume,
-              avg_volume_24h, market_cap, spread, price_std_dev, candlestick_pattern,
-              current_price, market_depth_bids, market_depth_asks))
+        """, (
+            symbol, timestamp, resistance or None, support or None, adx or None, rsi or None,
+            relative_volume or None, avg_volume_24h or None, market_cap or None, spread or None,
+            price_std_dev or None, candlestick_pattern or None, current_price,
+            market_depth_bids or None, market_depth_asks or None
+        ))
         conn.commit()
-        print(f"✅ Market condition insertada para {symbol} en {timestamp}.")
+        print(f"✅ Market condition insertada para {symbol}")
     except sqlite3.Error as e:
         print(f"❌ Error al insertar market condition para {symbol}: {e}")
-    finally:
-        conn.close()
+        print(f"Datos: {symbol}, {timestamp}, {resistance}, {support}, {adx}, {rsi}, {relative_volume}, {avg_volume_24h}, {market_cap}, {spread}, {price_std_dev}, {candlestick_pattern}, {current_price}, {market_depth_bids}, {market_depth_asks}")
 
 
 def initialize_db():
