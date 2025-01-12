@@ -787,14 +787,18 @@ def gpt_decision_sell(prepared_text):
     {prepared_text}
 
     Inicia tu respuesta UNICAMENTE con: "vender" o "mantener" no me interesa comprar teniendo muy encuenta la variable "recent_transactions" y teniendo en cuenta que el objetivo es aumentar el USDT que es mi moneda base. Incluye un resumen de 1 oracion de la decision y un porcentaje de confianza.
+    Toma en cuenta:
+    1. Tenemos un trailing stop
+    2. Si la moneda esta estancada por mucho tiempo, es mejor vender para tener presupuesto para comprar otras monedas
+    3. No me interesa mantener en el largo plazo, solo quiero transacciones en el corto plazo, si esta interesante en el largo plazo unicamente es mejor vender
     """
     response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model="gpt-4-turbo",
         messages=[
             {"role": "system", "content": "Eres un asesor experto en trading."},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.5
+        temperature=0.7
     )
     message = response.choices[0].message.content.strip().lower()
 
