@@ -91,7 +91,7 @@ def initialize_db():
     finally:
         conn.close()
 
-def insert_transaction(symbol, action, price, amount, timestamp, profit_loss=None, confidence_percentage=None, summary=None):
+def insert_transaction(symbol, action, price, amount, timestamp, profit_loss=None, confidence_percentage=None, risk_type=None, summary=None):
     """
     Inserta una nueva transacción en la base de datos con reintentos en caso de bloqueo.
     """
@@ -104,11 +104,11 @@ def insert_transaction(symbol, action, price, amount, timestamp, profit_loss=Non
             conn = sqlite3.connect(DB_NAME, timeout=10)  # Añadimos un timeout
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO transactions (symbol, action, price, amount, timestamp, profit_loss, confidence_percentage, summary)
+                INSERT INTO transactions (symbol, action, price, amount, timestamp, profit_loss, confidence_percentage, risk_type, summary)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (symbol, action, price, amount, timestamp, profit_loss, confidence_percentage, summary))
+            """, (symbol, action, price, amount, timestamp, profit_loss, confidence_percentage, risk_type, summary))
             conn.commit()
-            print(f"✅ Transacción insertada: {symbol}, {action}, {amount}")
+            print(f"✅ Transacción insertada: {symbol}, {action}, {amount}, {risk_type}")
             break
         except sqlite3.OperationalError as e:
             if "database is locked" in str(e):
@@ -224,5 +224,5 @@ def upgrade_db_schema():
 
 if __name__ == "__main__":
     #print(fetch_all_transactions())  # Asegúrate de que la base de datos esté configurada
-    #create_market_conditions_table()
-    upgrade_db_schema()
+    create_market_conditions_table()
+    #upgrade_db_schema()

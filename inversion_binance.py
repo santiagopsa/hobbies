@@ -9,10 +9,15 @@ import csv
 from db_manager_real import initialize_db, insert_transaction, fetch_all_transactions, upgrade_db_schema, insert_market_condition, fetch_last_resistance_levels
 import requests
 import numpy as np
+import sqlite3
+import time
+from datetime import datetime, timedelta
+import pytz
+import math
 
 initialize_db()
 #upgrade_db_schema()
-
+DB_NAME = "trading_real.db"
 
 if os.getenv("HEROKU") is None:
     load_dotenv()
@@ -46,6 +51,56 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # Variables globales
 TRADE_SIZE = 40
 TRANSACTION_LOG = []
+
+def get_colombia_timestamp():
+    """
+    Retorna el timestamp actual en la zona horaria de Colombia (solo día y hora).
+    """
+    colombia_timezone = pytz.timezone("America/Bogota")
+    colombia_time = datetime.now(colombia_timezone)
+    return colombia_time.strftime("%Y-%m-%d %H:%M:%S")  # Formato: Año-Mes-Día Hora:Minuto:Segundo
+
+def get_high_risk_balance_last_24h():
+    """
+    Calcula el saldo neto de alto riesgo (compras - ventas) en las últimas 24 horas.
+    """
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+
+        # Calcular el timestamp de hace 24 horas
+        now = datetime.now()
+        last_24h = now - timedelta(hours=24)
+        last_24h_timestamp = last_24h.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Consultar compras y ventas de alto riesgo en las últimas 24 horas
+        cursor.execute("""
+            SELECT action, SUM(price * amount) AS total
+            FROM transactions
+            WHERE risk_type = 'high_risk' AND timestamp >= ?
+            GROUP BY action
+        """, (last_24h_timestamp,))
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        # Procesar resultados
+        buy_total = 0
+        sell_total = 0
+        for action, total in rows:
+            if action == "buy":
+                buy_total += total
+            elif action == "sell":
+                sell_total += total
+
+        # Calcular saldo neto
+        net_balance = buy_total - sell_total
+        return net_balance
+
+    except sqlite3.Error as e:
+        print(f"❌ Error al calcular el saldo de alto riesgo: {e}")
+        return None
+
 
 def send_telegram_message(message):
     """
@@ -312,70 +367,281 @@ def detect_exponential_growth(price_series, lookback=3, threshold=0.5):
     growth = (price_series.iloc[-1] - recent_prices.mean()) / recent_prices.mean()
     return growth > threshold
 
-def filter_combined_with_base(exchange, threshold=1.5, periods=50, base_threshold=1.05):
+def filter_by_score_normalized(
+    exchange,
+    periods=50,
+    # Pesos para cada factor (ajústalos a tu gusto)
+    weight_distance=0.15,   
+    weight_volume=0.4,
+    weight_price=0.3,
+    weight_trend=0.20,
+    # Umbral de volumen en las últimas 24h (en USDT)
+    min_24h_volume=1_000_000,
+    # ¿Usar escalado logarítmico en el volume_growth?
+    volume_growth_log=True
+):
     """
-    Filtra criptos con bajo volumen, crecimiento exponencial, y que están en una posible base.
+    Función integral para:
+      1) Filtrar pares spot USDT con min_24h_volume.
+      2) Calcular factores de explosividad (distance, volumen, price_change, trend).
+      3) Normalizar y sacar Top 3 con el mayor 'score'.
+
+    Retorna: lista con los objetos del Top 3 (score, factores, etc.).
     """
+
     try:
+        print("Cargando mercados...")
         markets = exchange.load_markets()
-        potential_cryptos = []
-        omitted_symbols = []  # Para registrar los pares omitidos
-        for symbol in markets:
-            if "USDT" not in symbol:  # Considera solo pares con USDT
+
+        # ---------------------------------------------------------------------
+        # (A) Construir la lista de símbolos spot con quote=USDT
+        # ---------------------------------------------------------------------
+        spot_usdt_symbols = []
+        for symbol, info in markets.items():
+            # Verificar si es spot (si la clave 'spot' existe y es True)
+            if not info.get('spot', False):
                 continue
+            # Verificar si la "quote" es USDT
+            if info.get('quote') != 'USDT':
+                continue
+
+            # Opcional: si deseas excluir específicamente pares fiat, stable-stable, etc.
+            # Ejemplo: si no quieres ver USDT/MXN
+            base = info.get('base', '')
+            if base == 'USDT':
+                # Este par es USDT/XXX => no te interesa
+                continue
+
+            # Si pasa todos los filtros, lo agregamos
+            spot_usdt_symbols.append(symbol)
+
+        print(f"Símbolos spot USDT detectados: {len(spot_usdt_symbols)}")
+
+        # ---------------------------------------------------------------------
+        # (B) Variables para guardar resultados
+        # ---------------------------------------------------------------------
+        raw_data = []
+        omitted_symbols = []
+
+        print("Recopilando datos...")
+        for symbol in spot_usdt_symbols:
             try:
+                # 1) Ticker general
                 ticker = exchange.fetch_ticker(symbol)
-                last_price = ticker.get('last')
-                open_price = ticker.get('open')
-                volume = ticker.get('quoteVolume')
-                avg_volume = ticker.get('average')
-
-                # Obtener datos históricos para analizar la base
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=periods)
-                closes = [candle[4] for candle in ohlcv]
-                volumes = [candle[5] for candle in ohlcv]
-                min_close = min(closes)
-                avg_recent_volume = sum(volumes) / len(volumes)
-
-                # Validar datos incompletos
-                missing_data = []
-                if last_price is None:
-                    missing_data.append("last_price")
-                if open_price is None:
-                    missing_data.append("open_price")
-                if volume is None:
-                    missing_data.append("quoteVolume")
-                if avg_volume is None:
-                    missing_data.append("average_volume")
-                if not ohlcv:
-                    missing_data.append("historical_data")
-
-                if missing_data:
-                    omitted_symbols.append((symbol, missing_data))
+                if ticker is None:
+                    omitted_symbols.append((symbol, "No se pudo obtener ticker"))
                     continue
 
-                # Calcular volumen relativo, cambio de precio y proximidad al mínimo histórico
-                volume_relative = volume / avg_volume if avg_volume > 0 else 0
-                price_change = (last_price - open_price) / open_price if open_price > 0 else 0
-                near_base = last_price / min_close <= base_threshold
-                increasing_volume = volume / avg_recent_volume > threshold
+                last_price = ticker.get('last')
+                open_price = ticker.get('open')
+                vol_24h    = ticker.get('quoteVolume', 0)  # Volumen en USDT
 
-                # Aplicar filtros: en la base, volumen creciendo, y cambio positivo
-                if near_base and increasing_volume and price_change > 0.1:
-                    potential_cryptos.append((symbol, last_price, volume_relative, price_change))
+                # 2) Filtro de volumen 24h
+                if vol_24h is None:
+                    vol_24h = 0
+                if vol_24h < min_24h_volume:
+                    omitted_symbols.append((symbol, f"Vol.24h ({vol_24h:.1f}) < {min_24h_volume}"))
+                    continue
+
+                # 3) Validaciones de precio
+                if any(val is None for val in [last_price, open_price]):
+                    omitted_symbols.append((symbol, "last_price u open_price incompletos"))
+                    continue
+                if open_price <= 0:
+                    omitted_symbols.append((symbol, "open_price <= 0"))
+                    continue
+
+                # 4) OHLCV histórico (para factores)
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=periods)
+                if not ohlcv or len(ohlcv) < periods:
+                    omitted_symbols.append((symbol, "OHLCV insuficiente"))
+                    continue
+
+                # Extraer datos de las velas
+                closes = [c[4] for c in ohlcv]  # cierre de cada vela
+                opens_ = [c[1] for c in ohlcv]  # apertura de cada vela
+                vols   = [c[5] for c in ohlcv]  # volumen de cada vela
+
+                min_close = min(closes) if closes else 999999
+                avg_recent_volume = sum(vols) / len(vols) if vols else 1
+
+                # La última vela
+                last_candle = ohlcv[-1]
+                last_candle_open  = last_candle[1]
+                last_candle_close = last_candle[4]
+                volume_ultima_vela = last_candle[5]
+
+                # -------------------------------------------------------------
+                # (1) distance_factor => cercanía a la base
+                # -------------------------------------------------------------
+                near_base = last_price / min_close if min_close else 999999
+                distance_factor = 1.0 / near_base  # mayor => más cerca de su min
+
+                # -------------------------------------------------------------
+                # (2) volume_growth con factor de dirección
+                # -------------------------------------------------------------
+                volume_direction_factor = 1.0 if last_candle_close > last_candle_open else -1.0
+                ratio = volume_ultima_vela / avg_recent_volume if avg_recent_volume > 0 else 0
+
+                if volume_growth_log:
+                    raw_vol_growth = math.log10(ratio + 1) if ratio > 0 else 0.0
+                else:
+                    raw_vol_growth = ratio - 1.0  # Ejemplo lineal
+
+                # Multiplicamos por direction_factor
+                raw_vol_growth *= volume_direction_factor
+
+                # -------------------------------------------------------------
+                # (3) price_change con penalización si muy negativo
+                # -------------------------------------------------------------
+                price_change = (last_price - open_price) / open_price
+                if price_change < -0.10:
+                    price_change *= 0.8  # penalización
+
+                # -------------------------------------------------------------
+                # (4) trend_factor con MA(7), MA(25) y pendiente
+                # -------------------------------------------------------------
+                short_ma_window = 7
+                long_ma_window  = 25
+                if len(closes) < long_ma_window:
+                    omitted_symbols.append((symbol, "No hay velas suficientes para MA(25)"))
+                    continue
+
+                # Cálculo de la MA(7) y MA(25) actuales
+                ma_short = sum(closes[-short_ma_window:]) / short_ma_window
+                ma_long  = sum(closes[-long_ma_window:])  / long_ma_window
+
+                # Pendiente de la MA(25)
+                half_window = max(1, long_ma_window // 2)
+                ma_long_old = sum(closes[-(long_ma_window + half_window):-half_window]) / long_ma_window
+                slope_long  = (ma_long - ma_long_old) / ma_long_old if ma_long_old != 0 else 0
+
+                # Definir trend_factor
+                if (ma_short > ma_long) and (slope_long > 0):
+                    trend_factor = 1.0  # Alcista
+                elif (ma_short < ma_long) and (slope_long < 0):
+                    trend_factor = 0.0  # Bajista
+                else:
+                    trend_factor = 0.5  # Neutro
+
+                # -------------------------------------------------------------
+                # Guardar datos sin normalizar (raw)
+                # -------------------------------------------------------------
+                raw_data.append({
+                    "symbol": symbol,
+                    "distance_factor": distance_factor,
+                    "volume_growth":   raw_vol_growth,
+                    "price_change":    price_change,
+                    "trend_factor":    trend_factor,
+                    "near_base":       near_base,
+                    "last_price":      last_price,
+                    "vol_24h":         vol_24h,  # para info
+                })
+
             except Exception as e:
-                print(f"Error en {symbol}: {e}")
+                omitted_symbols.append((symbol, f"Error interno: {e}"))
 
-        # Opcional: Guardar pares omitidos para análisis posterior
+        # ---------------------------------------------------------------------
+        # (C) Si no hay datos válidos tras filtrar
+        # ---------------------------------------------------------------------
+        if not raw_data:
+            print("No hay datos tras filtrar y descartar.")
+            return []
+
+        # ---------------------------------------------------------------------
+        # (D) Normalización de cada factor en [0..1]
+        # ---------------------------------------------------------------------
+        df_vals  = [x["distance_factor"] for x in raw_data]
+        vol_vals = [x["volume_growth"]   for x in raw_data]
+        pc_vals  = [x["price_change"]    for x in raw_data]
+        tr_vals  = [x["trend_factor"]    for x in raw_data]
+
+        df_min, df_max = min(df_vals), max(df_vals)
+        vol_min, vol_max = min(vol_vals), max(vol_vals)
+        pc_min, pc_max = min(pc_vals), max(pc_vals)
+        tr_min, tr_max = min(tr_vals), max(tr_vals)
+
+        print("\nDEBUG - Mín y Máx de los factores:")
+        print(f"  distance_factor: min={df_min:.4f}, max={df_max:.4f}")
+        print(f"  volume_growth:   min={vol_min:.4f}, max={vol_max:.4f}")
+        print(f"  price_change:    min={pc_min:.4f}, max={pc_max:.4f}")
+        print(f"  trend_factor:    min={tr_min:.4f}, max={tr_max:.4f}\n")
+
+        def normalize(val, vmin, vmax):
+            if vmax > vmin:
+                return (val - vmin) / (vmax - vmin)
+            return 0.0
+
+        normalized_data = []
+        for item in raw_data:
+            df_val = item["distance_factor"]
+            vol_val = item["volume_growth"]
+            pc_val = item["price_change"]
+            tr_val = item["trend_factor"]
+
+            df_norm  = normalize(df_val,  df_min,  df_max)
+            vol_norm = normalize(vol_val, vol_min, vol_max)
+            pc_norm  = normalize(pc_val,  pc_min,  pc_max)
+            tr_norm  = normalize(tr_val,  tr_min,  tr_max)
+
+            # Score final
+            score = (
+                weight_distance * df_norm +
+                weight_volume   * vol_norm +
+                weight_price    * pc_norm  +
+                weight_trend    * tr_norm
+            )
+
+            normalized_data.append({
+                "symbol": item["symbol"],
+                "score": score,
+                "probabilidad_explosividad": score * 100,
+                # Datos para imprimir
+                "distance_factor": item["distance_factor"],
+                "volume_growth":   item["volume_growth"],
+                "price_change":    item["price_change"],
+                "trend_factor":    item["trend_factor"],
+                "near_base":       item["near_base"],
+                "last_price":      item["last_price"],
+                "vol_24h":         item["vol_24h"],
+            })
+
+        # ---------------------------------------------------------------------
+        # (E) Ordenar de mayor a menor score, tomar Top 3
+        # ---------------------------------------------------------------------
+        normalized_data.sort(key=lambda obj: obj["score"], reverse=True)
+        top3 = normalized_data[:3]
+
+        print("Top 3 criptos con mayor 'score' de explosividad:")
+        for i, c in enumerate(top3, start=1):
+            print(
+                f"{i}) {c['symbol']} => score={c['score']:.4f} "
+                f"({c['probabilidad_explosividad']:.2f}%) | "
+                f"distance_factor={c['distance_factor']:.4f} | "
+                f"volume_growth={c['volume_growth']:.4f} | "
+                f"price_change={c['price_change']:.2%} | "
+                f"trend_factor={c['trend_factor']:.2f} | "
+                f"near_base={c['near_base']:.4f} | "
+                f"last_price={c['last_price']:.4f} | "
+                f"vol_24h={c['vol_24h']:.2f}"
+            )
+
+        # ---------------------------------------------------------------------
+        # (F) Log de omitidos
+        # ---------------------------------------------------------------------
         if omitted_symbols:
-            with open("omitted_symbols_log.csv", "w") as f:
-                f.write("Symbol,MissingData\n")
-                for symbol, missing in omitted_symbols:
-                    f.write(f"{symbol},{','.join(missing)}\n")
 
-        return potential_cryptos
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            with open(f"omitted_symbols_log_{timestamp}.csv", "w") as f:
+                f.write("Symbol,Reason\n")
+                for sym, reason in omitted_symbols:
+                    f.write(f"{sym},{reason}\n")
+
+        top3_symbols = [item["symbol"] for item in top3]
+        return top3_symbols
+
     except Exception as e:
-        print(f"Error general al filtrar criptos: {e}")
+        print(f"Error general: {e}")
         return []
 
 
@@ -418,19 +684,72 @@ def gpt_prepare_data(data_by_timeframe, additional_data):
 
 def gpt_decision_buy(prepared_text):
     prompt = f"""
+    Eres un experto en trading enfocado en criptomonedas de alta especulación.
+    Estás dispuesto a asumir un riesgo elevado,
+    respaldado por un trailing stop. Tu objetivo es conseguir al menos un 3% de
+    crecimiento diario en el corto plazo.
+
+    Basándote en el siguiente texto estructurado, decide si COMPRAR esta
+    criptomoneda para tener un retorno en el corto plazo, o si debes MANTENER.
+    Recuerda que:
+    - Queremos ser más arriesgados, ya que el trailing stop reduce nuestro riesgo.
+    - Buscamos alta probabilidad de crecimiento y aumento de volumen de manera inmediata.
+    - Si los indicadores sugieren potencial de crecimiento, incluso si las condiciones
+      no son perfectas, preferimos COMPRAR para mantener el capital en movimiento.
+    - MANTENER solo en caso de divergencias bajistas claras o problemas de liquidez
+      (bajo volumen, spreads demasiado amplios, etc.).
+
+    Información disponible:
+    {prepared_text}
+
+    En base a estos datos, decide entre "comprar" o "mantener".
+    1. Inicia la respuesta con la palabra "comprar" o "mantener".
+    2. Indica después un porcentaje de confianza para la compra, en base a eso voy a definir mi presupuesto, esto es MUY IMPORTANTE ajustarlo a la probabilidad de crecimiento (por ejemplo, 80%).
+    3. Proporciona una breve explicación (1 o 2 líneas) sobre por qué tomas esa decisión.
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "Eres un experto en trading."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.7
+    )
+
+    # Convertimos la respuesta a minúsculas para evaluar la palabra inicial
+    message = response.choices[0].message.content.strip().lower()
+
+    import re
+    action = "mantener"
+    if message.startswith("comprar"):
+        action = "comprar"
+
+    # Buscamos el primer número con % como confianza (ej. "80%")
+    match = re.search(r'(\d+)%', message)
+    confidence = int(match.group(1)) if match else 50
+
+    # Tomamos la primera línea como explicación completa
+    explanation = message.split("\n", 1)[0]
+
+    return action, confidence, explanation
+
+
+def gpt_decision_buy_high_risk(prepared_text):
+    prompt = f"""
     Eres un experto en trading. Basándote en el siguiente texto estructurado, decide si COMPRAR esta criptomoneda para tener un retorno en el corto plazo.
     
     Presta especial atención a:
-    1. Divergencias de momentum (señales muy importantes de reversión)
-    2. Liquidez del mercado (evitar mercados con poca liquidez)
-    3. Patrones de velas (confirmación técnica)
-    4. Sentimiento general del mercado
-    
+    1. Son monedas de alto riesgo, el presupuesto es pequeño y queremos apuestas con alto potencial
+    2. Estamos buscando alta probabilidad de crecimiento, es decir aumento de volumen en el corto plazo
+    3. si estamos cerca a la base y hay alto crecimiento de volumen en el corto plazo deberiamos comprar
+    4. Toma en cuenta que estas son monedas de alta especulacion, le estamos apostando a la especulacion
+
     Texto:
     {prepared_text}
     
     **Objetivo principal**:
-    - Maximizar el uso del capital mientras aceptamos un riesgo alto.
+    - Me interesa comprar con alto riesgo si los indicadores tienen probabilidad de crecimiento en el corto plazo
     - Si las condiciones son razonables pero no ideales, decide COMPRAR para mantener el capital en movimiento.
     - MANTENER si hay divergencias bajistas o problemas de liquidez significativos.
 
@@ -859,7 +1178,7 @@ def is_valid_notional(symbol, amount):
 
 
 # Ejecutar orden de compra
-def execute_order_buy(symbol, amount, confidence, explanation):
+def execute_order_buy(symbol, amount, confidence, explanation, risk_t):
     """
     Ejecuta una orden de compra y registra la transacción en la base de datos.
     """
@@ -883,6 +1202,7 @@ def execute_order_buy(symbol, amount, confidence, explanation):
             timestamp=timestamp,
             profit_loss=None,
             confidence_percentage=confidence,
+            risk_type=risk_t,
             summary=explanation
         )
 
@@ -923,7 +1243,7 @@ def make_buy(symbol, budget, risk_type, confidence=None, explanation=None):
 
     # Verificar si cumple con el mínimo notional
     if amount_to_buy * final_price >= 2:  # Mínimo notional de Binance
-        order = execute_order_buy(symbol, amount_to_buy, confidence, explanation)
+        order = execute_order_buy(symbol, amount_to_buy, confidence, explanation, risk_type)
         if order:
             print(f"✅ Compra ejecutada para {symbol} ({risk_type})")
         else:
@@ -1187,7 +1507,8 @@ def fetch_price(symbol):
 # Función principal
 # Función principal
 def demo_trading():
-    print("Iniciando proceso de inversión...")
+    timestamp = get_colombia_timestamp()
+    print(f"Iniciando proceso de inversión con el timestamp {timestamp}")
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
     print(f"Saldo disponible en USDT: {usdt_balance}")
 
@@ -1266,9 +1587,11 @@ def demo_trading():
 
             if action == "comprar":
                 make_buy(final_winner, low_risk_budget, "bajo riesgo", confidence, explanation)
+                url_binance = f"https://www.binance.com/en/trade/{final_winner.replace("/", "_")}?_from=markets&type=spot"
                 try:
                     print(f"Comprando {final_winner} con éxito a un valor de {low_risk_budget} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
                     send_telegram_message(f"Comprando {final_winner} con éxito a un valor de {low_risk_budget} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
+                    send_telegram_message(f"URL de binance: {url_binance}, con el timestamp {timestamp}")
                 except Exception as e:
                     print(f"❌ Error enviando mensaje de prueba a Telegram: {e}")
     else:
@@ -1276,94 +1599,127 @@ def demo_trading():
 
     # 2. Criptos de bajo volumen (alto riesgo)
     print("Analizando criptos de bajo volumen (alto riesgo)...")
-    low_volume_candidates = filter_combined_with_base(exchange)
-    print(f"Criptos de bajo volumen seleccionadas: {low_volume_candidates}")
+    high_risk_balance = get_high_risk_balance_last_24h()
 
-    # Inicializar la lista de criptos interesantes
-    valid_cryptos = []
+    if high_risk_balance is not None and high_risk_balance >= 50:
+        print(f"⚠️ Saldo neto de alto riesgo en las últimas 24 horas: {high_risk_balance:.2f} USDT. "
+            f"No se realizarán compras de alto riesgo.")
+    else:
+        # Llamamos a la función que nos filtra y retorna SOLO los símbolos
+        low_volume_candidates = filter_by_score_normalized(exchange)
+        print(f"Criptos de bajo volumen seleccionadas: {low_volume_candidates}")
 
-    # Evaluar las criptos de bajo volumen con validación de datos
-    for symbol, volume, price_change in low_volume_candidates:
-        try:
-            # Obtener datos y calcular indicadores
-            data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(symbol)
-            if not data_by_timeframe or volume_series is None or price_series is None:
-                print(f"⚠️ Datos insuficientes para {symbol}, se omite.")
-                continue
+        # Lista donde guardaremos las criptos que validamos con éxito
+        valid_cryptos = []
 
-            # Calcular indicadores técnicos
-            support, resistance = calculate_support_resistance(price_series)
-            adx = calculate_adx(data_by_timeframe["1h"])
-            prices = data_by_timeframe["1h"]["close"].values if "close" in data_by_timeframe["1h"].columns else None
-            rsi = calculate_rsi(prices, period=14)[-1] if prices is not None else None
-            additional_data = {
-                "current_price": fetch_price(symbol),
-                "relative_volume": calculate_relative_volume(volume_series),
-                "rsi": rsi,
-                "avg_volume_24h": fetch_avg_volume_24h(volume_series),
-                "market_cap": fetch_market_cap(symbol),
-                "spread": calculate_spread(symbol),
-                "fear_greed": fetch_fear_greed_index(),
-                "price_std_dev": calculate_price_std_dev(price_series),
-                "adx": adx,
-                "support": support,
-                "resistance": resistance,
-                "candlestick_pattern": analyze_candlestick_patterns(data_by_timeframe["1h"]),
-            }
+        # Iterar sobre los símbolos (string) devueltos por la función de filtrado
+        for symbol in low_volume_candidates:
+            try:
+                # 1) Obtenemos los datos de velas y series
+                data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(symbol)
 
-            # Validar indicadores necesarios
-            if validate_crypto_data(additional_data):
-                valid_cryptos.append({
-                    "symbol": symbol,
-                    "price_change": price_change,
-                    "volume": volume,
-                    "additional_data": additional_data
-                })
-            else:
-                print(f"⚠️ {symbol} omitida por datos insuficientes.")
-        except Exception as e:
-            print(f"❌ Error al procesar {symbol}: {e}")
+                # 2) Verificamos si hay datos suficientes
+                if not data_by_timeframe or volume_series is None or price_series is None:
+                    print(f"⚠️ Datos insuficientes para {symbol}, se omite.")
+                    continue
 
-    # Verificar si hay criptos válidas
-    if not valid_cryptos:
-        print("⚠️ No se encontraron criptos interesantes de bajo volumen. Finalizando.")
-        return
+                # 3) Calcular indicadores técnicos
+                #    (Asumiendo que estas funciones existen en tu código)
+                support, resistance = calculate_support_resistance(price_series)
+                adx = calculate_adx(data_by_timeframe["1h"])
+                prices = data_by_timeframe["1h"]["close"].values if "close" in data_by_timeframe["1h"].columns else None
 
-    # Ordenar por volumen y cambio de precio
-    valid_cryptos.sort(key=lambda x: (x["price_change"], x["volume"]), reverse=True)
-    top_interesting_cryptos = valid_cryptos[:2]
-    print(f"Top 2 criptos interesantes de bajo volumen: {top_interesting_cryptos}")
+                rsi = None
+                if prices is not None and len(prices) >= 14:
+                    rsi_values = calculate_rsi(prices, period=14)
+                    rsi = rsi_values[-1] if rsi_values is not None and len(rsi_values) > 0 else None
 
-    # Evaluar con GPT si comprar las criptos seleccionadas
-    for crypto in top_interesting_cryptos:
-        try:
-            prepared_text = gpt_prepare_data(
-                fetch_and_prepare_data(crypto["symbol"])[0],
-                crypto["additional_data"]
-            )
-            action, confidence, explanation = gpt_decision_buy(prepared_text)
-            print(f"La cripto interesante de bajo volumen es: {crypto['symbol']}")
-            print(f"******************************************")
-            print(f"Se recomienda {action}")
-            print(f"******************************************")
-            print(f"La explicación es: {explanation}")
+                # 4) Armar la información “adicional” que quieres guardar
+                additional_data = {
+                    "current_price": fetch_price(symbol),
+                    "relative_volume": calculate_relative_volume(volume_series),
+                    "rsi": rsi,
+                    "avg_volume_24h": fetch_avg_volume_24h(volume_series),
+                    "market_cap": fetch_market_cap(symbol),
+                    "spread": calculate_spread(symbol),
+                    "fear_greed": fetch_fear_greed_index(),
+                    "price_std_dev": calculate_price_std_dev(price_series),
+                    "adx": adx,
+                    "support": support,
+                    "resistance": resistance,
+                    "candlestick_pattern": analyze_candlestick_patterns(data_by_timeframe["1h"]),
+                }
+
+                # 5) Validar si los datos “adicionales” están completos o en rangos aceptables
+                if validate_crypto_data(additional_data):
+                    # Si todo OK, agregamos a valid_cryptos
+                    valid_cryptos.append({
+                        "symbol": symbol,
+                        # Puedes guardar también volumen, price_change, etc. si los necesitas
+                        "additional_data": additional_data
+                    })
+                else:
+                    print(f"⚠️ {symbol} omitida por datos insuficientes (indicadores).")
+
+            except Exception as e:
+                print(f"❌ Error al procesar {symbol}: {e}")
+
+        # 6) Revisamos si pudimos validar alguna cripto
+        if not valid_cryptos:
+            print("⚠️ No se encontraron criptos interesantes de bajo volumen. Finalizando.")
+        else:
+            # (Opcional) Ordenar por algún criterio si quieres un “Top 2” o similar
+            # Ejemplo si en la data adicional tuvieras "price_change" y "volume"
+            # valid_cryptos.sort(key=lambda x: (x["price_change"], x["volume"]), reverse=True)
+            # top_interesting_cryptos = valid_cryptos[:2]
             
-            # Ejecutar compra si GPT recomienda
-            if action == "comprar":
-                make_buy(
-                    crypto["symbol"],
-                    high_risk_budget / len(top_interesting_cryptos),
-                    "alto riesgo",
-                    confidence,
-                    explanation
-                )
+            # Para simplificar, aquí usamos todo `valid_cryptos`
+            top_interesting_cryptos = valid_cryptos
+            print(f"Criptos validadas de bajo volumen: {top_interesting_cryptos}")
+
+            # 7) Consultar GPT si quieres tomar decisión de compra
+            for crypto in top_interesting_cryptos:
                 try:
-                    print(f"Comprando {crypto['symbol']} con éxito a un valor de {high_risk_budget / len(top_interesting_cryptos)} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
-                    send_telegram_message(f"Comprando {crypto['symbol']} con éxito a un valor de {high_risk_budget / len(top_interesting_cryptos)} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
+                    prepared_text = gpt_prepare_data(
+                        data_by_timeframe,  # si tu `gpt_prepare_data` requiere la info de velas
+                        crypto["additional_data"]
+                    )
+                    action, confidence, explanation = gpt_decision_buy_high_risk(prepared_text)
+                    print(f"La cripto interesante de bajo volumen es: {crypto['symbol']}")
+                    print("******************************************")
+                    print(f"Se recomienda {action}")
+                    print("******************************************")
+                    print(f"La explicación es: {explanation}")
+
+                    # 8) Ejecutar compra si GPT recomienda
+                    if action == "comprar":
+                        make_buy(
+                            crypto["symbol"],
+                            high_risk_budget / len(top_interesting_cryptos),
+                            "alto riesgo",
+                            confidence,
+                            explanation
+                        )
+                        try:
+                            print(
+                                f"Comprando {crypto['symbol']} con éxito a un valor de "
+                                f"{high_risk_budget / len(top_interesting_cryptos)} USDT "
+                                f"con un nivel de confianza de {confidence}. Explicación: {explanation}"
+                            )
+                            send_telegram_message(
+                                f"Comprando {crypto['symbol']} con éxito a un valor de "
+                                f"{high_risk_budget / len(top_interesting_cryptos)} USDT "
+                                f"con un nivel de confianza de {confidence} y la explicación: {explanation}"
+                            )
+                            send_telegram_message(
+                                f"URL de binance https://www.binance.com/en/trade/"
+                                f"{crypto['symbol'].replace('/', '_')}?_from=markets&type=spot y timestamp {timestamp}"
+                            )
+                        except Exception as e:
+                            print(f"❌ Error enviando mensaje a Telegram: {e}")
+
                 except Exception as e:
-                    print(f"❌ Error enviando mensaje de prueba a Telegram: {e}")
-        except Exception as e:
-            print(f"❌ Error al evaluar {crypto['symbol']}: {e}")
+                    print(f"❌ Error al evaluar {crypto['symbol']}: {e}")
 
    # Lógica de ventas
     portfolio_cryptos = get_portfolio_cryptos()
@@ -1372,6 +1728,7 @@ def demo_trading():
         try:
             crypto_balance = exchange.fetch_balance()['free'].get(symbol, 0)
             market_symbol = f"{symbol}/USDT"
+            url_binance = f"https://www.binance.com/en/trade/{symbol}_USDT?_from=markets&type=spot"
             current_price = fetch_price(market_symbol)
             if current_price is None:
                 print(f"⚠️ No se pudo obtener el precio actual para {symbol}.")
@@ -1500,9 +1857,10 @@ def demo_trading():
             print(f"La accion a realizar es:......................... {action}")
             print(f"El nivel de confianza es:....................... {confidence}")
             print(f"La explicacion es:.................... {explanation}")
-
+            timestamp = get_colombia_timestamp()
             try:
                 send_telegram_message(f"la decision de vender es : {action}, en la cripto {market_symbol} El nivel de confianza es: {confidence}, La explicacion es: {explanation}")
+                send_telegram_message(f"La URL de binance es: {url_binance} y el timestamp {timestamp}")
             except Exception as e:
                 print(f"❌ Error enviando mensaje de prueba a Telegram: {e}")
 
@@ -1549,7 +1907,8 @@ def demo_trading():
 # Ejecutar demo
 if __name__ == "__main__":
     demo_trading()
-    show_transactions()
+    #show_transactions()
     test_new_indicators()
+    #print(get_high_risk_balance_last_24h())
 
 
