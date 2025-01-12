@@ -63,6 +63,7 @@ def get_colombia_timestamp():
 def get_high_risk_balance_last_24h():
     """
     Calcula el saldo neto de alto riesgo (compras - ventas) en las últimas 24 horas.
+    Las ventas heredan el 'risk_type' de las compras más recientes si el 'risk_type' es NULL.
     """
     try:
         conn = sqlite3.connect(DB_NAME)
@@ -73,34 +74,60 @@ def get_high_risk_balance_last_24h():
         last_24h = now - timedelta(hours=24)
         last_24h_timestamp = last_24h.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Consultar compras y ventas de alto riesgo en las últimas 24 horas
+        # Obtener todas las transacciones de las últimas 24 horas
         cursor.execute("""
-            SELECT action, SUM(price * amount) AS total
+            SELECT symbol, action, SUM(price * amount) AS total, risk_type
             FROM transactions
-            WHERE risk_type = 'high_risk' AND timestamp >= ?
-            GROUP BY action
+            WHERE timestamp >= ?
+            GROUP BY symbol, action, risk_type
         """, (last_24h_timestamp,))
-
         rows = cursor.fetchall()
+
+        # Ver transacciones agrupadas
+        print("🔍 Transacciones encontradas (últimas 24h):", rows)
+
+        # Organizar transacciones por símbolo
+        transactions_by_symbol = {}
+        for symbol, action, total, risk_type in rows:
+            if symbol not in transactions_by_symbol:
+                transactions_by_symbol[symbol] = {"buy": 0, "sell": 0, "risk_type": None}
+            transactions_by_symbol[symbol][action] += total
+            # Asignar el tipo de riesgo si está definido
+            if risk_type:
+                transactions_by_symbol[symbol]["risk_type"] = risk_type
+
+        # Validar y heredar risk_type para las ventas
+        for symbol, data in transactions_by_symbol.items():
+            if data["risk_type"] is None:
+                # Buscar el tipo de riesgo de compras anteriores
+                cursor.execute("""
+                    SELECT risk_type
+                    FROM transactions
+                    WHERE symbol = ? AND action = 'buy'
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """, (symbol,))
+                last_risk_type = cursor.fetchone()
+                if last_risk_type:
+                    data["risk_type"] = last_risk_type[0]
+                else:
+                    data["risk_type"] = "unknown"  # Si no hay compras, marcar como desconocido
+
+        # Cerrar conexión
         conn.close()
 
-        # Procesar resultados
-        buy_total = 0
-        sell_total = 0
-        for action, total in rows:
-            if action == "buy":
-                buy_total += total
-            elif action == "sell":
-                sell_total += total
+        # Calcular saldo neto para alto riesgo
+        high_risk_balance = 0
+        for symbol, data in transactions_by_symbol.items():
+            if data.get("risk_type") == "high_risk":
+                high_risk_balance += data["buy"] - data["sell"]
 
-        # Calcular saldo neto
-        net_balance = buy_total - sell_total
-        return net_balance
+        print(f"📊 Saldo neto de alto riesgo: {high_risk_balance:.2f} USDT")
+        return high_risk_balance
 
     except sqlite3.Error as e:
         print(f"❌ Error al calcular el saldo de alto riesgo: {e}")
         return None
-
 
 def send_telegram_message(message):
     """
@@ -1863,7 +1890,7 @@ def demo_trading():
             print(f"La explicacion es:.................... {explanation}")
             timestamp = get_colombia_timestamp()
             try:
-                send_telegram_message(f"la decision de vender es : {action}, en la cripto {market_symbol} El nivel de confianza es: {confidence}, La explicacion es: {explanation}")
+                send_telegram_message(f"la decision de vender {market_symbol} es : {action}, con un nivel de confianza es: {confidence}, La explicacion es: {explanation}")
                 send_telegram_message(f"La URL de binance es: {url_binance} y el timestamp {timestamp}")
             except Exception as e:
                 print(f"❌ Error enviando mensaje de prueba a Telegram: {e}")

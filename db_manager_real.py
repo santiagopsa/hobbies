@@ -105,7 +105,7 @@ def insert_transaction(symbol, action, price, amount, timestamp, profit_loss=Non
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO transactions (symbol, action, price, amount, timestamp, profit_loss, confidence_percentage, risk_type, summary)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (symbol, action, price, amount, timestamp, profit_loss, confidence_percentage, risk_type, summary))
             conn.commit()
             print(f"✅ Transacción insertada: {symbol}, {action}, {amount}, {risk_type}")
