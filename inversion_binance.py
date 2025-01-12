@@ -1587,7 +1587,7 @@ def demo_trading():
 
             if action == "comprar":
                 make_buy(final_winner, low_risk_budget, "bajo riesgo", confidence, explanation)
-                url_binance = f"https://www.binance.com/en/trade/{final_winner.replace("/", "_")}?_from=markets&type=spot"
+                url_binance = f"https://www.binance.com/en/trade/{final_winner.replace("/","_")}?_from=markets&type=spot"
                 try:
                     print(f"Comprando {final_winner} con éxito a un valor de {low_risk_budget} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
                     send_telegram_message(f"Comprando {final_winner} con éxito a un valor de {low_risk_budget} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
