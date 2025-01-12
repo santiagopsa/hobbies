@@ -312,13 +312,13 @@ def detect_exponential_growth(price_series, lookback=3, threshold=0.5):
     growth = (price_series.iloc[-1] - recent_prices.mean()) / recent_prices.mean()
     return growth > threshold
 
-def filter_combined(exchange, threshold=1.5):
+def filter_combined_with_base(exchange, threshold=1.5, periods=50, base_threshold=1.05):
     """
-    Filtra criptos con bajo volumen y crecimiento exponencial.
+    Filtra criptos con bajo volumen, crecimiento exponencial, y que están en una posible base.
     """
     try:
         markets = exchange.load_markets()
-        low_volume_cryptos = []
+        potential_cryptos = []
         omitted_symbols = []  # Para registrar los pares omitidos
         for symbol in markets:
             if "USDT" not in symbol:  # Considera solo pares con USDT
@@ -330,6 +330,13 @@ def filter_combined(exchange, threshold=1.5):
                 volume = ticker.get('quoteVolume')
                 avg_volume = ticker.get('average')
 
+                # Obtener datos históricos para analizar la base
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=periods)
+                closes = [candle[4] for candle in ohlcv]
+                volumes = [candle[5] for candle in ohlcv]
+                min_close = min(closes)
+                avg_recent_volume = sum(volumes) / len(volumes)
+
                 # Validar datos incompletos
                 missing_data = []
                 if last_price is None:
@@ -340,21 +347,25 @@ def filter_combined(exchange, threshold=1.5):
                     missing_data.append("quoteVolume")
                 if avg_volume is None:
                     missing_data.append("average_volume")
+                if not ohlcv:
+                    missing_data.append("historical_data")
 
                 if missing_data:
-                    #print(f"⚠️ Datos incompletos para {symbol}: {', '.join(missing_data)}. Se omite.")
                     omitted_symbols.append((symbol, missing_data))
                     continue
 
-                # Calcular volumen relativo y cambio de precio
+                # Calcular volumen relativo, cambio de precio y proximidad al mínimo histórico
                 volume_relative = volume / avg_volume if avg_volume > 0 else 0
                 price_change = (last_price - open_price) / open_price if open_price > 0 else 0
+                near_base = last_price / min_close <= base_threshold
+                increasing_volume = volume / avg_recent_volume > threshold
 
-                # Aplicar filtros de crecimiento exponencial
-                if volume_relative > threshold and price_change > 0.1:  # 10% de cambio en precio
-                    low_volume_cryptos.append((symbol, volume_relative, price_change))
+                # Aplicar filtros: en la base, volumen creciendo, y cambio positivo
+                if near_base and increasing_volume and price_change > 0.1:
+                    potential_cryptos.append((symbol, last_price, volume_relative, price_change))
             except Exception as e:
                 print(f"Error en {symbol}: {e}")
+
         # Opcional: Guardar pares omitidos para análisis posterior
         if omitted_symbols:
             with open("omitted_symbols_log.csv", "w") as f:
@@ -362,7 +373,7 @@ def filter_combined(exchange, threshold=1.5):
                 for symbol, missing in omitted_symbols:
                     f.write(f"{symbol},{','.join(missing)}\n")
 
-        return low_volume_cryptos
+        return potential_cryptos
     except Exception as e:
         print(f"Error general al filtrar criptos: {e}")
         return []
@@ -1265,7 +1276,7 @@ def demo_trading():
 
     # 2. Criptos de bajo volumen (alto riesgo)
     print("Analizando criptos de bajo volumen (alto riesgo)...")
-    low_volume_candidates = filter_combined(exchange)
+    low_volume_candidates = filter_combined_with_base(exchange)
     print(f"Criptos de bajo volumen seleccionadas: {low_volume_candidates}")
 
     # Inicializar la lista de criptos interesantes

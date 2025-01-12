@@ -207,6 +207,11 @@ def upgrade_db_schema():
             cursor.execute("ALTER TABLE transactions ADD COLUMN confidence_percentage REAL")
             print("✅ Columna 'confidence_percentage' añadida.")
 
+                # Verificar y agregar columnas si no están presentes
+        if "risk_type" not in existing_columns:
+            cursor.execute("ALTER TABLE transactions ADD COLUMN risk_type TEXT")
+            print("✅ Columna 'confidence_percentage' añadida.")
+
         if "summary" not in existing_columns:
             cursor.execute("ALTER TABLE transactions ADD COLUMN summary TEXT")
             print("✅ Columna 'summary' añadida.")
@@ -219,4 +224,5 @@ def upgrade_db_schema():
 
 if __name__ == "__main__":
     #print(fetch_all_transactions())  # Asegúrate de que la base de datos esté configurada
-    create_market_conditions_table()
+    #create_market_conditions_table()
+    upgrade_db_schema()
