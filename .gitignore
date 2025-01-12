@@ -20,3 +20,5 @@ Thumbs.db
 
 # Ignorar configuraciones específicas
 .env
+
+trading_real.db
