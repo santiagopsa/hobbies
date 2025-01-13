@@ -294,6 +294,85 @@ def analyze_market_sentiment(symbol, exchange):
         print(f"Error en analyze_market_sentiment: {e}")
         return None
 
+def detect_accelerated_growth(data, threshold=10, max_period=10):
+    """
+    Detecta un crecimiento acelerado en un periodo corto.
+    data: lista o array de precios (close).
+    threshold: porcentaje de crecimiento para considerar aceleración.
+    max_period: número máximo de velas para evaluar el crecimiento.
+    """
+    try:
+        # Validar tipo de data
+        print(f"🛠️ Tipo inicial de data: {type(data)}")
+
+        if not isinstance(data, np.ndarray):
+            data = np.array(data, dtype=float)
+            print(f"🔄 Data convertida a np.ndarray: {data}")
+
+        # Validar longitud del array
+        print(f"🔍 Longitud de data: {len(data)}")
+        if len(data) < 2:
+            print("⚠️ Datos insuficientes en detect_accelerated_growth.")
+            return False, 0, 0
+
+        # Loop para detectar crecimiento acelerado
+        for i in range(1, max_period + 1):
+            print(f"🔄 Iteración: {i}")
+            if i >= len(data):
+                print(f"⚠️ Índice fuera de rango: {i} >= {len(data)}")
+                continue
+
+            if data[-i] == 0:
+                print(f"⚠️ División por cero evitada en índice {-i}")
+                continue
+
+            print(f"📊 Valores en evaluación: data[-1]={data[-1]}, data[-{i}]={data[-i]}")
+            growth = ((data[-1] - data[-i]) / data[-i]) * 100  # Crecimiento porcentual
+            print(f"📈 Crecimiento calculado: {growth:.2f}%")
+
+            if growth >= threshold:
+                print(f"✅ Crecimiento acelerado detectado: {growth:.2f}% en {i} periodos.")
+                return True, growth, i
+
+        print("❌ No se detectó crecimiento acelerado.")
+        return False, 0, 0
+    except Exception as e:
+        print(f"❌ Error en detect_accelerated_growth: {e}")
+        return False, 0, 0
+
+
+
+def is_near_resistance(current_price, resistance, margin=1):
+    """
+    Verifica si el precio actual está cerca de una resistencia dentro de un margen dado.
+    """
+    try:
+        # Imprimir los valores iniciales para depuración
+        print(f"🛠️ Depuración is_near_resistance:")
+        print(f"  - Current price: {current_price} (tipo: {type(current_price)})")
+        print(f"  - Resistance: {resistance} (tipo: {type(resistance)})")
+        print(f"  - Margin: {margin} (tipo: {type(margin)})")
+
+        # Verificar si los valores son numéricos
+        if not isinstance(current_price, (float, int, np.float64)):
+            raise ValueError(f"current_price no es un valor numérico válido: {current_price}")
+        if not isinstance(resistance, (float, int, np.float64)):
+            raise ValueError(f"resistance no es un valor numérico válido: {resistance}")
+        
+        # Calcular si está cerca de la resistencia
+        margin_value = resistance * (margin / 100)
+        near_resistance = abs(current_price - resistance) <= margin_value
+
+        # Resultado
+        print(f"  - Margin value: {margin_value}")
+        print(f"  - Near resistance: {near_resistance}")
+        return near_resistance, resistance
+
+    except Exception as e:
+        print(f"❌ Error dentro de is_near_resistance: {e}")
+        raise
+
+
 def debug_new_indicators(symbol):
     """
     Función de diagnóstico para verificar los datos de las nuevas variables
@@ -808,24 +887,27 @@ def gpt_decision_sell(prepared_text):
     Decide si vender un activo basado en los datos proporcionados.
     """
     prompt = f"""
-    Eres un asesor financiero especializado en trading. Basándote en el siguiente texto estructurado, decide si debo vender este activo.
+        Eres un asesor financiero especializado en trading. Basándote en el siguiente texto estructurado, decide si debo vender este activo.
 
-    Texto:
-    {prepared_text}
+        Texto:
+        {prepared_text}
 
-    Inicia tu respuesta UNICAMENTE con: "vender" o "mantener" no me interesa comprar teniendo muy encuenta la variable "recent_transactions" y teniendo en cuenta que el objetivo es aumentar el USDT que es mi moneda base. Incluye un resumen de 1 oracion de la decision y un porcentaje de confianza.
-    Toma en cuenta:
-    1. Tenemos un trailing stop
-    2. Si la moneda esta estancada por mucho tiempo, es mejor vender para tener presupuesto para comprar otras monedas
-    3. No me interesa mantener en el largo plazo, solo quiero transacciones en el corto plazo, si esta interesante en el largo plazo unicamente es mejor vender
-    """
+        Inicia tu respuesta ÚNICAMENTE con: "vender" o "mantener". No estoy interesado en comprar, y debes priorizar la variable "recent_transactions". Mi objetivo es incrementar mi balance en USDT, mi moneda base.
+
+        Condiciones:
+        1. Si compré este activo en las últimas 10 velas, solo considerar vender si hay una caída significativa (>5%) desde el precio de compra o señales claras de sobrecompra extrema.
+        2. Prioriza mantener si el volumen está aumentando o si hay señales de soporte cerca del precio actual.
+        3. Prefiero evitar pérdidas pequeñas y mantener el activo si hay potencial para un rebote en el corto plazo.
+        4. Si el precio está claramente estancado (>50 velas sin movimiento relevante) o si está en máximos locales con bajo volumen, es mejor vender.
+        5. Solo prioriza decisiones de corto plazo. Sin embargo, si la moneda muestra un soporte claro y movimiento alcista, prefiere mantener.
+        """
     response = client.chat.completions.create(
-        model="gpt-4-turbo",
+        model="gpt-3.5-turbo",
         messages=[
             {"role": "system", "content": "Eres un asesor experto en trading."},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.7
+        temperature=0.5
     )
     message = response.choices[0].message.content.strip().lower()
 
@@ -1769,7 +1851,7 @@ def demo_trading():
 
             # Si el valor es menor a 0.1 USDT no vale la pena analizar venta
             # Ajusta este valor según el mínimo notional del exchange o tu criterio
-            if value_in_usdt < 0.5:
+            if value_in_usdt < 1:
                 print(f"⚠️ {symbol} tiene un valor en USDT muy bajo ({value_in_usdt:.5f}), se omite análisis de venta.")
             else:
                 filtered_portfolio.append(symbol)
@@ -1780,11 +1862,20 @@ def demo_trading():
             continue
 
     print(f"📊 Criptos en portafolio para analizar venta: {filtered_portfolio}")
-
+    last_analysis_time = {}
+    MIN_TIME_INTERVAL = timedelta(minutes=30)  # Intervalo mínimo de 30 minutos
     for symbol in filtered_portfolio:
         try:
             market_symbol = f"{symbol}/USDT"
+            current_time = datetime.now()
+            if symbol in last_analysis_time:
+                time_since_last_analysis = current_time - last_analysis_time[symbol]
+                if time_since_last_analysis < MIN_TIME_INTERVAL:
+                    print(f"⏳ {symbol}: No ha pasado suficiente tiempo desde el último análisis ({time_since_last_analysis}). Omitiendo.")
+                    continue
 
+            # Actualiza el tiempo del último análisis
+            last_analysis_time[symbol] = current_time
             # Obtener datos históricos y preparar series de precios y volúmenes
             data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(market_symbol)
             if not data_by_timeframe or volume_series is None or price_series is None:
@@ -1811,6 +1902,10 @@ def demo_trading():
             else:
                 rsi = "No disponible"
 
+                    # Condición adicional: número mínimo de velas desde la última transacción
+            if len(price_series) < 10:
+                print(f"⚠️ {symbol}: No se han acumulado suficientes velas desde el último análisis.")
+                continue
             # Insertar los datos actuales en la tabla `market_conditions`
             insert_market_condition(
                 symbol=market_symbol,
@@ -1884,23 +1979,89 @@ def demo_trading():
                 "market_depth_asks": market_depth["total_asks"],
                 "candlestick_pattern": candlestick_pattern
             }
+            # Verificar y convertir price_series
+            if isinstance(price_series, pd.Series):
+                print(f"🔄 Convirtiendo price_series desde pandas.Series para {symbol}.")
+                price_series = price_series.to_numpy(dtype=float)  # Convertir a array de NumPy con tipo float
+            elif not isinstance(price_series, (list, np.ndarray)):
+                print(f"⚠️ price_series no es una lista o un array válido para {symbol}. Tipo: {type(price_series)}")
+                continue
 
-            # Preparar texto para GPT con los datos
-            prepared_text = gpt_prepare_data(data_by_timeframe, additional_data)
-            print(f"El texto preparado que nos saca GPT-3 es:*********************************************************************************************** {prepared_text}")
+            # Asegurar que price_series sea un array NumPy de tipo float
+            price_series = np.array(price_series, dtype=float)
 
-            # Decisión de GPT
-            action, confidence, explanation = gpt_decision_sell(prepared_text)
-            print("********************************************************************************")
-            print(f"La accion a realizar es:......................... {action}")
-            print(f"El nivel de confianza es:....................... {confidence}")
-            print(f"La explicacion es:.................... {explanation}")
-            timestamp = get_colombia_timestamp()
+            # Filtrar valores inválidos (NaN o negativos/cero)
+            price_series = price_series[~np.isnan(price_series) & (price_series > 0)]
+
+            # Verificar longitud de price_series después de conversión y filtrado
+            if len(price_series) < 10:
+                print(f"⚠️ {symbol}: No hay suficientes velas válidas ({len(price_series)}).")
+                continue
+
+            print(f"🔄 price_series final para {symbol}: {price_series}")
+            print(f"Cantidad de datos en price_series: {len(price_series)}")
+
+            # Detectar crecimiento acelerado
+            if len(price_series) < 2:
+                print("⚠️ Datos insuficientes en price_series para detectar crecimiento acelerado.")
+                accelerated, growth, period = False, 0, 0
+            else:
+                # Depuración antes de llamar a detect_accelerated_growth
+                print(f"Contenido de data antes de llamar a detect_accelerated_growth: {price_series}")
+                print(f"Tipo de price_series antes de pasar a detect_accelerated_growth: {type(price_series)}")
+                try:
+                    accelerated, growth, period = detect_accelerated_growth(price_series, threshold=10, max_period=10)
+                    # Confirmar valores retornados
+                    print(f"🚀 Resultado de detect_accelerated_growth -> Accelerated: {accelerated}, Growth: {growth}, Period: {period}")
+                except Exception as e:
+                    print(f"❌ Error en detect_accelerated_growth: {e}")
+                    accelerated, growth, period = False, 0, 0
+
+            # Verificar resistencia cercana
             try:
-                send_telegram_message(f"la decision de vender {market_symbol} es : {action}, con un nivel de confianza es: {confidence}, La explicacion es: {explanation}")
-                send_telegram_message(f"La URL de binance es: {url_binance} y el timestamp {timestamp}")
+                print(f"🔍 Valores para is_near_resistance -> Current price: {current_price}, Resistance: {resistance}")
+                near_resistance, resistance = is_near_resistance(current_price, resistance, margin=1)
+                print(f"Resultado de is_near_resistance -> Near resistance: {near_resistance}, Resistance: {resistance}")
             except Exception as e:
-                print(f"❌ Error enviando mensaje de prueba a Telegram: {e}")
+                print(f"❌ Error en is_near_resistance: {e}")
+                near_resistance, resistance = False, None
+
+            # Resumen de condiciones y acción
+            try:
+                print(f"🛠️ Condiciones -> Accelerated: {accelerated}, Near resistance: {near_resistance}")
+                print(f"Growth: {growth}, Period: {period}")
+                if accelerated and near_resistance:
+                    print(f"⚠️ Crecimiento acelerado del {growth:.2f}% en {period} velas cerca de la resistencia {resistance}.")
+                    action = "vender"
+                    confidence = 85
+                    explanation = (
+                        "El precio ha crecido rápidamente y está cerca de resistencia. "
+                        "Señales de reversión sugieren vender."
+                    )
+                    print(f"✅ Acción sugerida -> {action} con confianza de {confidence}%")
+                else:
+                    print("No se cumplen las condiciones para vender.")
+            except Exception as e:
+                print(f"❌ Error en el análisis final: {e}")
+
+
+            else:
+
+                prepared_text = gpt_prepare_data(data_by_timeframe, additional_data)
+                print(f"El texto preparado que nos saca GPT-3 es:*********************************************************************************************** {prepared_text}")
+
+                # Decisión de GPT
+                action, confidence, explanation = gpt_decision_sell(prepared_text)
+                print("********************************************************************************")
+                print(f"La accion a realizar es:......................... {action}")
+                print(f"El nivel de confianza es:....................... {confidence}")
+                print(f"La explicacion es:.................... {explanation}")
+                timestamp = get_colombia_timestamp()
+                try:
+                    send_telegram_message(f"la decision de vender {market_symbol} es : {action}, con un nivel de confianza es: {confidence}, La explicacion es: {explanation}")
+                    send_telegram_message(f"La URL de binance es: {url_binance} y el timestamp {timestamp}")
+                except Exception as e:
+                    print(f"❌ Error enviando mensaje de prueba a Telegram: {e}")
 
             # Ejecutar venta si GPT lo decide
             if action == "vender":
