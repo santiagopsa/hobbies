@@ -1337,7 +1337,7 @@ def make_buy(symbol, budget, risk_type, confidence, explanation=None):
             adjusted_budget = budget * 0.8  # 80% del presupuesto si la confianza es alta
         else:
             adjusted_budget = budget * 0.5  # 50% del presupuesto si la confianza es baja
-            
+
     elif risk_type == "bajo riesgo":
         if confidence <= 70:
             adjusted_budget = budget * 0.05  # 5% del presupuesto
@@ -1714,11 +1714,9 @@ def demo_trading():
             action, confidence, explanation = gpt_decision_buy(prepared_text)
             print(f"El ganador final es {final_winner}")
             print(f"******************************************")
-            action= "comprar"
             print(f"Se recomienda {action}")
             print(f"******************************************")
             print(f"La explicación es: {explanation}")
-            low_risk_budget=20
 
             if action == "comprar":
                 make_buy(final_winner, low_risk_budget, "bajo riesgo", confidence, explanation)
