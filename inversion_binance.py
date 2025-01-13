@@ -1325,24 +1325,36 @@ def execute_order_buy(symbol, amount, confidence, explanation, risk_t):
         print(f"❌ Error al ejecutar la orden de compra para {symbol}: {e}")
         return None
 
-def make_buy(symbol, budget, risk_type, confidence=None, explanation=None):
+def make_buy(symbol, budget, risk_type, confidence, explanation=None):
     """
-    Realiza la compra de una cripto utilizando la función `execute_order_buy`, ajustando el presupuesto según la confianza.
+    Realiza la compra de una criptomoneda utilizando la función `execute_order_buy`, 
+    ajustando el presupuesto según la confianza y el tipo de riesgo, y maneja la comunicación
+    de la transacción a través de Telegram.
     """
-    # Ajustar el presupuesto en base al porcentaje de confianza
-    if confidence <= 70:
-        adjusted_budget = budget * 0.05  # 8% del presupuesto
-    elif 70 < confidence <= 75:
-        adjusted_budget = budget * 0.15  # 15% del presupuesto
-    elif 75 < confidence <= 80:
-        adjusted_budget = budget * 0.4  # 30% del presupuesto
-    elif confidence > 80:
-        adjusted_budget = budget * 0.7  # 60% del presupuesto
+    # Ajustar el presupuesto basado en el tipo de riesgo y la confianza
+    if risk_type == "alto riesgo":
+        if confidence > 80:
+            adjusted_budget = budget * 0.8  # 80% del presupuesto si la confianza es alta
+        else:
+            adjusted_budget = budget * 0.5  # 50% del presupuesto si la confianza es baja
+            
+    elif risk_type == "bajo riesgo":
+        if confidence <= 70:
+            adjusted_budget = budget * 0.05  # 5% del presupuesto
+        elif 70 < confidence <= 75:
+            adjusted_budget = budget * 0.15  # 15% del presupuesto
+        elif 75 < confidence <= 80:
+            adjusted_budget = budget * 0.4  # 40% del presupuesto
+        elif confidence > 80:
+            adjusted_budget = budget * 0.7  # 70% del presupuesto
+        else:
+            print(f"⚠️ Confianza no válida: {confidence}")
+            return
     else:
-        print(f"⚠️ Confianza no válida: {confidence}")
+        print(f"⚠️ Tipo de riesgo no válido: {risk_type}")
         return
 
-    print(f"🔍 Presupuesto ajustado: {adjusted_budget:.2f} USDT (Confianza: {confidence}%)")
+    print(f"🔍 Presupuesto ajustado: {adjusted_budget:.2f} USDT (Confianza: {confidence}%, Riesgo: {risk_type})")
 
     # Obtener el precio actual
     final_price = fetch_price(symbol)
@@ -1358,7 +1370,15 @@ def make_buy(symbol, budget, risk_type, confidence=None, explanation=None):
     if amount_to_buy * final_price >= 2:  # Mínimo notional de Binance
         order = execute_order_buy(symbol, amount_to_buy, confidence, explanation, risk_type)
         if order:
+            timestamp = get_colombia_timestamp()
             print(f"✅ Compra ejecutada para {symbol} ({risk_type})")
+            url_binance = f"https://www.binance.com/en/trade/{symbol}_USDT?_from=markets&type=spot"
+            try:
+                print(f"Comprando {symbol} con éxito a un valor de {amount_to_buy} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
+                send_telegram_message(f"Comprando {symbol} con {risk_type} EXITOSAMENTE a un valor de {amount_to_buy} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
+                send_telegram_message(f"URL de binance: {url_binance}, con el timestamp {timestamp}")
+            except Exception as e:
+                print(f"❌ Error enviando mensaje de prueba a Telegram: {e}")
         else:
             print(f"❌ No se pudo ejecutar la compra para {symbol} ({risk_type}).")
     else:
@@ -1694,19 +1714,14 @@ def demo_trading():
             action, confidence, explanation = gpt_decision_buy(prepared_text)
             print(f"El ganador final es {final_winner}")
             print(f"******************************************")
+            action= "comprar"
             print(f"Se recomienda {action}")
             print(f"******************************************")
             print(f"La explicación es: {explanation}")
+            low_risk_budget=20
 
             if action == "comprar":
                 make_buy(final_winner, low_risk_budget, "bajo riesgo", confidence, explanation)
-                url_binance = "https://www.binance.com/en/trade/{}_?_from=markets&type=spot".format(final_winner.replace("/", "_"))
-                try:
-                    print(f"Comprando {final_winner} con éxito a un valor de {low_risk_budget} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
-                    send_telegram_message(f"Comprando {final_winner} con éxito a un valor de {low_risk_budget} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
-                    send_telegram_message(f"URL de binance: {url_binance}, con el timestamp {timestamp}")
-                except Exception as e:
-                    print(f"❌ Error enviando mensaje de prueba a Telegram: {e}")
     else:
         print("⚠️ No se encontraron criptos válidas de alto volumen.")
 
@@ -1813,23 +1828,6 @@ def demo_trading():
                             confidence,
                             explanation
                         )
-                        try:
-                            print(
-                                f"Comprando {crypto['symbol']} con éxito a un valor de "
-                                f"{high_risk_budget / len(top_interesting_cryptos)} USDT "
-                                f"con un nivel de confianza de {confidence}. Explicación: {explanation}"
-                            )
-                            send_telegram_message(
-                                f"Comprando {crypto['symbol']} con éxito a un valor de "
-                                f"{high_risk_budget / len(top_interesting_cryptos)} USDT "
-                                f"con un nivel de confianza de {confidence} y la explicación: {explanation}"
-                            )
-                            send_telegram_message(
-                                f"URL de binance https://www.binance.com/en/trade/"
-                                f"{crypto['symbol'].replace('/', '_')}?_from=markets&type=spot y timestamp {timestamp}"
-                            )
-                        except Exception as e:
-                            print(f"❌ Error enviando mensaje a Telegram: {e}")
 
                 except Exception as e:
                     print(f"❌ Error al evaluar {crypto['symbol']}: {e}")
