@@ -477,279 +477,310 @@ def filter_by_score_normalized(
     exchange,
     periods=50,
     # Pesos para cada factor (ajústalos a tu gusto)
-    weight_distance=0.15,   
-    weight_volume=0.4,
-    weight_price=0.3,
+    weight_distance=0.1,   
+    weight_volume=0.5,
+    weight_price=0.35,
     weight_trend=0.20,
     # Umbral de volumen en las últimas 24h (en USDT)
     min_24h_volume=1_000_000,
     # ¿Usar escalado logarítmico en el volume_growth?
-    volume_growth_log=True
+    volume_growth_log=True,
+    # Monedas fiat a excluir
+    fiat_currencies=None,
+    # Monedas estables (stablecoins) a excluir en la moneda base
+    stablecoins=None
 ):
     """
     Función integral para:
-      1) Filtrar pares spot USDT con min_24h_volume.
+      1) Filtrar pares spot USDT con min_24h_volume y excluyendo monedas fiat y stablecoins en la moneda base.
       2) Calcular factores de explosividad (distance, volumen, price_change, trend).
-      3) Normalizar y sacar Top 3 con el mayor 'score'.
-
-    Retorna: lista con los objetos del Top 3 (score, factores, etc.).
+      3) Calcular un 'score' independiente para cada moneda basado en factores absolutos.
+    
+    Retorna: lista con los símbolos del Top 3.
     """
+
+    # Definir listas predeterminadas si no se proporcionan
+    if fiat_currencies is None:
+        fiat_currencies = [
+            'USD', 'EUR', 'GBP', 'JPY', 'AUD', 'CAD', 'CHF', 'CNY', 'HKD', 'SGD',
+            'SEK', 'NZD', 'MXN', 'INR', 'RUB', 'ZAR', 'TRY', 'BRL', 'KRW', 'NOK',
+            'TWD', 'DKK', 'PLN', 'THB', 'IDR', 'HUF', 'CZK', 'ILS', 'CLP'
+        ]
+
+    if stablecoins is None:
+        stablecoins = [
+            'USDT', 'USDC', 'BUSD', 'DAI', 'TUSD', 'PAX', 'GUSD', 'UST', 'FRAX',
+            'sUSD', 'HUSD', 'MIM', 'USDP', 'EURS', 'AUDS', 'NZDS'
+        ]
 
     try:
         print("Cargando mercados...")
         markets = exchange.load_markets()
+    except Exception as e:
+        print(f"Error al cargar mercados: {e}")
+        return []  # Retorna una lista vacía en caso de error
 
-        # ---------------------------------------------------------------------
-        # (A) Construir la lista de símbolos spot con quote=USDT
-        # ---------------------------------------------------------------------
-        spot_usdt_symbols = []
-        for symbol, info in markets.items():
+    # ---------------------------------------------------------------------
+    # (A) Construir la lista de símbolos spot con quote=USDT excluyendo fiat y stablecoins en base
+    # ---------------------------------------------------------------------
+    spot_usdt_symbols = []
+    for symbol, info in markets.items():
+        try:
             # Verificar si es spot (si la clave 'spot' existe y es True)
             if not info.get('spot', False):
                 continue
             # Verificar si la "quote" es USDT
-            if info.get('quote') != 'USDT':
+            if info.get('quote', '').upper() != 'USDT':
                 continue
 
-            # Opcional: si deseas excluir específicamente pares fiat, stable-stable, etc.
-            # Ejemplo: si no quieres ver USDT/MXN
-            base = info.get('base', '')
+            # Obtener la moneda base
+            base = info.get('base', '').upper()
+            quote = info.get('quote', '').upper()
+
+            # Excluir pares donde la moneda base sea USDT (evitar USDT/USDT)
             if base == 'USDT':
-                # Este par es USDT/XXX => no te interesa
                 continue
+
+            # Excluir monedas fiat en la moneda base
+            if base in fiat_currencies:
+                continue
+
+            # Excluir stablecoins en la moneda base
+            if base in stablecoins:
+                continue
+
+            # Opcional: Excluir stablecoins en la moneda quote, si es necesario
+            # (Generalmente, la moneda quote ya es USDT, que ya está en la lista de stablecoins)
+            # if quote in stablecoins:
+            #     continue
 
             # Si pasa todos los filtros, lo agregamos
             spot_usdt_symbols.append(symbol)
+        except Exception as e:
+            print(f"Error al procesar el símbolo {symbol}: {e}")
+            continue  # Continúa con el siguiente símbolo en caso de error
 
-        print(f"Símbolos spot USDT detectados: {len(spot_usdt_symbols)}")
+    print(f"Símbolos spot USDT detectados (excluyendo fiat y stablecoins en base): {len(spot_usdt_symbols)}")
 
-        # ---------------------------------------------------------------------
-        # (B) Variables para guardar resultados
-        # ---------------------------------------------------------------------
-        raw_data = []
-        omitted_symbols = []
+    # ---------------------------------------------------------------------
+    # (B) Variables para guardar resultados
+    # ---------------------------------------------------------------------
+    raw_data = []
+    omitted_symbols = []
 
-        print("Recopilando datos...")
-        for symbol in spot_usdt_symbols:
-            try:
-                # 1) Ticker general
-                ticker = exchange.fetch_ticker(symbol)
-                if ticker is None:
-                    omitted_symbols.append((symbol, "No se pudo obtener ticker"))
-                    continue
+    print("Recopilando datos...")
+    for symbol in spot_usdt_symbols:
+        try:
+            # 1) Ticker general
+            ticker = exchange.fetch_ticker(symbol)
+            if ticker is None:
+                omitted_symbols.append((symbol, "No se pudo obtener ticker"))
+                continue
 
-                last_price = ticker.get('last')
-                open_price = ticker.get('open')
-                vol_24h    = ticker.get('quoteVolume', 0)  # Volumen en USDT
+            last_price = ticker.get('last')
+            open_price = ticker.get('open')
+            vol_24h    = ticker.get('quoteVolume', 0)  # Volumen en USDT
 
-                # 2) Filtro de volumen 24h
-                if vol_24h is None:
-                    vol_24h = 0
-                if vol_24h < min_24h_volume:
-                    omitted_symbols.append((symbol, f"Vol.24h ({vol_24h:.1f}) < {min_24h_volume}"))
-                    continue
+            # 2) Filtro de volumen 24h
+            if vol_24h is None:
+                vol_24h = 0
+            if vol_24h < min_24h_volume:
+                omitted_symbols.append((symbol, f"Vol.24h ({vol_24h:.1f}) < {min_24h_volume}"))
+                continue
 
-                # 3) Validaciones de precio
-                if any(val is None for val in [last_price, open_price]):
-                    omitted_symbols.append((symbol, "last_price u open_price incompletos"))
-                    continue
-                if open_price <= 0:
-                    omitted_symbols.append((symbol, "open_price <= 0"))
-                    continue
+            # 3) Validaciones de precio
+            if any(val is None for val in [last_price, open_price]):
+                omitted_symbols.append((symbol, "last_price u open_price incompletos"))
+                continue
+            if open_price <= 0:
+                omitted_symbols.append((symbol, "open_price <= 0"))
+                continue
 
-                # 4) OHLCV histórico (para factores)
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=periods)
-                if not ohlcv or len(ohlcv) < periods:
-                    omitted_symbols.append((symbol, "OHLCV insuficiente"))
-                    continue
+            # 4) OHLCV histórico (para factores)
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=periods)
+            if not ohlcv or len(ohlcv) < periods:
+                omitted_symbols.append((symbol, "OHLCV insuficiente"))
+                continue
 
-                # Extraer datos de las velas
-                closes = [c[4] for c in ohlcv]  # cierre de cada vela
-                opens_ = [c[1] for c in ohlcv]  # apertura de cada vela
-                vols   = [c[5] for c in ohlcv]  # volumen de cada vela
+            # Extraer datos de las velas
+            closes = [c[4] for c in ohlcv]  # cierre de cada vela
+            vols   = [c[5] for c in ohlcv]  # volumen de cada vela
 
-                min_close = min(closes) if closes else 999999
-                avg_recent_volume = sum(vols) / len(vols) if vols else 1
+            min_close = min(closes) if closes else 999999
+            avg_recent_volume = sum(vols) / len(vols) if vols else 1
 
-                # La última vela
-                last_candle = ohlcv[-1]
-                last_candle_open  = last_candle[1]
-                last_candle_close = last_candle[4]
-                volume_ultima_vela = last_candle[5]
+            # La última vela
+            last_candle = ohlcv[-1]
+            last_candle_open  = last_candle[1]
+            last_candle_close = last_candle[4]
+            volume_ultima_vela = last_candle[5]
 
-                # -------------------------------------------------------------
-                # (1) distance_factor => cercanía a la base
-                # -------------------------------------------------------------
-                near_base = last_price / min_close if min_close else 999999
-                distance_factor = 1.0 / near_base  # mayor => más cerca de su min
+            # -------------------------------------------------------------
+            # (1) distance_factor => cercanía a la base
+            # -------------------------------------------------------------
+            near_base = last_price / min_close if min_close else 999999
+            distance_factor = 1.0 / near_base  # mayor => más cerca de su min
 
-                # -------------------------------------------------------------
-                # (2) volume_growth con factor de dirección
-                # -------------------------------------------------------------
-                volume_direction_factor = 1.0 if last_candle_close > last_candle_open else -1.0
-                ratio = volume_ultima_vela / avg_recent_volume if avg_recent_volume > 0 else 0
+            # -------------------------------------------------------------
+            # (2) volume_growth con factor de dirección
+            # -------------------------------------------------------------
+            volume_direction_factor = 1.0 if last_candle_close > last_candle_open else -1.0
+            ratio = volume_ultima_vela / avg_recent_volume if avg_recent_volume > 0 else 0
 
-                if volume_growth_log:
-                    raw_vol_growth = math.log10(ratio + 1) if ratio > 0 else 0.0
-                else:
-                    raw_vol_growth = ratio - 1.0  # Ejemplo lineal
+            if volume_growth_log:
+                raw_vol_growth = math.log10(ratio + 1) if ratio > 0 else 0.0
+            else:
+                raw_vol_growth = ratio - 1.0  # Ejemplo lineal
 
-                # Multiplicamos por direction_factor
-                raw_vol_growth *= volume_direction_factor
+            # Multiplicamos por direction_factor
+            raw_vol_growth *= volume_direction_factor
 
-                # -------------------------------------------------------------
-                # (3) price_change con penalización si muy negativo
-                # -------------------------------------------------------------
-                price_change = (last_price - open_price) / open_price
-                if price_change < -0.10:
-                    price_change *= 0.8  # penalización
+            # -------------------------------------------------------------
+            # (3) price_change con penalización si muy negativo
+            # -------------------------------------------------------------
+            price_change = (last_price - open_price) / open_price
+            if price_change < -0.10:
+                price_change *= 0.8  # penalización
 
-                # -------------------------------------------------------------
-                # (4) trend_factor con MA(7), MA(25) y pendiente
-                # -------------------------------------------------------------
-                short_ma_window = 7
-                long_ma_window  = 25
-                if len(closes) < long_ma_window:
-                    omitted_symbols.append((symbol, "No hay velas suficientes para MA(25)"))
-                    continue
+            # -------------------------------------------------------------
+            # (4) trend_factor con MA(7), MA(25) y pendiente
+            # -------------------------------------------------------------
+            short_ma_window = 7
+            long_ma_window  = 25
+            if len(closes) < long_ma_window:
+                omitted_symbols.append((symbol, "No hay velas suficientes para MA(25)"))
+                continue
 
-                # Cálculo de la MA(7) y MA(25) actuales
-                ma_short = sum(closes[-short_ma_window:]) / short_ma_window
-                ma_long  = sum(closes[-long_ma_window:])  / long_ma_window
+            # Cálculo de la MA(7) y MA(25) actuales
+            ma_short = sum(closes[-short_ma_window:]) / short_ma_window
+            ma_long  = sum(closes[-long_ma_window:])  / long_ma_window
 
-                # Pendiente de la MA(25)
-                half_window = max(1, long_ma_window // 2)
-                ma_long_old = sum(closes[-(long_ma_window + half_window):-half_window]) / long_ma_window
-                slope_long  = (ma_long - ma_long_old) / ma_long_old if ma_long_old != 0 else 0
+            # Pendiente de la MA(25)
+            half_window = max(1, long_ma_window // 2)
+            ma_long_old = sum(closes[-(long_ma_window + half_window):-half_window]) / long_ma_window
+            slope_long  = (ma_long - ma_long_old) / ma_long_old if ma_long_old != 0 else 0
 
-                # Definir trend_factor
-                if (ma_short > ma_long) and (slope_long > 0):
-                    trend_factor = 1.0  # Alcista
-                elif (ma_short < ma_long) and (slope_long < 0):
-                    trend_factor = 0.0  # Bajista
-                else:
-                    trend_factor = 0.5  # Neutro
+            # Definir trend_factor
+            if (ma_short > ma_long) and (slope_long > 0):
+                trend_factor = 1.0  # Alcista
+            elif (ma_short < ma_long) and (slope_long < 0):
+                trend_factor = 0.0  # Bajista
+            else:
+                trend_factor = 0.5  # Neutro
 
-                # -------------------------------------------------------------
-                # Guardar datos sin normalizar (raw)
-                # -------------------------------------------------------------
-                raw_data.append({
-                    "symbol": symbol,
-                    "distance_factor": distance_factor,
-                    "volume_growth":   raw_vol_growth,
-                    "price_change":    price_change,
-                    "trend_factor":    trend_factor,
-                    "near_base":       near_base,
-                    "last_price":      last_price,
-                    "vol_24h":         vol_24h,  # para info
-                })
-
-            except Exception as e:
-                omitted_symbols.append((symbol, f"Error interno: {e}"))
-
-        # ---------------------------------------------------------------------
-        # (C) Si no hay datos válidos tras filtrar
-        # ---------------------------------------------------------------------
-        if not raw_data:
-            print("No hay datos tras filtrar y descartar.")
-            return []
-
-        # ---------------------------------------------------------------------
-        # (D) Normalización de cada factor en [0..1]
-        # ---------------------------------------------------------------------
-        df_vals  = [x["distance_factor"] for x in raw_data]
-        vol_vals = [x["volume_growth"]   for x in raw_data]
-        pc_vals  = [x["price_change"]    for x in raw_data]
-        tr_vals  = [x["trend_factor"]    for x in raw_data]
-
-        df_min, df_max = min(df_vals), max(df_vals)
-        vol_min, vol_max = min(vol_vals), max(vol_vals)
-        pc_min, pc_max = min(pc_vals), max(pc_vals)
-        tr_min, tr_max = min(tr_vals), max(tr_vals)
-
-        print("\nDEBUG - Mín y Máx de los factores:")
-        print(f"  distance_factor: min={df_min:.4f}, max={df_max:.4f}")
-        print(f"  volume_growth:   min={vol_min:.4f}, max={vol_max:.4f}")
-        print(f"  price_change:    min={pc_min:.4f}, max={pc_max:.4f}")
-        print(f"  trend_factor:    min={tr_min:.4f}, max={tr_max:.4f}\n")
-
-        def normalize(val, vmin, vmax):
-            if vmax > vmin:
-                return (val - vmin) / (vmax - vmin)
-            return 0.0
-
-        normalized_data = []
-        for item in raw_data:
-            df_val = item["distance_factor"]
-            vol_val = item["volume_growth"]
-            pc_val = item["price_change"]
-            tr_val = item["trend_factor"]
-
-            df_norm  = normalize(df_val,  df_min,  df_max)
-            vol_norm = normalize(vol_val, vol_min, vol_max)
-            pc_norm  = normalize(pc_val,  pc_min,  pc_max)
-            tr_norm  = normalize(tr_val,  tr_min,  tr_max)
-
-            # Score final
-            score = (
-                weight_distance * df_norm +
-                weight_volume   * vol_norm +
-                weight_price    * pc_norm  +
-                weight_trend    * tr_norm
-            )
-
-            normalized_data.append({
-                "symbol": item["symbol"],
-                "score": score,
-                "probabilidad_explosividad": score * 100,
-                # Datos para imprimir
-                "distance_factor": item["distance_factor"],
-                "volume_growth":   item["volume_growth"],
-                "price_change":    item["price_change"],
-                "trend_factor":    item["trend_factor"],
-                "near_base":       item["near_base"],
-                "last_price":      item["last_price"],
-                "vol_24h":         item["vol_24h"],
+            # -------------------------------------------------------------
+            # Guardar datos sin normalizar (raw)
+            # -------------------------------------------------------------
+            raw_data.append({
+                "symbol": symbol,
+                "distance_factor": distance_factor,
+                "volume_growth":   raw_vol_growth,
+                "price_change":    price_change,
+                "trend_factor":    trend_factor,
+                "near_base":       near_base,
+                "last_price":      last_price,
+                "vol_24h":         vol_24h,  # para info
             })
 
-        # ---------------------------------------------------------------------
-        # (E) Ordenar de mayor a menor score, tomar Top 3
-        # ---------------------------------------------------------------------
-        normalized_data.sort(key=lambda obj: obj["score"], reverse=True)
-        top3 = normalized_data[:3]
+        except Exception as e:
+            omitted_symbols.append((symbol, f"Error interno: {e}"))
+            continue  # Continúa con el siguiente símbolo en caso de error
 
-        print("Top 3 criptos con mayor 'score' de explosividad:")
-        for i, c in enumerate(top3, start=1):
-            print(
-                f"{i}) {c['symbol']} => score={c['score']:.4f} "
-                f"({c['probabilidad_explosividad']:.2f}%) | "
-                f"distance_factor={c['distance_factor']:.4f} | "
-                f"volume_growth={c['volume_growth']:.4f} | "
-                f"price_change={c['price_change']:.2%} | "
-                f"trend_factor={c['trend_factor']:.2f} | "
-                f"near_base={c['near_base']:.4f} | "
-                f"last_price={c['last_price']:.4f} | "
-                f"vol_24h={c['vol_24h']:.2f}"
-            )
+    # ---------------------------------------------------------------------
+    # (C) Si no hay datos válidos tras filtrar
+    # ---------------------------------------------------------------------
+    if not raw_data:
+        print("No hay datos tras filtrar y descartar.")
+        return []
 
-        # ---------------------------------------------------------------------
-        # (F) Log de omitidos
-        # ---------------------------------------------------------------------
-        if omitted_symbols:
+    # ---------------------------------------------------------------------
+    # (D) Definir rangos máximos para escalado absoluto
+    # ---------------------------------------------------------------------
+    # Estos valores deben ajustarse según la observación de los datos
+    MAX_DISTANCE_FACTOR = 1.0          # Por ejemplo
+    MAX_VOLUME_GROWTH = 5.0            # Ajusta según tus observaciones
+    MAX_PRICE_CHANGE = 1.0              # Cambios de -100% a +100%
+    MAX_TREND_FACTOR = 1.0              # Valor máximo esperado
 
+    def scale_factor(value, max_value):
+        return min(value / max_value, 1.0) if max_value != 0 else 0.0
+
+    normalized_data = []
+    for item in raw_data:
+        df_val = item["distance_factor"]
+        vol_val = item["volume_growth"]
+        pc_val = item["price_change"]
+        tr_val = item["trend_factor"]
+
+        # Escalado absoluto
+        df_scaled = scale_factor(df_val, MAX_DISTANCE_FACTOR)
+        vol_scaled = scale_factor(vol_val, MAX_VOLUME_GROWTH)
+        pc_scaled = scale_factor(abs(pc_val), MAX_PRICE_CHANGE)  # Usar valor absoluto si consideras tanto aumentos como disminuciones
+        tr_scaled = scale_factor(tr_val, MAX_TREND_FACTOR)
+
+        # Aplicar penalización si price_change es muy negativo
+        if item["price_change"] < -0.10:
+            pc_scaled *= 0.8  # Penalización
+
+        # Score final
+        score = (
+            weight_distance * df_scaled +
+            weight_volume   * vol_scaled +
+            weight_price    * pc_scaled  +
+            weight_trend    * tr_scaled
+        )
+
+        normalized_data.append({
+            "symbol": item["symbol"],
+            "score": score,
+            "probabilidad_explosividad": score * 100,
+            # Datos para imprimir
+            "distance_factor": item["distance_factor"],
+            "volume_growth":   item["volume_growth"],
+            "price_change":    item["price_change"],
+            "trend_factor":    item["trend_factor"],
+            "near_base":       item["near_base"],
+            "last_price":      item["last_price"],
+            "vol_24h":         item["vol_24h"],
+        })
+
+    # ---------------------------------------------------------------------
+    # (E) Ordenar de mayor a menor score, tomar Top 3
+    # ---------------------------------------------------------------------
+    normalized_data.sort(key=lambda obj: obj["score"], reverse=True)
+    top3 = normalized_data[:3]
+
+    print("Top 3 criptos con mayor 'score' de explosividad:")
+    for i, c in enumerate(top3, start=1):
+        print(
+            f"{i}) {c['symbol']} => score={c['score']:.4f} "
+            f"({c['probabilidad_explosividad']:.2f}%) | "
+            f"distance_factor={c['distance_factor']:.4f} | "
+            f"volume_growth={c['volume_growth']:.4f} | "
+            f"price_change={c['price_change']:.2%} | "
+            f"trend_factor={c['trend_factor']:.2f} | "
+            f"near_base={c['near_base']:.4f} | "
+            f"last_price={c['last_price']:.4f} | "
+            f"vol_24h={c['vol_24h']:.2f}"
+        )
+
+    # ---------------------------------------------------------------------
+    # (F) Log de omitidos
+    # ---------------------------------------------------------------------
+    if omitted_symbols:
+        try:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             with open(f"omitted_symbols_log_{timestamp}.csv", "w") as f:
                 f.write("Symbol,Reason\n")
                 for sym, reason in omitted_symbols:
                     f.write(f"{sym},{reason}\n")
+            print(f"Se han registrado {len(omitted_symbols)} símbolos omitidos en 'omitted_symbols_log_{timestamp}.csv'")
+        except Exception as e:
+            print(f"Error al escribir el log de símbolos omitidos: {e}")
 
-        top3_symbols = [item["symbol"] for item in top3]
-        return top3_symbols
-
-    except Exception as e:
-        print(f"Error general: {e}")
-        return []
-
+    top3_symbols = [item["symbol"] for item in top3]
+    print(f"\nTop 3 símbolos retornados: {top3_symbols}")
+    return top3_symbols
 
 def gpt_prepare_data(data_by_timeframe, additional_data):
     combined_data = ""
@@ -1409,7 +1440,7 @@ def execute_order_sell(symbol, confidence, explanation):
         # Obtener el precio actual si no está en la orden
         ticker = exchange.fetch_ticker(symbol)
         price = order.get("price") or ticker["last"]
-        timestamp = pd.Timestamp.now().isoformat()
+        timestamp = get_colombia_timestamp()
 
         # Recuperar todas las compras del símbolo
         transactions = fetch_all_transactions()
@@ -1760,7 +1791,7 @@ def demo_trading():
                     rsi_values = calculate_rsi(prices, period=14)
                     rsi = rsi_values[-1] if rsi_values is not None and len(rsi_values) > 0 else None
 
-                # 4) Armar la información “adicional” que quieres guardar
+                # 4) Armar la información "adicional" que quieres guardar
                 additional_data = {
                     "current_price": fetch_price(symbol),
                     "relative_volume": calculate_relative_volume(volume_series),
@@ -1776,7 +1807,7 @@ def demo_trading():
                     "candlestick_pattern": analyze_candlestick_patterns(data_by_timeframe["1h"]),
                 }
 
-                # 5) Validar si los datos “adicionales” están completos o en rangos aceptables
+                # 5) Validar si los datos "adicionales" están completos o en rangos aceptables
                 if validate_crypto_data(additional_data):
                     # Si todo OK, agregamos a valid_cryptos
                     valid_cryptos.append({
@@ -1794,7 +1825,7 @@ def demo_trading():
         if not valid_cryptos:
             print("⚠️ No se encontraron criptos interesantes de bajo volumen. Finalizando.")
         else:
-            # (Opcional) Ordenar por algún criterio si quieres un “Top 2” o similar
+            # (Opcional) Ordenar por algún criterio si quieres un "Top 2" o similar
             # Ejemplo si en la data adicional tuvieras "price_change" y "volume"
             # valid_cryptos.sort(key=lambda x: (x["price_change"], x["volume"]), reverse=True)
             # top_interesting_cryptos = valid_cryptos[:2]
@@ -2065,16 +2096,6 @@ def demo_trading():
                 if crypto_balance > 0:
                     order = execute_order_sell(market_symbol, confidence, explanation)
                     if order:
-                        insert_transaction(
-                            symbol=market_symbol,
-                            action="sell",
-                            price=current_price,
-                            amount=crypto_balance,
-                            timestamp=pd.Timestamp.now().isoformat(),
-                            profit_loss=None,
-                            confidence_percentage=confidence,
-                            summary=explanation
-                        )
                         print(f"✅ Venta realizada para {symbol} a {current_price} USDT.")
                         try:
                             print(f"Vendiendo {symbol} con éxito a un valor de {current_price} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
