@@ -14,6 +14,9 @@ import time
 from datetime import datetime, timedelta
 import pytz
 import math
+import json
+import logging
+import re
 
 initialize_db()
 #upgrade_db_schema()
@@ -461,7 +464,7 @@ def validate_crypto_data(additional_data):
     """
     required_keys = [
         "current_price", "relative_volume", "rsi", "avg_volume_24h",
-        "market_cap", "spread", "adx", "support", "resistance"
+         "support", "resistance"
     ]
     for key in required_keys:
         if key not in additional_data or additional_data[key] is None or np.isnan(additional_data[key]):
@@ -816,145 +819,345 @@ def gpt_prepare_data(data_by_timeframe, additional_data):
         ],
         temperature=0.5
     )
-    #print(combined_data)
     return response.choices[0].message.content.strip()
 
+import json
+import re
+import logging
+
+# Configura el logging para registrar las respuestas y errores
+logging.basicConfig(
+    level=logging.INFO,
+    filename='gpt_responses.log',
+    filemode='a',
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
 def gpt_decision_buy(prepared_text):
-    prompt = f"""
-    Eres un experto en trading enfocado en criptomonedas de alta especulación.
-    Estás dispuesto a asumir un riesgo elevado,
-    respaldado por un trailing stop. Tu objetivo es conseguir al menos un 3% de
-    crecimiento diario en el corto plazo.
-
-    Basándote en el siguiente texto estructurado, decide si COMPRAR esta
-    criptomoneda para tener un retorno en el corto plazo, o si debes MANTENER.
-    Recuerda que:
-    - Queremos ser más arriesgados, ya que el trailing stop reduce nuestro riesgo.
-    - Buscamos alta probabilidad de crecimiento y aumento de volumen de manera inmediata.
-    - Si los indicadores sugieren potencial de crecimiento, incluso si las condiciones
-      no son perfectas, preferimos COMPRAR para mantener el capital en movimiento.
-    - MANTENER solo en caso de divergencias bajistas claras o problemas de liquidez
-      (bajo volumen, spreads demasiado amplios, etc.).
-
-    Información disponible:
-    {prepared_text}
-
-    En base a estos datos, decide entre "comprar" o "mantener".
-    1. Inicia la respuesta con la palabra "comprar" o "mantener".
-    2. Indica después un porcentaje de confianza para la compra, en base a eso voy a definir mi presupuesto, esto es MUY IMPORTANTE ajustarlo a la probabilidad de crecimiento (por ejemplo, 80%).
-    3. Proporciona una breve explicación (1 o 2 líneas) sobre por qué tomas esa decisión.
     """
+    Decide si comprar un activo basado en los datos proporcionados.
+    """
+    prompt = f"""
+        Eres un experto en trading enfocado en criptomonedas de alta especulación.
+        Estás dispuesto a asumir un riesgo elevado, respaldado por un trailing stop.
+        Tu objetivo es conseguir al menos un 3% de crecimiento diario en el corto plazo.
 
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "Eres un experto en trading."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.7
-    )
+        Basándote en el siguiente texto estructurado, decide si COMPRAR esta criptomoneda para tener un retorno en el corto plazo, o si debes MANTENER.
 
-    # Convertimos la respuesta a minúsculas para evaluar la palabra inicial
-    message = response.choices[0].message.content.strip().lower()
+        Condiciones clave:
+        - Queremos ser más arriesgados, ya que el trailing stop reduce nuestro riesgo.
+        - Buscamos alta probabilidad de crecimiento y aumento de volumen de manera inmediata.
+        - Si los indicadores sugieren potencial de crecimiento, incluso si las condiciones no son perfectas, preferimos COMPRAR para mantener el capital en movimiento.
+        - MANTENER solo en caso de divergencias bajistas claras o problemas de liquidez (bajo volumen, spreads demasiado amplios, etc.).
 
-    import re
-    action = "mantener"
-    if message.startswith("comprar"):
-        action = "comprar"
+        Información disponible:
+        {prepared_text}
 
-    # Buscamos el primer número con % como confianza (ej. "80%")
-    match = re.search(r'(\d+)%', message)
-    confidence = int(match.group(1)) if match else 50
+        **Instrucciones:**
+        - Responde únicamente en formato JSON con los campos "accion", "confianza" y "explicacion".
+        - "accion" debe ser "comprar" o "mantener".
+        - "confianza" debe ser un número entero entre 0 y 100 que represente el nivel de confianza en la decisión.
+        - "explicacion" debe contener una breve justificación de la decisión (1 o 2 líneas).
+        - No incluyas ningún otro texto, comentarios, o delimitadores de código en la respuesta.
+        - Asegúrate de que el JSON esté completo y correctamente cerrado.
 
-    # Tomamos la primera línea como explicación completa
-    explanation = message.split("\n", 1)[0]
+        **Ejemplo de respuesta:**
+        {{"accion": "comprar", "confianza": 80, "explicacion": "Los indicadores muestran un aumento de volumen y señales de sobrecompra."}}
+    """
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "Eres un experto en trading enfocado en criptomonedas de alta especulación."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,        # Temperatura baja para respuestas más deterministas
+            max_tokens=150           # Suficiente para la respuesta en JSON
+            # Eliminar el parámetro 'stop' para permitir que GPT genere el JSON completo
+        )
+        message = response.choices[0].message.content.strip()
+        print(f"decision de compra: {message}")
+        logging.info(f"Respuesta completa de GPT: {message}")
 
-    return action, confidence, explanation
+        # Eliminar delimitadores de código si están presentes
+        message = message.replace('```json', '').replace('```', '').strip()
+
+        try:
+            # Intentar parsear el mensaje directamente como JSON
+            decision = json.loads(message)
+            accion = decision.get("accion", "mantener").lower()
+            confianza = int(decision.get("confianza", 50))
+            explicacion = decision.get("explicacion", "")
+
+            # Validación de la acción
+            if accion not in ["comprar", "mantener"]:
+                accion = "mantener"
+
+            # Validación de la confianza
+            if not (0 <= confianza <= 100):
+                confianza = 50
+
+        except json.JSONDecodeError as e:
+            logging.error(f"Error al parsear JSON directamente: {e}")
+            # Intentar extraer el JSON si está incrustado en el texto
+            json_match = re.search(r'\{.*\}', message, re.DOTALL)
+            if json_match:
+                try:
+                    decision = json.loads(json_match.group())
+                    accion = decision.get("accion", "mantener").lower()
+                    confianza = int(decision.get("confianza", 50))
+                    explicacion = decision.get("explicacion", "")
+
+                    # Validación de la acción
+                    if accion not in ["comprar", "mantener"]:
+                        accion = "mantener"
+
+                    # Validación de la confianza
+                    if not (0 <= confianza <= 100):
+                        confianza = 50
+
+                except (json.JSONDecodeError, ValueError, TypeError) as e_inner:
+                    logging.error(f"Error al extraer y parsear JSON: {e_inner}")
+                    # Manejo de errores si el JSON aún no es válido
+                    accion = "mantener"
+                    confianza = 50
+                    explicacion = "Respuesta no estructurada o inválida, se mantiene por defecto."
+            else:
+                logging.error("No se encontró ningún JSON en la respuesta de GPT.")
+                # Manejo de errores si no se encuentra ningún JSON
+                accion = "mantener"
+                confianza = 50
+                explicacion = "Respuesta no estructurada o inválida, se mantiene por defecto."
+
+    except Exception as e:
+        logging.error(f"Error en la llamada a la API de GPT: {e}")
+        # Manejo de errores en caso de falla en la llamada a la API
+        accion = "mantener"
+        confianza = 50
+        explicacion = "Error en la llamada a la API, se mantiene por defecto."
+
+    return accion, confianza, explicacion
 
 
 def gpt_decision_buy_high_risk(prepared_text):
-    prompt = f"""
-    Eres un experto en trading. Basándote en el siguiente texto estructurado, decide si COMPRAR esta criptomoneda para tener un retorno en el corto plazo.
-    
-    Presta especial atención a:
-    1. Son monedas de alto riesgo, el presupuesto es pequeño y queremos apuestas con alto potencial
-    2. Estamos buscando alta probabilidad de crecimiento, es decir aumento de volumen en el corto plazo
-    3. si estamos cerca a la base y hay alto crecimiento de volumen en el corto plazo deberiamos comprar
-    4. Toma en cuenta que estas son monedas de alta especulacion, le estamos apostando a la especulacion
-
-    Texto:
-    {prepared_text}
-    
-    **Objetivo principal**:
-    - Me interesa comprar con alto riesgo si los indicadores tienen probabilidad de crecimiento en el corto plazo
-    - Si las condiciones son razonables pero no ideales, decide COMPRAR para mantener el capital en movimiento.
-    - MANTENER si hay divergencias bajistas o problemas de liquidez significativos.
-
-    Inicia el texto con "comprar" o "mantener". después Incluye un porcentaje de confianza y finalmente una breve explicación.
     """
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "Eres un experto en trading."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.7
-    )
-    message = response.choices[0].message.content.strip().lower()
+    Decide si comprar un activo de alto riesgo basado en los datos proporcionados.
+    """
+    prompt = f"""
+        Eres un experto en trading enfocado en criptomonedas de alta especulación.
+        Estás dispuesto a asumir un riesgo elevado, respaldado por un trailing stop.
+        Tu objetivo es conseguir al menos un 3% de crecimiento diario en el corto plazo.
 
-    import re
-    action = "mantener"
-    if message.startswith("comprar"):
-        action = "comprar"
+        Basándote en el siguiente texto estructurado, decide si COMPRAR esta criptomoneda para tener un retorno en el corto plazo, o si debes MANTENER.
 
-    match = re.search(r'(\d+)%', message)
-    confidence = int(match.group(1)) if match else 50
-    explanation = message.split("\n", 1)[0]
+        **Condiciones clave:**
+        1. Son monedas de alto riesgo, el presupuesto es pequeño y queremos apuestas con alto potencial.
+        2. Estamos buscando alta probabilidad de crecimiento, es decir, aumento de volumen en el corto plazo.
+        3. Si estamos cerca a la base y hay alto crecimiento de volumen en el corto plazo, deberíamos comprar.
+        4. Toma en cuenta que estas son monedas de alta especulación; le estamos apostando a la especulación.
 
-    return action, confidence, explanation
+        **Información disponible:**
+        {prepared_text}
+
+        **Objetivo principal:**
+        - Me interesa comprar con alto riesgo si los indicadores tienen probabilidad de crecimiento en el corto plazo.
+        - Si las condiciones son razonables pero no ideales, decide COMPRAR para mantener el capital en movimiento.
+        - MANTENER si hay divergencias bajistas o problemas de liquidez significativos.
+
+        **Instrucciones:**
+        - Responde únicamente en formato JSON con los campos "accion", "confianza" y "explicacion".
+        - "accion" debe ser "comprar" o "mantener".
+        - "confianza" debe ser un número entero entre 0 y 100 que represente el nivel de confianza en la decisión.
+        - "explicacion" debe contener una breve justificación de la decisión (1 o 2 líneas).
+        - No incluyas ningún otro texto, comentarios, o delimitadores de código en la respuesta.
+        - Asegúrate de que el JSON esté completo y correctamente cerrado.
+
+        **Ejemplo de respuesta:**
+        {{"accion": "comprar", "confianza": 80, "explicacion": "Los indicadores muestran un aumento de volumen y señales de crecimiento."}}
+    """
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "Eres un experto en trading enfocado en criptomonedas de alta especulación."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,        # Temperatura baja para respuestas más deterministas
+            max_tokens=150           # Suficiente para la respuesta en JSON
+            # Eliminamos el parámetro 'stop' para permitir que GPT genere el JSON completo
+        )
+        message = response.choices[0].message.content.strip()
+        print(f"decision de compra: {message}")
+        logging.info(f"Respuesta completa de GPT: {message}")
+
+        # Eliminar delimitadores de código si están presentes
+        message = message.replace('```json', '').replace('```', '').strip()
+
+        try:
+            # Intentar parsear el mensaje directamente como JSON
+            decision = json.loads(message)
+            accion = decision.get("accion", "mantener").lower()
+            confianza = int(decision.get("confianza", 50))
+            explicacion = decision.get("explicacion", "")
+
+            # Validación de la acción
+            if accion not in ["comprar", "mantener"]:
+                accion = "mantener"
+
+            # Validación de la confianza
+            if not (0 <= confianza <= 100):
+                confianza = 50
+
+        except json.JSONDecodeError as e:
+            logging.error(f"Error al parsear JSON directamente: {e}")
+            # Intentar extraer el JSON si está incrustado en el texto
+            json_match = re.search(r'\{.*\}', message, re.DOTALL)
+            if json_match:
+                try:
+                    decision = json.loads(json_match.group())
+                    accion = decision.get("accion", "mantener").lower()
+                    confianza = int(decision.get("confianza", 50))
+                    explicacion = decision.get("explicacion", "")
+
+                    # Validación de la acción
+                    if accion not in ["comprar", "mantener"]:
+                        accion = "mantener"
+
+                    # Validación de la confianza
+                    if not (0 <= confianza <= 100):
+                        confianza = 50
+
+                except (json.JSONDecodeError, ValueError, TypeError) as e_inner:
+                    logging.error(f"Error al extraer y parsear JSON: {e_inner}")
+                    # Manejo de errores si el JSON aún no es válido
+                    accion = "mantener"
+                    confianza = 50
+                    explicacion = "Respuesta no estructurada o inválida, se mantiene por defecto."
+            else:
+                logging.error("No se encontró ningún JSON en la respuesta de GPT.")
+                # Manejo de errores si no se encuentra ningún JSON
+                accion = "mantener"
+                confianza = 50
+                explicacion = "Respuesta no estructurada o inválida, se mantiene por defecto."
+
+    except Exception as e:
+        logging.error(f"Error en la llamada a la API de GPT: {e}")
+        # Manejo de errores en caso de falla en la llamada a la API
+        accion = "mantener"
+        confianza = 50
+        explicacion = "Error en la llamada a la API, se mantiene por defecto."
+
+    logging.info(f"Decisión: {accion}, Confianza: {confianza}, Explicación: {explicacion}")
+    return accion, confianza, explicacion
+
 
 def gpt_decision_sell(prepared_text):
     """
     Decide si vender un activo basado en los datos proporcionados.
     """
     prompt = f"""
-        Eres un asesor financiero especializado en trading. Basándote en el siguiente texto estructurado, decide si debo vender este activo.
+        Eres un asesor financiero especializado en trading. Basándote en los siguientes datos, decide si debo vender este activo.
 
-        Texto:
+        Datos:
         {prepared_text}
 
-        Inicia tu respuesta ÚNICAMENTE con: "vender" o "mantener". No estoy interesado en comprar, y debes priorizar la variable "recent_transactions". Mi objetivo es incrementar mi balance en USDT, mi moneda base.
+        Condiciones clave:
+        1. Vender si hay una caída >5% desde la compra reciente o sobrecompra extrema.
+        2. Mantener si el volumen aumenta o hay soporte cercano.
+        3. Evitar pequeñas pérdidas y mantener si hay potencial de rebote a corto plazo.
+        4. Vender si el precio está estancado (>50 velas) o en máximos locales con bajo volumen.
+        5. Decisiones a corto plazo; mantener si hay soporte claro y movimiento alcista.
 
-        Condiciones:
-        1. Si compré este activo en las últimas 10 velas, solo considerar vender si hay una caída significativa (>5%) desde el precio de compra o señales claras de sobrecompra extrema.
-        2. Prioriza mantener si el volumen está aumentando o si hay señales de soporte cerca del precio actual.
-        3. Prefiero evitar pérdidas pequeñas y mantener el activo si hay potencial para un rebote en el corto plazo.
-        4. Si el precio está claramente estancado (>50 velas sin movimiento relevante) o si está en máximos locales con bajo volumen, es mejor vender.
-        5. Solo prioriza decisiones de corto plazo. Sin embargo, si la moneda muestra un soporte claro y movimiento alcista, prefiere mantener.
-        """
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "Eres un asesor experto en trading."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.5
-    )
-    message = response.choices[0].message.content.strip().lower()
+        **Instrucciones:**
+        - Responde únicamente en formato JSON con los campos "accion", "confianza" y "explicacion".
+        - "accion" debe ser "vender" o "mantener".
+        - "confianza" debe ser un número entero entre 0 y 100 que represente el nivel de confianza en la decisión.
+        - "explicacion" debe contener una breve justificación de la decisión (1 o 2 líneas).
+        - No incluyas ningún texto adicional antes o después del JSON.
+        - Asegúrate de que el JSON esté completo y correctamente cerrado.
 
-    # Extraer la decisión y el nivel de confianza
-    import re
-    action = "mantener"
-    if message.startswith("vender"):
-        action = "vender"
+        **Ejemplo de respuesta:**
+        {{"accion": "vender", "confianza": 75, "explicacion": "Se ha detectado una sobrecompra extrema y una caída reciente del 6%."}}
+    """
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "Eres un asesor experto en trading."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,        # Temperatura baja para respuestas más deterministas
+            max_tokens=150           # Suficiente para la respuesta en JSON
+            # Eliminamos el parámetro 'stop' para permitir que GPT genere el JSON completo
+        )
+        message = response.choices[0].message.content.strip()
+        print(f"decisión de venta: {message}")
+        logging.info(f"Respuesta completa de GPT: {message}")
 
-    match = re.search(r'(\d+)%', message)
-    confidence = int(match.group(1)) if match else 50
-    explanation = message.split("\n", 1)[0]
+        # Eliminar delimitadores de código si están presentes
+        message = message.replace('```json', '').replace('```', '').strip()
 
-    return action, confidence, explanation
+        try:
+            # Intentar parsear el mensaje directamente como JSON
+            decision = json.loads(message)
+            accion = decision.get("accion", "mantener").lower()
+            confianza = int(decision.get("confianza", 50))
+            explicacion = decision.get("explicacion", "")
+            if explicacion is None:
+                explicacion = "Sin explicación proporcionada."
 
+            # Validación de la acción
+            if accion not in ["vender", "mantener"]:
+                accion = "mantener"
 
+            # Validación de la confianza
+            if not (0 <= confianza <= 100):
+                confianza = 50
+
+        except json.JSONDecodeError as e:
+            logging.error(f"Error al parsear JSON directamente: {e}")
+            # Intentar extraer el JSON si está incrustado en el texto
+            json_match = re.search(r'\{.*\}', message, re.DOTALL)
+            if json_match:
+                try:
+                    decision = json.loads(json_match.group())
+                    accion = decision.get("accion", "mantener").lower()
+                    confianza = int(decision.get("confianza", 50))
+                    explicacion = decision.get("explicacion", "")
+                    if explicacion is None:
+                        explicacion = "Sin explicación proporcionada."
+
+                    # Validación de la acción
+                    if accion not in ["vender", "mantener"]:
+                        accion = "mantener"
+
+                    # Validación de la confianza
+                    if not (0 <= confianza <= 100):
+                        confianza = 50
+
+                except (json.JSONDecodeError, ValueError, TypeError) as e_inner:
+                    logging.error(f"Error al extraer y parsear JSON: {e_inner}")
+                    # Manejo de errores si el JSON aún no es válido
+                    accion = "mantener"
+                    confianza = 50
+                    explicacion = "Respuesta no estructurada o inválida, se mantiene por defecto."
+            else:
+                logging.error("No se encontró ningún JSON en la respuesta de GPT.")
+                # Manejo de errores si no se encuentra ningún JSON
+                accion = "mantener"
+                confianza = 50
+                explicacion = "Respuesta no estructurada o inválida, se mantiene por defecto."
+
+    except Exception as e:
+        logging.error(f"Error en la llamada a la API de GPT: {e}")
+        # Manejo de errores en caso de falla en la llamada a la API
+        accion = "mantener"
+        confianza = 50
+        explicacion = "Error en la llamada a la API, se mantiene por defecto."
+
+    # Registrar la decisión final
+    logging.info(f"Decisión final - Acción: {accion}, Confianza: {confianza}, Explicación: {explicacion}")
+    return accion, confianza, explicacion
 
 def chunk_list(lst, chunk_size):
     """Divide una lista en sublistas de tamaño chunk_size."""
