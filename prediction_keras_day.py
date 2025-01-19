@@ -19,6 +19,8 @@ def predict_next_day_price(model_path, ticker='BTC-USD', look_back=60):
         return
 
     df = df[['Close']].dropna()
+    print(df.tail())
+
 
     # Agregar los indicadores necesarios
     df['RSI'] = calculate_rsi(df['Close'])
