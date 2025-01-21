@@ -1,0 +1,4 @@
+[2025-01-19 09:36:15] Ejecutando predicción diaria inmediatamente porque el programa inició después de la hora programada.
+[2025-01-19 09:36:17] Predicción diaria realizada exitosamente. | Contexto: {'current_price': 105529.4, 'predicted_price': np.float32(0.5571089), 'daily_trend': 'bajista', 'last_sequence_shape': (1, 60, 9)}
+[2025-01-19 11:38:33] Ejecutando predicción diaria inmediatamente porque el programa inició después de la hora programada.
+[2025-01-19 11:38:36] Predicción diaria realizada exitosamente. | Contexto: {'current_price': 104949.99, 'predicted_price': np.float32(0.4657313), 'daily_trend': 'bajista', 'last_sequence_shape': (1, 60, 9)}

@@ -34,6 +34,7 @@ exchange = ccxt.binance({
 exchange.apiKey = os.getenv("BINANCE_API_KEY_REAL")
 exchange.secret = os.getenv("BINANCE_SECRET_KEY_REAL")
 
+NO_SELL = ["BTC", "TRUMP"]
 
 # exchange.set_sandbox_mode(True)
 
@@ -1948,6 +1949,8 @@ def demo_trading():
                 filtered_portfolio.append(symbol)
                 print(f"{symbol} vale {value_in_usdt:.2f} USDT, se incluye para análisis de venta.")
 
+
+
         except Exception as e:
             print(f"❌ Error al procesar {symbol} para filtrado: {e}")
             continue
@@ -1958,6 +1961,9 @@ def demo_trading():
     for symbol in filtered_portfolio:
         try:
             market_symbol = f"{symbol}/USDT"
+            if symbol in NO_SELL:
+                print(f"⚠️ {symbol} está en la lista de no vender. Omitiendo análisis.")
+                continue
             current_time = datetime.now()
             if symbol in last_analysis_time:
                 time_since_last_analysis = current_time - last_analysis_time[symbol]
