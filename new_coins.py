@@ -415,7 +415,6 @@ def main():
             if last_symbol:
                 logging.info(f"Última moneda detectada: {last_symbol}")
             new_symbols = get_new_symbols(previous_symbols, current_symbols)
-            new_symbols = ["VTHO/USDT"]  # Comentado para permitir detección dinámica
 
             for symbol in new_symbols:
                 logging.info(f"Nueva moneda detectada: {symbol}")
