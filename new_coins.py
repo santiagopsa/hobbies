@@ -7,13 +7,17 @@ from datetime import datetime, timezone
 import sqlite3
 import requests
 import threading
+from decimal import Decimal, ROUND_UP, getcontext
+
+# Configurar la precisión máxima que necesitarás
+getcontext().prec = 10  # Puedes ajustar según tus necesidades
 
 # Cargar variables de entorno
 load_dotenv()
 
 # Configuración de logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,  # Cambia a DEBUG para mayor detalle durante depuración
     filename='trading_bot.log',
     filemode='a',
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -111,7 +115,9 @@ def fetch_current_symbols():
     """
     try:
         markets = exchange.load_markets()
-        symbols = [symbol for symbol in markets.keys() if symbol.endswith('/USDT')]
+        symbols = [symbol.upper() for symbol in markets.keys() if symbol.endswith('/USDT')]
+        symbols = list(set(symbols))  # Eliminar duplicados
+        logging.info(f"Símbolos cargados: {len(symbols)}")
         return symbols
     except Exception as e:
         logging.error(f"Error al cargar mercados: {e}")
@@ -121,8 +127,31 @@ def get_new_symbols(previous_symbols, current_symbols):
     """
     Identifica los símbolos que son nuevos en la lista actual y terminan en /USDT.
     """
-    new_symbols = [symbol for symbol in current_symbols if symbol not in previous_symbols and symbol.endswith('/USDT')]
+    previous_set = set(previous_symbols)
+    current_set = set(current_symbols)
+    new_symbols = list(current_set - previous_set)
+    logging.info(f"Símbolos anteriores: {len(previous_set)}")
+    logging.info(f"Símbolos actuales: {len(current_set)}")
+    logging.info(f"Nuevas monedas detectadas: {len(new_symbols)}")
+    
+    # Loguear algunos ejemplos de nuevos símbolos
+    if new_symbols:
+        logging.info(f"Ejemplos de símbolos nuevos: {new_symbols[:5]}")
     return new_symbols
+
+def verify_symbol_matching(previous_symbols, current_symbols):
+    """
+    Verifica si la diferencia entre previous_symbols y current_symbols es coherente.
+    """
+    added_symbols = current_symbols - previous_symbols
+    removed_symbols = previous_symbols - current_symbols
+
+    if added_symbols:
+        logging.info(f"Símbolos añadidos: {len(added_symbols)}")
+        logging.debug(f"Símbolos añadidos: {added_symbols}")
+    if removed_symbols:
+        logging.info(f"Símbolos eliminados: {len(removed_symbols)}")
+        logging.debug(f"Símbolos eliminados: {removed_symbols}")
 
 def fetch_price(symbol, exchange_instance=None):
     """
@@ -144,7 +173,7 @@ def fetch_price(symbol, exchange_instance=None):
         logging.error(f"Error al obtener el precio para {symbol}: {e}")
         return None
 
-def buy_symbol(symbol, budget=5, exchange_instance=None):
+def buy_symbol(symbol, exchange_instance=None):
     """
     Realiza una orden de compra de mercado para el símbolo especificado con el presupuesto dado.
     
@@ -161,6 +190,17 @@ def buy_symbol(symbol, budget=5, exchange_instance=None):
         # Obtener el precio actual
         ticker = exchange_instance.fetch_ticker(symbol)
         current_price = ticker['last']
+        market = exchange.markets.get(symbol, None)
+        if not market:
+            logging.error(f"El símbolo {symbol} no está disponible en exchange.markets.")
+            return None
+        min_notional = market.get('limits', {}).get('cost', {}).get('min', 0)
+        logging.info(f"Min notional: {min_notional}")
+        if min_notional is None or min_notional <= 0:
+            logging.warning(f"No se encontró un 'min_notional' válido para {symbol}. Usando presupuesto por defecto de 5 USDT.")
+            min_notional = 5
+        budget = max(min_notional+1, 5)
+        logging.info(f"Presupuesto: {budget} USDT")
         
         # Calcular la cantidad a comprar
         amount = budget / current_price
@@ -333,10 +373,10 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=20, excha
                                     'STOP_LOSS_LIMIT',
                                     'sell',
                                     amount,
-                                    stop_price,
+                                    exchange_instance.price_to_precision(symbol, stop_price * 0.99),  # Precio límite ligeramente inferior
                                     {
-                                        'stopPrice': stop_price,
-                                        'price': exchange_instance.price_to_precision(symbol, stop_price * 0.99)  # Precio límite ligeramente inferior
+                                        'stopPrice': exchange_instance.price_to_precision(symbol, stop_price),
+                                        'price': exchange_instance.price_to_precision(symbol, stop_price * 0.99)
                                     }
                                 )
                                 stop_order_id = stop_order.get('id', 'N/A')
@@ -400,6 +440,20 @@ def process_order(order, symbol, exchange_instance):
         logging.info(f"Configurando trailing stop para {symbol} con objetivo de 3x y promedio de 1.5x.")
         threading.Thread(target=set_trailing_stop, args=(symbol, manage_amount, purchase_price, 20, exchange_instance), daemon=True).start()
 
+def verify_symbol_matching(previous_symbols, current_symbols):
+    """
+    Verifica si la diferencia entre previous_symbols y current_symbols es coherente.
+    """
+    added_symbols = current_symbols - previous_symbols
+    removed_symbols = previous_symbols - current_symbols
+
+    if added_symbols:
+        logging.info(f"Símbolos añadidos: {len(added_symbols)}")
+        logging.debug(f"Símbolos añadidos: {added_symbols}")
+    if removed_symbols:
+        logging.info(f"Símbolos eliminados: {len(removed_symbols)}")
+        logging.debug(f"Símbolos eliminados: {removed_symbols}")
+
 def main():
     initialize_db()
     logging.info("Iniciando bot de trading.")
@@ -414,8 +468,20 @@ def main():
             last_symbol = list(current_symbols)[-1] if current_symbols else None  # Manejar caso vacío
             if last_symbol:
                 logging.info(f"Última moneda detectada: {last_symbol}")
+            
+            # Verificación de correspondencia entre listas de símbolos
+            verify_symbol_matching(previous_symbols, current_symbols)
+            
             new_symbols = get_new_symbols(previous_symbols, current_symbols)
-
+            # Logging detallado de los símbolos para depuración
+            logging.info(f"Cantidad de símbolos anteriores: {len(previous_symbols)}")
+            logging.info(f"Cantidad de símbolos actuales: {len(current_symbols)}")
+            logging.info(f"Nuevas monedas detectadas: {len(new_symbols)}")
+            if new_symbols:
+                logging.info(f"Lista completa de nuevas monedas: {new_symbols}")
+            else:
+                logging.info("No se detectaron nuevas monedas en esta iteración.")
+            
             for symbol in new_symbols:
                 logging.info(f"Nueva moneda detectada: {symbol}")
                 send_telegram_message(f"🚀 *Nueva moneda detectada*: `{symbol}`")
@@ -425,16 +491,10 @@ def main():
                     logging.error(f"No se pudo obtener el precio actual para {symbol}.")
                     continue
                 send_telegram_message(f"🚀 *Precio actual*: `{current_price} USDT`")
+            
                 
-                market = exchange.markets.get(symbol, None)
-                if not market:
-                    logging.error(f"El símbolo {symbol} no está disponible en exchange.markets.")
-                    continue
-                
-                min_notional = market.get('limits', {}).get('cost', {}).get('min')
-                logging.info(f"Min notional: {min_notional}")
-                
-                order = buy_symbol(symbol, budget=5, exchange_instance=exchange)
+
+                order = buy_symbol(symbol, exchange_instance=exchange)
                 if order:
                     process_order(order, symbol, exchange)
 

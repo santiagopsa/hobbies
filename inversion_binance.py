@@ -1746,8 +1746,7 @@ def demo_trading():
         return
 
     # Presupuesto máximo para criptos de bajo volumen (20% del saldo)
-    high_risk_budget = usdt_balance * 0.2
-    low_risk_budget = usdt_balance - high_risk_budget
+    low_risk_budget = usdt_balance
 
     # 1. Criptos de alto volumen (bajo riesgo)
     print("Analizando criptos de alto volumen (bajo riesgo)...")
@@ -1818,113 +1817,6 @@ def demo_trading():
                 make_buy(final_winner, low_risk_budget, "bajo riesgo", confidence, explanation)
     else:
         print("⚠️ No se encontraron criptos válidas de alto volumen.")
-
-    # 2. Criptos de bajo volumen (alto riesgo)
-    print("Analizando criptos de bajo volumen (alto riesgo)...")
-    high_risk_balance = get_high_risk_balance_last_24h()
-
-    if high_risk_balance is not None and high_risk_balance >= 50:
-        print(f"⚠️ Saldo neto de alto riesgo en las últimas 24 horas: {high_risk_balance:.2f} USDT. "
-            f"No se realizarán compras de alto riesgo.")
-    else:
-        # Llamamos a la función que nos filtra y retorna SOLO los símbolos
-        low_volume_candidates = filter_by_score_normalized(exchange)
-        print(f"Criptos de bajo volumen seleccionadas: {low_volume_candidates}")
-
-        # Lista donde guardaremos las criptos que validamos con éxito
-        valid_cryptos = []
-
-        # Iterar sobre los símbolos (string) devueltos por la función de filtrado
-        for symbol in low_volume_candidates:
-            try:
-                # 1) Obtenemos los datos de velas y series
-                data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(symbol)
-
-                # 2) Verificamos si hay datos suficientes
-                if not data_by_timeframe or volume_series is None or price_series is None:
-                    print(f"⚠️ Datos insuficientes para {symbol}, se omite.")
-                    continue
-
-                # 3) Calcular indicadores técnicos
-                #    (Asumiendo que estas funciones existen en tu código)
-                support, resistance = calculate_support_resistance(price_series)
-                adx = calculate_adx(data_by_timeframe["1h"])
-                prices = data_by_timeframe["1h"]["close"].values if "close" in data_by_timeframe["1h"].columns else None
-
-                rsi = None
-                if prices is not None and len(prices) >= 14:
-                    rsi_values = calculate_rsi(prices, period=14)
-                    rsi = rsi_values[-1] if rsi_values is not None and len(rsi_values) > 0 else None
-
-                # 4) Armar la información "adicional" que quieres guardar
-                additional_data = {
-                    "current_price": fetch_price(symbol),
-                    "relative_volume": calculate_relative_volume(volume_series),
-                    "rsi": rsi,
-                    "avg_volume_24h": fetch_avg_volume_24h(volume_series),
-                    "market_cap": fetch_market_cap(symbol),
-                    "spread": calculate_spread(symbol),
-                    "fear_greed": fetch_fear_greed_index(),
-                    "price_std_dev": calculate_price_std_dev(price_series),
-                    "adx": adx,
-                    "support": support,
-                    "resistance": resistance,
-                    "candlestick_pattern": analyze_candlestick_patterns(data_by_timeframe["1h"]),
-                }
-
-                # 5) Validar si los datos "adicionales" están completos o en rangos aceptables
-                if validate_crypto_data(additional_data):
-                    # Si todo OK, agregamos a valid_cryptos
-                    valid_cryptos.append({
-                        "symbol": symbol,
-                        # Puedes guardar también volumen, price_change, etc. si los necesitas
-                        "additional_data": additional_data
-                    })
-                else:
-                    print(f"⚠️ {symbol} omitida por datos insuficientes (indicadores).")
-
-            except Exception as e:
-                print(f"❌ Error al procesar {symbol}: {e}")
-
-        # 6) Revisamos si pudimos validar alguna cripto
-        if not valid_cryptos:
-            print("⚠️ No se encontraron criptos interesantes de bajo volumen. Finalizando.")
-        else:
-            # (Opcional) Ordenar por algún criterio si quieres un "Top 2" o similar
-            # Ejemplo si en la data adicional tuvieras "price_change" y "volume"
-            # valid_cryptos.sort(key=lambda x: (x["price_change"], x["volume"]), reverse=True)
-            # top_interesting_cryptos = valid_cryptos[:2]
-            
-            # Para simplificar, aquí usamos todo `valid_cryptos`
-            top_interesting_cryptos = valid_cryptos
-            print(f"Criptos validadas de bajo volumen: {top_interesting_cryptos}")
-
-            # 7) Consultar GPT si quieres tomar decisión de compra
-            for crypto in top_interesting_cryptos:
-                try:
-                    prepared_text = gpt_prepare_data(
-                        data_by_timeframe,  # si tu `gpt_prepare_data` requiere la info de velas
-                        crypto["additional_data"]
-                    )
-                    action, confidence, explanation = gpt_decision_buy_high_risk(prepared_text)
-                    print(f"La cripto interesante de bajo volumen es: {crypto['symbol']}")
-                    print("******************************************")
-                    print(f"Se recomienda {action}")
-                    print("******************************************")
-                    print(f"La explicación es: {explanation}")
-
-                    # 8) Ejecutar compra si GPT recomienda
-                    if action == "comprar":
-                        make_buy(
-                            crypto["symbol"],
-                            high_risk_budget / len(top_interesting_cryptos),
-                            "alto riesgo",
-                            confidence,
-                            explanation
-                        )
-
-                except Exception as e:
-                    print(f"❌ Error al evaluar {crypto['symbol']}: {e}")
 
    # Lógica de ventas
     portfolio_cryptos = get_portfolio_cryptos()
