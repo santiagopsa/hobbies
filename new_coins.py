@@ -312,7 +312,7 @@ def sell_symbol(symbol, amount, target_price, stop_price=None, exchange_instance
         send_telegram_message(f"❌ *Error al vender* `{symbol}`\nDetalles: {e}")
     return None
 
-def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=20, exchange_instance=None):
+def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=10, exchange_instance=None):
     """
     Configura un trailing stop para el símbolo especificado en un hilo separado.
     
