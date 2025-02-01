@@ -5,7 +5,7 @@ import os
 import requests
 import numpy as np
 import sqlite3
-from inversion_binance import execute_order_sell, demo_trading  # demo_trading may start orders and trailing stops as needed
+from inversion_binance import demo_trading  # demo_trading may start orders and trailing stops as needed
 from dotenv import load_dotenv
 
 load_dotenv()
