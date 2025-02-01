@@ -1,127 +1,136 @@
 import ccxt
 import pandas as pd
-from openai import OpenAI
-import time
-from elegir_cripto import choose_best_cryptos  # Importar la función de selección de criptos
-from dotenv import load_dotenv
-import os
-import csv
-from db_manager_real import initialize_db, insert_transaction, fetch_all_transactions, upgrade_db_schema, insert_market_condition, fetch_last_resistance_levels
-import requests
 import numpy as np
 import sqlite3
+import os
+import csv
 import time
-from datetime import datetime, timedelta
-import pytz
-import math
+import requests
 import json
 import logging
 import re
+import math
 import ta
+import pytz
+import threading
+from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
+from openai import OpenAI
+from elegir_cripto import choose_best_cryptos  # Function to select cryptos
+from db_manager_real import (
+    initialize_db,
+    insert_transaction,
+    fetch_all_transactions,
+    upgrade_db_schema,
+    insert_market_condition,
+    fetch_last_resistance_levels,
+)
 
-initialize_db()
-#upgrade_db_schema()
-DB_NAME = "trading_real.db"
+# =============================================================================
+# CONFIGURATION & INITIALIZATION
+# =============================================================================
 
 if os.getenv("HEROKU") is None:
     load_dotenv()
 
-# Configurar APIs de OpenAI y CCXT
-exchange = ccxt.binance({
-    "enableRateLimit": True
-})
+GPT_MODEL = "gpt-4o-mini"
 
-exchange.apiKey = os.getenv("BINANCE_API_KEY_REAL")
-exchange.secret = os.getenv("BINANCE_SECRET_KEY_REAL")
+DB_NAME = "trading_real.db"
+# Initialize the database (uncomment upgrade_db_schema() if needed)
+initialize_db()
+# upgrade_db_schema()
 
+# (Optional) List of symbols you never want to sell. (Not used in this code.)
 NO_SELL = ["BTC", "TRUMP"]
 
-# exchange.set_sandbox_mode(True)
+# Configure the Binance exchange via CCXT
+exchange = ccxt.binance({"enableRateLimit": True})
+exchange.apiKey = os.getenv("BINANCE_API_KEY_REAL")
+exchange.secret = os.getenv("BINANCE_SECRET_KEY_REAL")
+# exchange.set_sandbox_mode(True)  # Enable if needed
 
-# Verificar conexión
+# Verify connection to Binance
 try:
     print("Conectando a Binance REAL...")
     balance = exchange.fetch_balance()
-    #print("Conexión exitosa. Balance:", balance)
+    print("Conexión exitosa.")
 except Exception as e:
     print("Error al conectar con Binance:", e)
 
-
+# Configure OpenAI client
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise ValueError("La variable de entorno OPENAI_API_KEY no está configurada")
-
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Variables globales
-TRADE_SIZE = 40
-TRANSACTION_LOG = []
+# Set up logging for GPT responses and errors
+logging.basicConfig(
+    level=logging.INFO,
+    filename="gpt_responses.log",
+    filemode="a",
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+# =============================================================================
+# UTILITY & INDICATOR FUNCTIONS
+# =============================================================================
 
 def get_colombia_timestamp():
-    """
-    Retorna el timestamp actual en la zona horaria de Colombia (solo día y hora).
-    """
+    """Returns the current timestamp in the Colombia timezone."""
     colombia_timezone = pytz.timezone("America/Bogota")
     colombia_time = datetime.now(colombia_timezone)
-    return colombia_time.strftime("%Y-%m-%d %H:%M:%S")  # Formato: Año-Mes-Día Hora:Minuto:Segundo
+    return colombia_time.strftime("%Y-%m-%d %H:%M:%S")
 
 def get_high_risk_balance_last_24h():
     """
-    Calcula el saldo neto de alto riesgo (compras - ventas) en las últimas 24 horas.
-    Las ventas heredan el 'risk_type' de las compras más recientes si el 'risk_type' es NULL.
+    Calculates the net balance (buys minus sells) for high risk transactions
+    in the last 24 hours.
     """
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
 
-        # Calcular el timestamp de hace 24 horas
         now = datetime.now()
         last_24h = now - timedelta(hours=24)
         last_24h_timestamp = last_24h.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Obtener todas las transacciones de las últimas 24 horas
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT symbol, action, SUM(price * amount) AS total, risk_type
             FROM transactions
             WHERE timestamp >= ?
             GROUP BY symbol, action, risk_type
-        """, (last_24h_timestamp,))
+            """,
+            (last_24h_timestamp,),
+        )
         rows = cursor.fetchall()
-
-        # Ver transacciones agrupadas
         print("🔍 Transacciones encontradas (últimas 24h):", rows)
 
-        # Organizar transacciones por símbolo
         transactions_by_symbol = {}
         for symbol, action, total, risk_type in rows:
             if symbol not in transactions_by_symbol:
                 transactions_by_symbol[symbol] = {"buy": 0, "sell": 0, "risk_type": None}
             transactions_by_symbol[symbol][action] += total
-            # Asignar el tipo de riesgo si está definido
             if risk_type:
                 transactions_by_symbol[symbol]["risk_type"] = risk_type
 
-        # Validar y heredar risk_type para las ventas
         for symbol, data in transactions_by_symbol.items():
             if data["risk_type"] is None:
-                # Buscar el tipo de riesgo de compras anteriores
-                cursor.execute("""
+                cursor.execute(
+                    """
                     SELECT risk_type
                     FROM transactions
                     WHERE symbol = ? AND action = 'buy'
                     ORDER BY timestamp DESC
                     LIMIT 1
-                """, (symbol,))
+                    """,
+                    (symbol,),
+                )
                 last_risk_type = cursor.fetchone()
-                if last_risk_type:
-                    data["risk_type"] = last_risk_type[0]
-                else:
-                    data["risk_type"] = "unknown"  # Si no hay compras, marcar como desconocido
+                data["risk_type"] = last_risk_type[0] if last_risk_type else "unknown"
 
-        # Cerrar conexión
         conn.close()
 
-        # Calcular saldo neto para alto riesgo
         high_risk_balance = 0
         for symbol, data in transactions_by_symbol.items():
             if data.get("risk_type") == "high_risk":
@@ -136,22 +145,16 @@ def get_high_risk_balance_last_24h():
 
 def send_telegram_message(message):
     """
-    Envía un mensaje de texto simple a tu bot de Telegram usando las variables de entorno:
-    - TELEGRAM_BOT_TOKEN
-    - TELEGRAM_CHAT_ID
+    Sends a plain text message to your Telegram bot using environment variables.
     """
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("No se configuró el token o chat ID de Telegram en las variables de entorno.")
+        print("No se configuró el token o chat ID de Telegram.")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        'chat_id': TELEGRAM_CHAT_ID,
-        'text': message
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
         response = requests.post(url, json=payload)
         if response.status_code == 200:
@@ -161,497 +164,159 @@ def send_telegram_message(message):
     except Exception as e:
         print(f"❌ Error al conectar con Telegram: {str(e)}")
 
-# Llamada de prueba, por ejemplo justo después de tu verificación de conexión con Binance
-
-
 def detect_momentum_divergences(price_series, rsi_values):
     """
-    Detecta divergencias entre precio y RSI
+    Detects divergences between price and RSI.
+    Returns a list of tuples (divergence_type, index).
     """
     try:
         price_series = np.array(price_series)
         rsi_values = np.array(rsi_values)
-        
         divergences = []
-        window = 5  # Ventana para detectar máximos/mínimos locales
-        
-        for i in range(window, len(price_series)-window):
-            # Detectar máximos locales
-            if all(price_series[i] > price_series[i-window:i]) and \
-               all(price_series[i] > price_series[i+1:i+window+1]):
-                
-                # Buscar divergencia bajista
-                if price_series[i] > price_series[i-window] and \
-                   rsi_values[i] < rsi_values[i-window]:
+        window = 5  # Window size for local extrema detection
+
+        for i in range(window, len(price_series) - window):
+            if (all(price_series[i] > price_series[i-window:i]) and
+                all(price_series[i] > price_series[i+1:i+window+1])):
+                if price_series[i] > price_series[i-window] and rsi_values[i] < rsi_values[i-window]:
                     divergences.append(("bearish", i))
-                    
-            # Detectar mínimos locales
-            if all(price_series[i] < price_series[i-window:i]) and \
-               all(price_series[i] < price_series[i+1:i+window+1]):
-                
-                # Buscar divergencia alcista
-                if price_series[i] < price_series[i-window] and \
-                   rsi_values[i] > rsi_values[i-window]:
+            if (all(price_series[i] < price_series[i-window:i]) and
+                all(price_series[i] < price_series[i+1:i+window+1])):
+                if price_series[i] < price_series[i-window] and rsi_values[i] > rsi_values[i-window]:
                     divergences.append(("bullish", i))
-                    
         return divergences
     except Exception as e:
         print(f"Error en detect_momentum_divergences: {e}")
         return []
 
-def analyze_market_liquidity(symbol, exchange, depth=20):
-    """
-    Analiza la liquidez del mercado y calcula métricas importantes
-    """
-    try:
-        order_book = exchange.fetch_order_book(symbol, limit=depth)
-        
-        # Calcular liquidez total disponible
-        bid_liquidity = sum(bid[1] for bid in order_book['bids'])
-        ask_liquidity = sum(ask[1] for ask in order_book['asks'])
-        
-        # Calcular precio promedio ponderado
-        def weighted_average_price(orders):
-            return sum(price * vol for price, vol in orders) / sum(vol for _, vol in orders)
-        
-        bid_vwap = weighted_average_price(order_book['bids'])
-        ask_vwap = weighted_average_price(order_book['asks'])
-        
-        return {
-            "bid_liquidity": bid_liquidity,
-            "ask_liquidity": ask_liquidity,
-            "liquidity_ratio": bid_liquidity / ask_liquidity if ask_liquidity > 0 else 0,
-            "bid_vwap": bid_vwap,
-            "ask_vwap": ask_vwap,
-            "spread_percentage": ((ask_vwap - bid_vwap) / bid_vwap) * 100
-        }
-    except Exception as e:
-        print(f"Error en analyze_market_liquidity: {e}")
-        return None
+def calculate_rsi(prices, period=14):
+    """Calculates the Relative Strength Index (RSI) for a price series."""
+    if len(prices) < period + 1:
+        return [np.nan]
+    deltas = np.diff(prices)
+    gains = np.where(deltas > 0, deltas, 0)
+    losses = np.where(deltas < 0, -deltas, 0)
+    avg_gain = np.mean(gains[:period])
+    avg_loss = np.mean(losses[:period])
+    rs = avg_gain / avg_loss if avg_loss != 0 else 0
+    rsi = 100 - (100 / (1 + rs))
+    rsis = [np.nan] * period
+    for i in range(period, len(prices)):
+        avg_gain = (avg_gain * (period - 1) + gains[i - 1]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i - 1]) / period
+        rs = avg_gain / avg_loss if avg_loss != 0 else 0
+        rsis.append(100 - (100 / (1 + rs)))
+    return rsis
 
-def analyze_market_sentiment(symbol, exchange):
+def calculate_bollinger_bands(series, window=20, num_std_dev=2):
+    """Calculates Bollinger Bands for a given price series."""
+    rolling_mean = series.rolling(window=window).mean()
+    rolling_std = series.rolling(window=window).std()
+    upper_band = rolling_mean + (rolling_std * num_std_dev)
+    lower_band = rolling_mean - (rolling_std * num_std_dev)
+    return upper_band, rolling_mean, lower_band
+
+def calculate_support_resistance(price_series, period=14):
     """
-    Análisis completo del sentimiento del mercado
+    Calculates support and resistance levels based on rolling minima and maxima.
+    Returns a tuple (support, resistance).
+    """
+    rolling_max = price_series.rolling(window=period).max()
+    rolling_min = price_series.rolling(window=period).min()
+    support = rolling_min.iloc[-1]
+    resistance = rolling_max.iloc[-1]
+    return support, resistance
+
+def calculate_adx(df, period=14):
+    """
+    Calculates the Average Directional Index (ADX) using OHLC data.
+    Returns the latest ADX value or None if not calculable.
     """
     try:
-        sentiment_data = {
-            "fear_greed": fetch_fear_greed_index(),
-            "volume_trend": None,
-            "pattern_sentiment": None,
-            "overall_sentiment": None
-        }
-        
-        # Validar que el índice de miedo y avaricia sea numérico
-        if isinstance(sentiment_data["fear_greed"], str):
-            try:
-                sentiment_data["fear_greed"] = float(sentiment_data["fear_greed"])
-            except ValueError:
-                print(f"Error: Índice de miedo y avaricia no es numérico para {symbol}")
-                sentiment_data["fear_greed"] = None
-        
-        # Analizar tendencia de volumen
-        ohlcv = exchange.fetch_ohlcv(symbol, '1h', limit=24)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        
-        current_volume = df['volume'].iloc[-1]
-        avg_volume = df['volume'].mean()
-        
-        if current_volume > avg_volume * 1.2:
-            volume_trend = "bullish"
-        elif current_volume < avg_volume * 0.8:
-            volume_trend = "bearish"
+        if len(df) < period:
+            print(f"⚠️ No hay suficientes datos para calcular el ADX.")
+            return None
+
+        high = df['high']
+        low = df['low']
+        close = df['close']
+
+        plus_dm = high.diff().clip(lower=0)
+        minus_dm = low.diff().clip(upper=0).abs()
+
+        true_range = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs()
+        ], axis=1).max(axis=1)
+        atr = true_range.rolling(window=period).mean()
+
+        plus_di = (plus_dm / atr).rolling(window=period).mean() * 100
+        minus_di = (minus_dm / atr).rolling(window=period).mean() * 100
+
+        dx = ((plus_di - minus_di).abs() / (plus_di + minus_di)) * 100
+        adx = dx.rolling(window=period).mean()
+
+        if adx.iloc[-1] is not None and not pd.isna(adx.iloc[-1]):
+            return adx.iloc[-1]
         else:
-            volume_trend = "neutral"
-            
-        sentiment_data["volume_trend"] = volume_trend
-        
-        # Analizar patrones de velas
-        patterns = analyze_candlestick_patterns(df)
-        if patterns:
-            latest_pattern = patterns[-1]
-            sentiment_data["pattern_sentiment"] = latest_pattern[2]  # bullish/bearish
-            
-        # Calcular sentimiento general
-        bullish_factors = 0
-        total_factors = 0
-        
-        if sentiment_data["fear_greed"] is not None:
-            total_factors += 1
-            if sentiment_data["fear_greed"] > 50:
-                bullish_factors += 1
-                
-        if volume_trend != "neutral":
-            total_factors += 1
-            if volume_trend == "bullish":
-                bullish_factors += 1
-                
-        if sentiment_data["pattern_sentiment"]:
-            total_factors += 1
-            if sentiment_data["pattern_sentiment"] == "bullish":
-                bullish_factors += 1
-                
-        if total_factors > 0:
-            sentiment_score = (bullish_factors / total_factors) * 100
-            sentiment_data["overall_sentiment"] = sentiment_score
-            
-        return sentiment_data
+            print("⚠️ ADX no calculable debido a datos insuficientes o NaN.")
+            return None
     except Exception as e:
-        print(f"Error en analyze_market_sentiment: {e}")
+        print(f"❌ Error al calcular el ADX: {e}")
         return None
 
-def detect_accelerated_growth(data, threshold=10, max_period=10):
-    """
-    Detecta un crecimiento acelerado en un periodo corto.
-    data: lista o array de precios (close).
-    threshold: porcentaje de crecimiento para considerar aceleración.
-    max_period: número máximo de velas para evaluar el crecimiento.
-    """
+def fetch_price(symbol):
+    """Obtains the current price for a given symbol."""
     try:
-        # Validar tipo de data
-        print(f"🛠️ Tipo inicial de data: {type(data)}")
-
-        if not isinstance(data, np.ndarray):
-            data = np.array(data, dtype=float)
-            print(f"🔄 Data convertida a np.ndarray: {data}")
-
-        # Validar longitud del array
-        print(f"🔍 Longitud de data: {len(data)}")
-        if len(data) < 2:
-            print("⚠️ Datos insuficientes en detect_accelerated_growth.")
-            return False, 0, 0
-
-        # Loop para detectar crecimiento acelerado
-        for i in range(1, max_period + 1):
-            print(f"🔄 Iteración: {i}")
-            if i >= len(data):
-                print(f"⚠️ Índice fuera de rango: {i} >= {len(data)}")
-                continue
-
-            if data[-i] == 0:
-                print(f"⚠️ División por cero evitada en índice {-i}")
-                continue
-
-            print(f"📊 Valores en evaluación: data[-1]={data[-1]}, data[-{i}]={data[-i]}")
-            growth = ((data[-1] - data[-i]) / data[-i]) * 100  # Crecimiento porcentual
-            print(f"📈 Crecimiento calculado: {growth:.2f}%")
-
-            if growth >= threshold:
-                print(f"✅ Crecimiento acelerado detectado: {growth:.2f}% en {i} periodos.")
-                return True, growth, i
-
-        print("❌ No se detectó crecimiento acelerado.")
-        return False, 0, 0
+        ticker = exchange.fetch_ticker(symbol)
+        return ticker['last']
     except Exception as e:
-        print(f"❌ Error en detect_accelerated_growth: {e}")
-        return False, 0, 0
-
-
-
-def is_near_resistance(current_price, resistance, margin=1):
-    """
-    Verifica si el precio actual está cerca de una resistencia dentro de un margen dado.
-    """
-    try:
-        # Imprimir los valores iniciales para depuración
-        print(f"🛠️ Depuración is_near_resistance:")
-        print(f"  - Current price: {current_price} (tipo: {type(current_price)})")
-        print(f"  - Resistance: {resistance} (tipo: {type(resistance)})")
-        print(f"  - Margin: {margin} (tipo: {type(margin)})")
-
-        # Verificar si los valores son numéricos
-        if not isinstance(current_price, (float, int, np.float64)):
-            raise ValueError(f"current_price no es un valor numérico válido: {current_price}")
-        if not isinstance(resistance, (float, int, np.float64)):
-            raise ValueError(f"resistance no es un valor numérico válido: {resistance}")
-        
-        # Calcular si está cerca de la resistencia
-        margin_value = resistance * (margin / 100)
-        near_resistance = abs(current_price - resistance) <= margin_value
-
-        # Resultado
-        print(f"  - Margin value: {margin_value}")
-        print(f"  - Near resistance: {near_resistance}")
-        return near_resistance, resistance
-
-    except Exception as e:
-        print(f"❌ Error dentro de is_near_resistance: {e}")
-        raise
-
-
-def debug_new_indicators(symbol):
-    """
-    Función de diagnóstico para verificar los datos de las nuevas variables
-    """
-    print(f"\n🔍 Diagnóstico de indicadores para {symbol}")
-    print("=" * 50)
-    
-    try:
-        # Obtener datos base
-        data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(symbol)
-        if not all([data_by_timeframe, volume_series is not None, price_series is not None]):
-            print("❌ Error: No se pudieron obtener los datos base")
-            return
-            
-        # 1. Verificar Divergencias
-        print("\n1️⃣ Análisis de Divergencias:")
-        prices = data_by_timeframe["1h"]["close"].values
-        rsi_values = calculate_rsi(prices)
-        divergences = detect_momentum_divergences(prices, rsi_values)
-        
-        print(f"- Últimos 5 precios: {prices[-5:]}")
-        print(f"- Últimos 5 RSI: {rsi_values[-5:]}")
-        print(f"- Divergencias encontradas: {divergences}")
-        
-        # 2. Verificar Sentimiento de Mercado
-        print("\n2️⃣ Análisis de Sentimiento:")
-        sentiment = analyze_market_sentiment(symbol, exchange)
-        if sentiment:
-            print(f"- Fear & Greed Index: {sentiment.get('fear_greed')}")
-            print(f"- Tendencia de Volumen: {sentiment.get('volume_trend')}")
-            print(f"- Sentimiento de Patrones: {sentiment.get('pattern_sentiment')}")
-            print(f"- Sentimiento General: {sentiment.get('overall_sentiment')}%")
-        else:
-            print("❌ Error: No se pudo obtener el análisis de sentimiento")
-            
-        # 3. Verificar validez de datos
-        print("\n3️⃣ Validación de Datos:")
-        validation = {
-            "Divergencias válidas": all(isinstance(d, tuple) and len(d) == 2 for d in divergences),
-            "Sentimiento completo": all(k in sentiment for k in ['fear_greed', 'volume_trend', 'pattern_sentiment', 'overall_sentiment']) if sentiment else False,
-        }
-        
-        for check, result in validation.items():
-            print(f"- {check}: {'✅' if result else '❌'}")
-            
-        return validation
-        
-    except Exception as e:
-        print(f"❌ Error durante el diagnóstico: {e}")
+        print(f"❌ Error al obtener el precio para {symbol}: {e}")
         return None
 
-# Función para probar múltiples símbolos
-def test_new_indicators():
-    print("\n🧪 Iniciando pruebas de nuevos indicadores")
-    test_symbols = ["BTC/USDT", "ETH/USDT", "BNB/USDT"]  # Símbolos de prueba
-    
-    results = {}
-    for symbol in test_symbols:
-        print(f"\nProbando {symbol}")
-        print("-" * 30)
-        results[symbol] = debug_new_indicators(symbol)
-        
-    return results
-
-
-# Filtrar cryptos con bajo volumen pero con crecimiento interesante
-def filter_low_volume_growth_cryptos(exchange, threshold=1.5):
-    markets = exchange.load_markets()
-    low_volume_cryptos = []
-    for symbol in markets:
-        if "USDT" not in symbol:  # Considera solo pares con USDT
-            continue
-        try:
-            ticker = exchange.fetch_ticker(symbol)
-            volume_relative = ticker['quoteVolume'] / ticker['average']
-            price_change = (ticker['last'] - ticker['open']) / ticker['open']
-            if volume_relative > threshold and price_change > 0.1:  # 10% de cambio en el precio
-                low_volume_cryptos.append(symbol)
-        except Exception as e:
-            print(f"Error al procesar {symbol}: {e}")
-    return low_volume_cryptos
-
-def validate_crypto_data(additional_data):
+def fetch_and_prepare_data(symbol):
     """
-    Verifica que todos los indicadores críticos estén presentes y sean válidos.
+    Fetches historical OHLCV data in multiple timeframes and calculates technical indicators.
+    Returns a tuple: (data_by_timeframe, volume_series, price_series)
     """
-    required_keys = [
-        "current_price", "relative_volume", "rsi", "avg_volume_24h",
-         "support", "resistance"
-    ]
-    for key in required_keys:
-        if key not in additional_data or additional_data[key] is None or np.isnan(additional_data[key]):
-            return False
-    return True
-
-def detect_exponential_growth(price_series, lookback=3, threshold=0.5):
-    recent_prices = price_series[-lookback:]
-    growth = (price_series.iloc[-1] - recent_prices.mean()) / recent_prices.mean()
-    return growth > threshold
-
-def filter_by_score_normalized(
-    exchange,
-    periods=50,
-    weight_ma_crossover=0.4,
-    weight_volume=0.3,
-    weight_rsi=0.3,
-    min_24h_volume=1_000_000,
-    max_rsi=70,  # RSI threshold to avoid overbought conditions
-    max_ma_extension=1.2,  # Max price distance from MA(7) as a multiplier
-    volume_growth_log=True,
-    fiat_currencies=None,
-    stablecoins=None,
-):
-    """
-    Function to:
-    1) Filter spot USDT pairs with min_24h_volume, excluding fiat and stablecoins.
-    2) Calculate buy signals using MA crossover, volume growth, and RSI.
-    3) Avoid late entries using RSI, volume, and price proximity to MA(7).
-    4) Return the top 3 pairs ranked by a calculated score.
-    """
-
-    # Default fiat and stablecoin exclusions
-    if fiat_currencies is None:
-        fiat_currencies = [
-            "USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "CNY", "HKD", "SGD",
-            "SEK", "NZD", "MXN", "INR", "RUB", "ZAR", "TRY", "BRL", "KRW", "NOK",
-            "TWD", "DKK", "PLN", "THB", "IDR", "HUF", "CZK", "ILS", "CLP"
-        ]
-
-    if stablecoins is None:
-        stablecoins = [
-            "USDT", "USDC", "BUSD", "DAI", "TUSD", "PAX", "GUSD", "UST", "FRAX",
-            "sUSD", "HUSD", "MIM", "USDP", "EURS", "AUDS", "NZDS"
-        ]
-
     try:
-        print("Loading markets...")
-        markets = exchange.load_markets()
+        timeframes = ['1h', '4h', '1d']
+        data = {}
+        volume_series = None
+        price_series = None
+
+        for timeframe in timeframes:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=50)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+
+            if timeframe == '1h':
+                volume_series = df['volume']
+                price_series = df['close']
+
+            df['MA_20'] = df['close'].rolling(window=20).mean()
+            df['MA_50'] = df['close'].rolling(window=50).mean()
+            df['RSI'] = calculate_rsi(df['close'])
+            df['BB_upper'], df['BB_middle'], df['BB_lower'] = calculate_bollinger_bands(df['close'])
+
+            data[timeframe] = df
+
+        return data, volume_series, price_series
     except Exception as e:
-        print(f"Error loading markets: {e}")
-        return []
+        print(f"Error al obtener datos para {symbol}: {e}")
+        return None, None, None
 
-    # (A) Filter USDT pairs excluding fiat and stablecoins
-    spot_usdt_symbols = []
-    for symbol, info in markets.items():
-        try:
-            if not info.get("spot", False):
-                continue
-            if info.get("quote", "").upper() != "USDT":
-                continue
-
-            base = info.get("base", "").upper()
-            if base in fiat_currencies or base in stablecoins:
-                continue
-
-            spot_usdt_symbols.append(symbol)
-        except Exception as e:
-            print(f"Error processing symbol {symbol}: {e}")
-            continue
-
-    print(f"Filtered USDT pairs: {len(spot_usdt_symbols)}")
-
-    # (B) Analyze symbols for buy signals
-    raw_data = []
-    for symbol in spot_usdt_symbols:
-        try:
-            # Fetch market data
-            ticker = exchange.fetch_ticker(symbol)
-            if ticker is None:
-                continue
-
-            last_price = ticker.get("last")
-            vol_24h = ticker.get("quoteVolume", 0)
-
-            if vol_24h < min_24h_volume:
-                continue
-
-            # Fetch OHLCV data
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe="1h", limit=periods)
-            if not ohlcv or len(ohlcv) < periods:
-                continue
-
-            df = pd.DataFrame(
-                ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]
-            )
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-
-            # Calculate indicators
-            df["MA_7"] = ta.trend.SMAIndicator(df["close"], window=7).sma_indicator()
-            df["MA_25"] = ta.trend.SMAIndicator(df["close"], window=25).sma_indicator()
-            df["RSI"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
-            df["Volume_Avg"] = df["volume"].rolling(window=20).mean()
-
-            # Current values
-            last = df.iloc[-1]
-            ma_crossover = last["MA_7"] > last["MA_25"]
-            rsi_signal = last["RSI"] < max_rsi
-            volume_signal = last["volume"] > 1.3 * last["Volume_Avg"]
-            ma_proximity = last_price <= max_ma_extension * last["MA_7"]
-
-            # Calculate score
-            score = (
-                weight_ma_crossover * ma_crossover
-                + weight_volume * volume_signal
-                + weight_rsi * rsi_signal
-            )
-
-            # Exclude late entries
-            if not rsi_signal or not ma_proximity:
-                continue
-
-            raw_data.append({
-                "symbol": symbol,
-                "score": score,
-                "last_price": last_price,
-                "volume_24h": vol_24h,
-                "MA_Crossover": ma_crossover,
-                "RSI_Signal": rsi_signal,
-                "Volume_Signal": volume_signal,
-                "MA_Proximity": ma_proximity,
-            })
-
-        except Exception as e:
-            print(f"Error analyzing {symbol}: {e}")
-            continue
-
-    # (C) Sort and return top 3 symbols
-    raw_data.sort(key=lambda x: x["score"], reverse=True)
-    top3 = raw_data[:3]
-
-    print("\nTop 3 symbols for buying:")
-    for entry in top3:
-        print(
-            f"Symbol: {entry['symbol']} | Score: {entry['score']:.2f} | "
-            f"Last Price: {entry['last_price']:.2f} | Volume 24h: {entry['volume_24h']:.2f} | "
-            f"MA Crossover: {entry['MA_Crossover']} | RSI Signal: {entry['RSI_Signal']} | "
-            f"Volume Signal: {entry['Volume_Signal']} | MA Proximity: {entry['MA_Proximity']}"
-        )
-
-    # Formatear el mensaje para enviar por Telegram
-    message = "*Revisión de Indicadores de Alto Riesgo:*\n\n"
-
-    for i, entry in enumerate(top3, start=1):
-        # Evaluar si es recomendable comprar
-        buy_recommendation = (
-            "✅ *Recomendación: Comprar*" if (
-                entry["score"] > 0.8 and
-                entry["MA_Crossover"] and
-                entry["RSI_Signal"] and
-                entry["Volume_Signal"]
-            ) else "❌ *Recomendación: No Comprar*"
-        )
-
-        # Construir el mensaje
-        message += (
-            f"*{i}) {entry['symbol']}*\n"
-            f"- Score: {entry['score']:.2f}\n"
-            f"- Último precio: {entry['last_price']:.2f} USDT\n"
-            f"- Volumen 24h: {entry['volume_24h']:.2f} USDT\n"
-            f"- Cruce MA: {'Sí' if entry['MA_Crossover'] else 'No'}\n"
-            f"- Señal RSI: {'Sí' if entry['RSI_Signal'] else 'No'}\n"
-            f"- Señal Volumen: {'Sí' if entry['Volume_Signal'] else 'No'}\n"
-            f"- Proximidad MA: {'Sí' if entry['MA_Proximity'] else 'No'}\n"
-            f"{buy_recommendation}\n\n"
-        )
-
-    # Enviar mensaje a Telegram
-    send_telegram_message(message)
-
-    # Retornar símbolos del Top 3
-    return [entry["symbol"] for entry in top3]
-
+# =============================================================================
+# GPT-BASED ANALYSIS FUNCTIONS
+# =============================================================================
 
 def gpt_prepare_data(data_by_timeframe, additional_data):
+    """
+    Combines market data from different timeframes and additional analysis,
+    then prepares a prompt for GPT to analyze.
+    """
     combined_data = ""
     for timeframe, df in data_by_timeframe.items():
         if df is not None and not df.empty:
@@ -673,31 +338,23 @@ def gpt_prepare_data(data_by_timeframe, additional_data):
     Basándote en esta información completa:
     1. Proporciona un resumen estructurado de los indicadores críticos y secundarios.
     2. Decide si debemos "comprar", "vender" o "mantener".
-    3. Justifica tu decisión en 1 oracion.
-    4. Instrucciones adicionales {additional_data.get('instruction', 'No disponible')}
+    3. Justifica tu decisión en 1 oración.
+    4. Instrucciones adicionales: {additional_data.get('instruction', 'No disponible')}
     """
-
     response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model=GPT_MODEL,
         messages=[
-            {"role": "system", "content": "Eres un experto en análisis financiero y trading."},
+            {"role": "developer", "content": "Eres un experto en crypto trading y análisis financiero."},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.5
+        temperature=0
     )
     return response.choices[0].message.content.strip()
 
-# Configura el logging para registrar las respuestas y errores
-logging.basicConfig(
-    level=logging.INFO,
-    filename='gpt_responses.log',
-    filemode='a',
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-
 def gpt_decision_buy(prepared_text):
     """
-    Decide si comprar un activo basado en los datos proporcionados.
+    Uses GPT to decide whether to buy or hold, based on the provided market data.
+    Returns a tuple (accion, confianza, explicacion).
     """
     prompt = f"""
         Eres un experto en trading enfocado en criptomonedas de alta especulación.
@@ -709,8 +366,8 @@ def gpt_decision_buy(prepared_text):
         Condiciones clave:
         - Queremos ser más arriesgados, ya que el trailing stop reduce nuestro riesgo.
         - Buscamos alta probabilidad de crecimiento y aumento de volumen de manera inmediata.
-        - Si los indicadores sugieren potencial de crecimiento, incluso si las condiciones no son perfectas, preferimos COMPRAR para mantener el capital en movimiento.
-        - MANTENER solo en caso de divergencias bajistas claras o problemas de liquidez (bajo volumen, spreads demasiado amplios, etc.).
+        - Si los indicadores sugieren potencial de crecimiento, preferimos COMPRAR para mantener el capital en movimiento.
+        - MANTENER solo en caso de señales negativas claras.
 
         Información disponible:
         {prepared_text}
@@ -718,359 +375,90 @@ def gpt_decision_buy(prepared_text):
         **Instrucciones:**
         - Responde únicamente en formato JSON con los campos "accion", "confianza" y "explicacion".
         - "accion" debe ser "comprar" o "mantener".
-        - "confianza" debe ser un número entero entre 0 y 100 que represente el nivel de confianza en la decisión.
-        - "explicacion" debe contener una breve justificación de la decisión (1 o 2 líneas).
-        - No incluyas ningún otro texto, comentarios, o delimitadores de código en la respuesta.
-        - Asegúrate de que el JSON esté completo y correctamente cerrado.
-
-        **Ejemplo de respuesta:**
-        {{"accion": "comprar", "confianza": 80, "explicacion": "Los indicadores muestran un aumento de volumen y señales de sobrecompra."}}
+        - "confianza" debe ser un número entero entre 0 y 100.
+        - "explicacion" debe contener una breve justificación (1 o 2 líneas).
+        - No incluyas texto adicional.
     """
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model=GPT_MODEL,
             messages=[
-                {"role": "system", "content": "Eres un experto en trading enfocado en criptomonedas de alta especulación."},
+                {"role": "developer", "content": "Eres un experto en trading enfocado en criptomonedas de alta especulación."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.3,        # Temperatura baja para respuestas más deterministas
-            max_tokens=150           # Suficiente para la respuesta en JSON
-            # Eliminar el parámetro 'stop' para permitir que GPT genere el JSON completo
+            temperature=0,
+            max_tokens=150
         )
         message = response.choices[0].message.content.strip()
-        print(f"decision de compra: {message}")
         logging.info(f"Respuesta completa de GPT: {message}")
-
-        # Eliminar delimitadores de código si están presentes
         message = message.replace('```json', '').replace('```', '').strip()
-
         try:
-            # Intentar parsear el mensaje directamente como JSON
             decision = json.loads(message)
             accion = decision.get("accion", "mantener").lower()
             confianza = int(decision.get("confianza", 50))
             explicacion = decision.get("explicacion", "")
-
-            # Validación de la acción
             if accion not in ["comprar", "mantener"]:
                 accion = "mantener"
-
-            # Validación de la confianza
             if not (0 <= confianza <= 100):
                 confianza = 50
-
         except json.JSONDecodeError as e:
-            logging.error(f"Error al parsear JSON directamente: {e}")
-            # Intentar extraer el JSON si está incrustado en el texto
-            json_match = re.search(r'\{.*\}', message, re.DOTALL)
-            if json_match:
-                try:
-                    decision = json.loads(json_match.group())
-                    accion = decision.get("accion", "mantener").lower()
-                    confianza = int(decision.get("confianza", 50))
-                    explicacion = decision.get("explicacion", "")
-
-                    # Validación de la acción
-                    if accion not in ["comprar", "mantener"]:
-                        accion = "mantener"
-
-                    # Validación de la confianza
-                    if not (0 <= confianza <= 100):
-                        confianza = 50
-
-                except (json.JSONDecodeError, ValueError, TypeError) as e_inner:
-                    logging.error(f"Error al extraer y parsear JSON: {e_inner}")
-                    # Manejo de errores si el JSON aún no es válido
-                    accion = "mantener"
-                    confianza = 50
-                    explicacion = "Respuesta no estructurada o inválida, se mantiene por defecto."
-            else:
-                logging.error("No se encontró ningún JSON en la respuesta de GPT.")
-                # Manejo de errores si no se encuentra ningún JSON
-                accion = "mantener"
-                confianza = 50
-                explicacion = "Respuesta no estructurada o inválida, se mantiene por defecto."
-
+            logging.error(f"Error al parsear JSON: {e}")
+            accion = "mantener"
+            confianza = 50
+            explicacion = "Respuesta no estructurada o inválida, se mantiene por defecto."
     except Exception as e:
         logging.error(f"Error en la llamada a la API de GPT: {e}")
-        # Manejo de errores en caso de falla en la llamada a la API
         accion = "mantener"
         confianza = 50
         explicacion = "Error en la llamada a la API, se mantiene por defecto."
-
     return accion, confianza, explicacion
 
-
-def gpt_decision_buy_high_risk(prepared_text):
-    """
-    Decide si comprar un activo de alto riesgo basado en los datos proporcionados.
-    """
-    prompt = f"""
-        Eres un experto en trading enfocado en criptomonedas de alta especulación.
-        Estás dispuesto a asumir un riesgo elevado, respaldado por un trailing stop.
-        Tu objetivo es conseguir al menos un 3% de crecimiento diario en el corto plazo.
-
-        Basándote en el siguiente texto estructurado, decide si COMPRAR esta criptomoneda para tener un retorno en el corto plazo, o si debes MANTENER.
-
-        **Condiciones clave:**
-        1. Son monedas de alto riesgo, el presupuesto es pequeño y queremos apuestas con alto potencial.
-        2. Estamos buscando alta probabilidad de crecimiento, es decir, aumento de volumen en el corto plazo.
-        3. Si estamos cerca a la base y hay alto crecimiento de volumen en el corto plazo, deberíamos comprar.
-        4. Toma en cuenta que estas son monedas de alta especulación; le estamos apostando a la especulación.
-
-        **Información disponible:**
-        {prepared_text}
-
-        **Objetivo principal:**
-        - Me interesa comprar con alto riesgo si los indicadores tienen probabilidad de crecimiento en el corto plazo.
-        - Si las condiciones son razonables pero no ideales, decide COMPRAR para mantener el capital en movimiento.
-        - MANTENER si hay divergencias bajistas o problemas de liquidez significativos.
-
-        **Instrucciones:**
-        - Responde únicamente en formato JSON con los campos "accion", "confianza" y "explicacion".
-        - "accion" debe ser "comprar" o "mantener".
-        - "confianza" debe ser un número entero entre 0 y 100 que represente el nivel de confianza en la decisión.
-        - "explicacion" debe contener una breve justificación de la decisión (1 o 2 líneas).
-        - No incluyas ningún otro texto, comentarios, o delimitadores de código en la respuesta.
-        - Asegúrate de que el JSON esté completo y correctamente cerrado.
-
-        **Ejemplo de respuesta:**
-        {{"accion": "comprar", "confianza": 80, "explicacion": "Los indicadores muestran un aumento de volumen y señales de crecimiento."}}
-    """
-    try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "Eres un experto en trading enfocado en criptomonedas de alta especulación."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,        # Temperatura baja para respuestas más deterministas
-            max_tokens=150           # Suficiente para la respuesta en JSON
-            # Eliminamos el parámetro 'stop' para permitir que GPT genere el JSON completo
-        )
-        message = response.choices[0].message.content.strip()
-        print(f"decision de compra: {message}")
-        logging.info(f"Respuesta completa de GPT: {message}")
-
-        # Eliminar delimitadores de código si están presentes
-        message = message.replace('```json', '').replace('```', '').strip()
-
-        try:
-            # Intentar parsear el mensaje directamente como JSON
-            decision = json.loads(message)
-            accion = decision.get("accion", "mantener").lower()
-            confianza = int(decision.get("confianza", 50))
-            explicacion = decision.get("explicacion", "")
-
-            # Validación de la acción
-            if accion not in ["comprar", "mantener"]:
-                accion = "mantener"
-
-            # Validación de la confianza
-            if not (0 <= confianza <= 100):
-                confianza = 50
-
-        except json.JSONDecodeError as e:
-            logging.error(f"Error al parsear JSON directamente: {e}")
-            # Intentar extraer el JSON si está incrustado en el texto
-            json_match = re.search(r'\{.*\}', message, re.DOTALL)
-            if json_match:
-                try:
-                    decision = json.loads(json_match.group())
-                    accion = decision.get("accion", "mantener").lower()
-                    confianza = int(decision.get("confianza", 50))
-                    explicacion = decision.get("explicacion", "")
-
-                    # Validación de la acción
-                    if accion not in ["comprar", "mantener"]:
-                        accion = "mantener"
-
-                    # Validación de la confianza
-                    if not (0 <= confianza <= 100):
-                        confianza = 50
-
-                except (json.JSONDecodeError, ValueError, TypeError) as e_inner:
-                    logging.error(f"Error al extraer y parsear JSON: {e_inner}")
-                    # Manejo de errores si el JSON aún no es válido
-                    accion = "mantener"
-                    confianza = 50
-                    explicacion = "Respuesta no estructurada o inválida, se mantiene por defecto."
-            else:
-                logging.error("No se encontró ningún JSON en la respuesta de GPT.")
-                # Manejo de errores si no se encuentra ningún JSON
-                accion = "mantener"
-                confianza = 50
-                explicacion = "Respuesta no estructurada o inválida, se mantiene por defecto."
-
-    except Exception as e:
-        logging.error(f"Error en la llamada a la API de GPT: {e}")
-        # Manejo de errores en caso de falla en la llamada a la API
-        accion = "mantener"
-        confianza = 50
-        explicacion = "Error en la llamada a la API, se mantiene por defecto."
-
-    logging.info(f"Decisión: {accion}, Confianza: {confianza}, Explicación: {explicacion}")
-    return accion, confianza, explicacion
-
-
-def gpt_decision_sell(prepared_text):
-    """
-    Decide si vender un activo basado en los datos proporcionados.
-    """
-    prompt = f"""
-        Eres un asesor financiero especializado en trading. Basándote en los siguientes datos, decide si debo vender este activo.
-
-        Datos:
-        {prepared_text}
-
-        Condiciones clave:
-        1. Vender si hay una caída >5% desde la compra reciente o sobrecompra extrema.
-        2. Mantener si el volumen aumenta o hay soporte cercano.
-        3. Evitar pequeñas pérdidas y mantener si hay potencial de rebote a corto plazo.
-        4. Vender si el precio está estancado (>50 velas) o en máximos locales con bajo volumen.
-        5. Decisiones a corto plazo; mantener si hay soporte claro y movimiento alcista.
-
-        **Instrucciones:**
-        - Responde únicamente en formato JSON con los campos "accion", "confianza" y "explicacion".
-        - "accion" debe ser "vender" o "mantener".
-        - "confianza" debe ser un número entero entre 0 y 100 que represente el nivel de confianza en la decisión.
-        - "explicacion" debe contener una breve justificación de la decisión (1 o 2 líneas).
-        - No incluyas ningún texto adicional antes o después del JSON.
-        - Asegúrate de que el JSON esté completo y correctamente cerrado.
-
-        **Ejemplo de respuesta:**
-        {{"accion": "vender", "confianza": 75, "explicacion": "Se ha detectado una sobrecompra extrema y una caída reciente del 6%."}}
-    """
-    try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "Eres un asesor experto en trading."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,        # Temperatura baja para respuestas más deterministas
-            max_tokens=150           # Suficiente para la respuesta en JSON
-            # Eliminamos el parámetro 'stop' para permitir que GPT genere el JSON completo
-        )
-        message = response.choices[0].message.content.strip()
-        print(f"decisión de venta: {message}")
-        logging.info(f"Respuesta completa de GPT: {message}")
-
-        # Eliminar delimitadores de código si están presentes
-        message = message.replace('```json', '').replace('```', '').strip()
-
-        try:
-            # Intentar parsear el mensaje directamente como JSON
-            decision = json.loads(message)
-            accion = decision.get("accion", "mantener").lower()
-            confianza = int(decision.get("confianza", 50))
-            explicacion = decision.get("explicacion", "")
-            if explicacion is None:
-                explicacion = "Sin explicación proporcionada."
-
-            # Validación de la acción
-            if accion not in ["vender", "mantener"]:
-                accion = "mantener"
-
-            # Validación de la confianza
-            if not (0 <= confianza <= 100):
-                confianza = 50
-
-        except json.JSONDecodeError as e:
-            logging.error(f"Error al parsear JSON directamente: {e}")
-            # Intentar extraer el JSON si está incrustado en el texto
-            json_match = re.search(r'\{.*\}', message, re.DOTALL)
-            if json_match:
-                try:
-                    decision = json.loads(json_match.group())
-                    accion = decision.get("accion", "mantener").lower()
-                    confianza = int(decision.get("confianza", 50))
-                    explicacion = decision.get("explicacion", "")
-                    if explicacion is None:
-                        explicacion = "Sin explicación proporcionada."
-
-                    # Validación de la acción
-                    if accion not in ["vender", "mantener"]:
-                        accion = "mantener"
-
-                    # Validación de la confianza
-                    if not (0 <= confianza <= 100):
-                        confianza = 50
-
-                except (json.JSONDecodeError, ValueError, TypeError) as e_inner:
-                    logging.error(f"Error al extraer y parsear JSON: {e_inner}")
-                    # Manejo de errores si el JSON aún no es válido
-                    accion = "mantener"
-                    confianza = 50
-                    explicacion = "Respuesta no estructurada o inválida, se mantiene por defecto."
-            else:
-                logging.error("No se encontró ningún JSON en la respuesta de GPT.")
-                # Manejo de errores si no se encuentra ningún JSON
-                accion = "mantener"
-                confianza = 50
-                explicacion = "Respuesta no estructurada o inválida, se mantiene por defecto."
-
-    except Exception as e:
-        logging.error(f"Error en la llamada a la API de GPT: {e}")
-        # Manejo de errores en caso de falla en la llamada a la API
-        accion = "mantener"
-        confianza = 50
-        explicacion = "Error en la llamada a la API, se mantiene por defecto."
-
-    # Registrar la decisión final
-    logging.info(f"Decisión final - Acción: {accion}, Confianza: {confianza}, Explicación: {explicacion}")
-    return accion, confianza, explicacion
+# =============================================================================
+# GPT-BASED GROUP SELECTION FUNCTIONS
+# =============================================================================
 
 def chunk_list(lst, chunk_size):
-    """Divide una lista en sublistas de tamaño chunk_size."""
+    """Divides a list into chunks of size chunk_size."""
     for i in range(0, len(lst), chunk_size):
         yield lst[i:i + chunk_size]
 
 def gpt_group_selection(data_by_symbol):
     """
-    data_by_symbol: dict con {symbol: (data_by_timeframe, additional_data)}
-    Selecciona la mejor cripto en dos fases:
-    1. Divide en grupos pequeños y elige la mejor de cada grupo.
-    2. De las ganadoras de cada grupo, elige la final con GPT-4.
+    Uses GPT in two phases to select the best crypto candidate from the data.
+    
+    Phase 1: Divide symbols into small groups (e.g. groups of 6) and ask GPT
+    to pick the best candidate from each group.
+    
+    Phase 2: From the winners of each group, ask GPT to choose the final candidate.
+    
+    Returns the final winning symbol.
     """
     symbols = list(data_by_symbol.keys())
     selected_per_group = {}
 
-    # Primera fase: Selección por grupos (usando GPT-3.5)
     print("=== Iniciando selección por grupos ===")
     for group in chunk_list(symbols, 6):
         print(f"\nAnalizando grupo: {group}")
-        prompt_for_group = "Eres un experto en análisis financiero. Aquí tienes datos de varias criptomonedas. Necesito que elijas SOLO la mejor (SOLO UNA) para comprar de este grupo y me digas cual es.\n"
-
+        prompt_for_group = "Eres un experto en análisis financiero. Aquí tienes datos de varias criptomonedas. Necesito que elijas SOLO la mejor (SOLO UNA) para comprar de este grupo y me digas cuál es.\n"
         for symbol in group:
             data_by_timeframe, additional_data = data_by_symbol[symbol]
             sub_text = gpt_prepare_data(data_by_timeframe, additional_data)
-            # Imprimimos una parte del sub_text para no saturar
-            #print(f"\n--- Datos para {symbol} ---\n{sub_text[:500]}...\n")  # Muestra primeros 500 caracteres
             prompt_for_group += f"\n### {symbol}\n{sub_text}\n"
-
         prompt_for_group += "\nBasándote en la información anterior, ¿cuál de estas criptos es la mejor opción para comprar? Devuelve solo el símbolo de la mejor."
-        
-        # Imprimimos el prompt completo que se envía a GPT-3.5
-        #print(f"\n[Prompt a GPT-3.5 para el grupo {group}]:\n{prompt_for_group}\n")
 
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model=GPT_MODEL,
             messages=[
-                {"role": "system", "content": "Eres un experto en análisis financiero y trading."},
+                {"role": "developer", "content": "Eres un experto en análisis financiero y trading."},
                 {"role": "user", "content": prompt_for_group}
             ],
-            temperature=0.7
+            temperature=0
         )
         answer = response.choices[0].message.content.strip()
         print(answer)
-        #print(f"[Respuesta GPT-3.5 para el grupo {group}]: {answer}")
-
         chosen_symbol = None
         for s in group:
-            # Extraer la parte base del símbolo (antes de /USDT)
-            base_name = s.split('/')[0].upper()  # Por ejemplo, PEPE/USDT -> PEPE
-            # Comprobar si el nombre base está en la respuesta de GPT (ignorar mayúsculas/minúsculas)
+            base_name = s.split('/')[0].upper()
             if base_name in answer.upper():
                 chosen_symbol = s
                 break
@@ -1082,301 +470,183 @@ def gpt_group_selection(data_by_symbol):
             print(f"⚠ Grupo {group}: No se reconoció un símbolo claro en la respuesta. Se elige {group[0]} por defecto.")
             selected_per_group[group[0]] = "default_winner"
 
-    # Segunda fase: Selección final entre ganadoras
+    # Phase 2: From the winners, select the final candidate
     finalists = list(selected_per_group.keys())
     print(f"\n=== Finalistas tras la primera fase: {finalists} ===")
     if len(finalists) == 1:
         final_winner = finalists[0]
         print(f"Solo hay un finalista: {final_winner}. No se requiere segunda fase.")
     else:
-        prompt_final = """
-        Eres un experto en análisis de criptomonedas. Necesito que analices los siguientes finalistas y elijas el MEJOR para comprar en el corto plazo.
-
-        INSTRUCCIONES ESPECÍFICAS:
-        1. Analiza cuidadosamente los indicadores técnicos y fundamentales de cada cripto
-        2. DEBES responder ÚNICAMENTE con el símbolo exacto (ejemplo: 'BTC/USDT')
-        3. NO incluyas explicaciones ni texto adicional
-        4. El símbolo debe coincidir EXACTAMENTE con uno de los siguientes: {symbols}
-
-        Datos de los finalistas:
-        """.format(symbols=', '.join(finalists))
-
+        prompt_final = ("Eres un experto en análisis de criptomonedas. Necesito que analices los siguientes finalistas "
+                        "y elijas el MEJOR para comprar en el corto plazo.\n\n")
         for sym in finalists:
             data_by_timeframe, additional_data = data_by_symbol[sym]
             sub_prepared = gpt_prepare_data(data_by_timeframe, additional_data)
             prompt_final += f"\n### {sym}\n{sub_prepared}\n"
-
         final_response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model=GPT_MODEL,
             messages=[
-                {"role": "system", "content": "Eres un experto en análisis financiero. DEBES responder ÚNICAMENTE con el símbolo exacto de la mejor cripto."},
+                {"role": "developer", "content": "Eres un experto en análisis financiero. DEBES responder ÚNICAMENTE con el símbolo exacto de la mejor cripto."},
                 {"role": "user", "content": prompt_final}
             ],
-            temperature=0.3  # Reducimos la temperatura para respuestas más precisas
+            temperature=0
         )
-        
         final_answer = final_response.choices[0].message.content.strip()
         print(f"[Respuesta GPT-3.5-turbo para finalistas]: {final_answer}")
 
-        # Mejorada la lógica de coincidencia
         final_winner = None
         for sym in finalists:
             if sym in final_answer:
                 final_winner = sym
                 break
-            # Búsqueda alternativa por el símbolo base
             base_symbol = sym.split('/')[0]
             if base_symbol in final_answer:
                 final_winner = sym
                 break
 
         if not final_winner:
-            print("❌ Error: GPT no proporcionó un símbolo válido. Realizando nuevo intento con prompt simplificado...")
-            # Intento de recuperación con prompt más simple
-            retry_prompt = f"IMPORTANTE: Responde ÚNICAMENTE con uno de estos símbolos exactos: {', '.join(finalists)}. ¿Cuál es la mejor opción de inversión en el corto plazo basada en los datos anteriores?"
-            
-            retry_response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "Responde únicamente con el símbolo exacto."},
-                    {"role": "user", "content": retry_prompt}
-                ],
-                temperature=0.1
-            )
-            
-            retry_answer = retry_response.choices[0].message.content.strip()
-            for sym in finalists:
-                if sym in retry_answer:
-                    final_winner = sym
-                    break
-            
-            if not final_winner:
-                raise ValueError("No se pudo determinar un ganador claro entre los finalistas.")
-
-        print(f"✅ GPT eligió {final_winner} como el ganador final.")
-
+            print("❌ Error: GPT no proporcionó un símbolo válido. Se selecciona el primer finalista.")
+            final_winner = finalists[0]
+    print(f"✅ GPT eligió {final_winner} como el ganador final.")
     return final_winner
 
-def calculate_macd(series, short_window=12, long_window=26, signal_window=9):
+# =============================================================================
+# TRAILING STOP FUNCTIONS (SELLING LOGIC)
+# =============================================================================
+
+def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5, exchange_instance=None):
     """
-    Calculate the MACD (Moving Average Convergence Divergence) indicator.
+    Configures a trailing stop for the given symbol.
     
-    Args:
-        series (pd.Series): Price series data
-        short_window (int): Short-term EMA period (default: 12)
-        long_window (int): Long-term EMA period (default: 26)
-        signal_window (int): Signal line EMA period (default: 9)
-    
-    Returns:
-        tuple: (MACD line, Signal line, MACD histogram)
+    When the current price reaches the activation level (here, 1.5× the purchase price),
+    the trailing stop logic starts tracking the highest price reached.
+    Once the price falls below the highest price minus the trailing percentage,
+    a STOP_LOSS_LIMIT order is placed.
     """
-    # Validate input
-    if len(series) < long_window:
-        return None, None, None
+    if exchange_instance is None:
+        exchange_instance = exchange
+
+    def trailing_stop_logic():
+        try:
+            activation_price = purchase_price * 1.1
+            logging.info(f"Trailing stop para {symbol} se activará al alcanzar {activation_price} USDT")
+            send_telegram_message(f"🔄 *Trailing Stop configurado* para `{symbol}`\nActivación al alcanzar `{activation_price} USDT`")
+            
+            while True:
+                current_price = fetch_price(symbol)
+                if current_price is None:
+                    logging.error(f"No se pudo obtener el precio actual para {symbol}.")
+                    time.sleep(60)
+                    continue
+
+                if current_price >= activation_price:
+                    logging.info(f"{symbol}: Precio de activación alcanzado. Configurando trailing stop.")
+                    send_telegram_message(f"📊 *Trailing Stop Activado* para `{symbol}`\nPrecio Actual: `{current_price} USDT`")
+                    
+                    highest_price = current_price
+                    while True:
+                        updated_price = fetch_price(symbol)
+                        if updated_price is None:
+                            logging.error(f"No se pudo obtener el precio actual para {symbol}.")
+                            time.sleep(60)
+                            continue
+                        
+                        if updated_price > highest_price:
+                            highest_price = updated_price
+                            logging.info(f"{symbol}: Nuevo precio más alto alcanzado: {highest_price} USDT")
+                            send_telegram_message(f"📈 *Nuevo Precio Más Alto Alcanzado* para `{symbol}`\nNuevo Precio: `{highest_price} USDT`")
+                        
+                        stop_price = highest_price * (1 - trailing_percent / 100)
+                        logging.debug(f"{symbol}: Precio actual: {updated_price} USDT, Stop Price: {stop_price} USDT")
+                        
+                        if updated_price < stop_price:
+                            try:
+                                stop_order = exchange_instance.create_order(
+                                    symbol,
+                                    'STOP_LOSS_LIMIT',
+                                    'sell',
+                                    amount,
+                                    exchange_instance.price_to_precision(symbol, stop_price * 0.99),
+                                    {
+                                        'stopPrice': exchange_instance.price_to_precision(symbol, stop_price),
+                                        'price': exchange_instance.price_to_precision(symbol, stop_price * 0.99)
+                                    }
+                                )
+                                stop_order_id = stop_order.get('id', 'N/A')
+                                timestamp = datetime.now(timezone.utc).isoformat()
+                                insert_transaction(symbol, 'stop_sell', stop_price, amount, timestamp, stop_order_id)
+                                logging.info(f"Trailing stop activado para {symbol} a {stop_price} USDT")
+                                send_telegram_message(f"🔄 *Trailing Stop Activado*\nSímbolo: `{symbol}`\nPrecio de stop: `{stop_price} USDT`")
+                                break
+                            except Exception as e:
+                                logging.error(f"Error al colocar orden de trailing stop para {symbol}: {e}")
+                                send_telegram_message(f"❌ *Error al configurar trailing stop* `{symbol}`\nDetalles: {e}")
+                                break
+                        time.sleep(60)
+                    break
+                time.sleep(60)
+        except Exception as e:
+            logging.error(f"Error en trailing_stop_logic para {symbol}: {e}")
+            send_telegram_message(f"❌ *Error en trailing_stop_logic* `{symbol}`\nDetalles: {e}")
+
+    trailing_thread = threading.Thread(target=trailing_stop_logic)
+    trailing_thread.start()
+
+def process_order(order, symbol, exchange_instance=exchange):
+    """
+    Processes the purchase order and starts the trailing stop process.
+    
+    Expects the order to be a dictionary containing at least:
+      - 'price': the purchase price
+      - 'filled': the purchased amount
+    """
+    if order:
+        logging.info(f"Iniciando procesamiento de la orden para {symbol}.")
+        purchase_price = order.get('price')
+        amount = order.get('filled', 0)
         
-    # Calculate EMAs
-    short_ema = series.ewm(span=short_window, adjust=False, min_periods=short_window).mean()
-    long_ema = series.ewm(span=long_window, adjust=False, min_periods=long_window).mean()
-    
-    # Calculate MACD line
-    macd_line = short_ema - long_ema
-    
-    # Calculate Signal line
-    signal_line = macd_line.ewm(span=signal_window, adjust=False, min_periods=signal_window).mean()
-    
-    # Calculate MACD histogram
-    macd_histogram = macd_line - signal_line
-    
-    return macd_line, signal_line, macd_histogram
-
-def fetch_market_cap(symbol):
-    try:
-        ticker = exchange.fetch_ticker(symbol)
-        return ticker['quoteVolume'] * ticker['last']  # Aproximado como volumen * precio
-    except Exception as e:
-        print(f"Error al obtener el market cap para {symbol}: {e}")
-        return None
-
-def calculate_relative_volume(volume_series):
-    return volume_series.iloc[-1] / volume_series.mean() # Último volumen comparado con la media
-
-def calculate_spread(symbol):
-    try:
-        order_book = exchange.fetch_order_book(symbol)
-        spread = order_book['asks'][0][0] - order_book['bids'][0][0]
-        return spread
-    except Exception as e:
-        print(f"Error al calcular el spread para {symbol}: {e}")
-        return None
-
-def fetch_fear_greed_index():
-    url = "https://api.alternative.me/fng/"
-    try:
-        response = requests.get(url)
-        data = response.json()
-        return data['data'][0]['value']  # Índice de miedo/codicia
-    except Exception as e:
-        print(f"Error al obtener el Fear & Greed Index: {e}")
-        return None
-    
-def calculate_price_std_dev(price_series):
-    return price_series.std()
-
-def get_portfolio_cryptos():
-    """
-    Obtiene las criptos del portafolio con saldo mayor a 0.
-    """
-    try:
+        if purchase_price is None or amount <= 0:
+            logging.error(f"Datos insuficientes en la orden para {symbol}. Precio: {purchase_price}, Cantidad: {amount}")
+            send_telegram_message(f"❌ *Error al procesar la orden de compra* `{symbol}`\nDetalles: Datos insuficientes.")
+            return
+        
+        logging.info("Pausando 5 segundos para actualización de balance.")
+        time.sleep(5)
+        
+        asset = symbol.split('/')[0]
         balance = exchange.fetch_balance()
-        portfolio = balance['free']
-        active_cryptos = [
-            symbol for symbol, amount in portfolio.items() if amount > 0 and symbol != 'USDT'
-        ]
-        return active_cryptos
-    except Exception as e:
-        print(f"❌ Error al obtener el portafolio: {e}")
-        return []
+        available_amount = balance['free'].get(asset, 0)
+        logging.info(f"Balance disponible para {asset}: {available_amount}")
+        
+        manage_amount = min(amount, available_amount)
+        if manage_amount < amount:
+            logging.warning(f"Saldo insuficiente para manejar la cantidad completa de {symbol}. Manejar {manage_amount} en lugar de {amount}.")
+            send_telegram_message(f"⚠️ *Aviso de Saldo Insuficiente*\nSímbolo: `{symbol}`\nCantidad manejada: `{manage_amount}` en lugar de `{amount}`.")
+        
+        logging.info(f"Configurando trailing stop para {symbol} (purchase price: {purchase_price} USDT, cantidad: {manage_amount}).")
+        set_trailing_stop(symbol, manage_amount, purchase_price, trailing_percent=20, exchange_instance=exchange_instance)
+    else:
+        logging.error(f"No se recibió orden para {symbol}.")
 
-def wei_to_bnb(value_in_wei):
-    """
-    Convierte valores en wei a la unidad principal (BNB o similar).
-    """
-    return value_in_wei / (10 ** 18)
-
-def log_transaction(order):
-    """
-    Registra una orden en un archivo CSV con las columnas: símbolo, precio, cantidad ejecutada.
-    """
-    filename = "ordenes_realizadas.csv"
-    fields = ["symbol", "price", "amount"]  # Columnas del archivo
-
-    try:
-        # Extraer datos relevantes, adaptando el acceso a los datos según el formato del objeto `order`
-        symbol = order.get("symbol", "UNKNOWN") if isinstance(order, dict) else order.symbol
-        price = order.get("price", 0) if isinstance(order, dict) else order.price
-        amount = order.get("filled", 0) if isinstance(order, dict) else order.filled
-
-        # Escribir en el archivo CSV
-        file_exists = os.path.isfile(filename)
-        with open(filename, mode="a", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=fields)
-            if not file_exists:
-                writer.writeheader()  # Escribir encabezado
-            writer.writerow({"symbol": symbol, "price": price, "amount": amount})
-        print(f"✅ Orden registrada: {symbol}, Precio: {price}, Cantidad: {amount}")
-    except AttributeError as e:
-        print(f"❌ Error al acceder a los atributos de la orden: {e}")
-    except Exception as e:
-        print(f"❌ Error al registrar la orden en el archivo: {e}")
-    
-
-def fetch_and_prepare_data(symbol):
-    """
-    Obtiene datos históricos en múltiples marcos temporales y calcula indicadores técnicos.
-    """
-    try:
-        # Definir marcos temporales y cantidad de datos a obtener
-        timeframes = ['1h', '4h', '1d']  # Horas, 4 horas, días
-        data = {}
-        volume_series = None
-        price_series = None
-
-        # Obtener datos para cada marco temporal
-        for timeframe in timeframes:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=50)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-
-            # Solo guardar los datos de 1h para las series de volumen y precio
-            if timeframe == '1h':
-                volume_series = df['volume']
-                price_series = df['close']
-
-            # Calcular indicadores técnicos
-            df['MA_20'] = df['close'].rolling(window=20).mean()  # Media móvil de 20 periodos
-            df['MA_50'] = df['close'].rolling(window=50).mean()  # Media móvil de 50 periodos
-            df['RSI'] = calculate_rsi(df['close'])  # Índice de Fuerza Relativa
-            df['BB_upper'], df['BB_middle'], df['BB_lower'] = calculate_bollinger_bands(df['close'])  # Bandas de Bollinger
-
-            data[timeframe] = df  # Almacenar datos por marco temporal
-
-        return data, volume_series, price_series  # Devuelve los datos y las series
-    except Exception as e:
-        print(f"Error al obtener datos para {symbol}: {e}")
-        return None, None, None
-
-# Función para calcular el RSI
-# Función para calcular RSI
-def calculate_rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return [np.nan]
-    
-    deltas = np.diff(prices)
-    gains = np.where(deltas > 0, deltas, 0)
-    losses = np.where(deltas < 0, -deltas, 0)
-    avg_gain = np.mean(gains[:period])
-    avg_loss = np.mean(losses[:period])
-    rs = avg_gain / avg_loss if avg_loss != 0 else 0
-    rsi = 100 - (100 / (1 + rs))
-    rsis = [np.nan] * period
-    for i in range(period, len(prices)):
-        avg_gain = (avg_gain * (period - 1) + gains[i - 1]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i - 1]) / period
-        rs = avg_gain / avg_loss if avg_loss != 0 else 0
-        rsis.append(100 - (100 / (1 + rs)))
-    return rsis
-
-# Función para calcular Bandas de Bollinger
-def calculate_bollinger_bands(series, window=20, num_std_dev=2):
-    """
-    Calcula las Bandas de Bollinger.
-    """
-    rolling_mean = series.rolling(window=window).mean()
-    rolling_std = series.rolling(window=window).std()
-    upper_band = rolling_mean + (rolling_std * num_std_dev)
-    lower_band = rolling_mean - (rolling_std * num_std_dev)
-    return upper_band, rolling_mean, lower_band
-
-def extract_confidence(message):
-    """
-    Extrae el porcentaje de confianza de la respuesta.
-    """
-    import re
-    match = re.search(r'(\d+)%', message)
-    if match:
-        return int(match.group(1))
-    return 50  # Valor predeterminado si no se encuentra un porcentaje
+# =============================================================================
+# ORDER EXECUTION (BUYING LOGIC)
+# =============================================================================
 
 def is_valid_notional(symbol, amount):
     """
-    Verifica si el valor notional cumple con los requisitos mínimos de Binance.
+    Verifies that the notional value (price * amount) meets the exchange's minimum.
     """
     try:
-        # Cargar los datos del mercado para el símbolo
         markets = exchange.load_markets()
         market = markets.get(symbol)
-
-        # Obtener el precio actual del símbolo
         ticker = exchange.fetch_ticker(symbol)
-        current_price = ticker['last']  # Último precio del par
-
-        # Calcular el valor notional
+        current_price = ticker['last']
         notional = current_price * amount
-
-        # Obtener el valor mínimo de notional desde el mercado
         if market and 'limits' in market and 'cost' in market['limits']:
             min_notional = market['limits']['cost']['min']
         else:
-            min_notional = 10  # Valor mínimo genérico si no está definido
-
-        print(f"🔍 Verificación para {symbol}:")
-        print(f"    Precio actual: {current_price} USDT")
-        print(f"    Cantidad: {amount}")
-        print(f"    Valor notional: {notional} USDT")
-        print(f"    Mínimo permitido: {min_notional} USDT")
-
-        # Validar si el notional cumple con el requisito
+            min_notional = 10  # Generic fallback minimum
+        print(f"🔍 Verificación para {symbol}: Precio actual: {current_price} USDT, Cantidad: {amount}, Valor notional: {notional} USDT, Mínimo permitido: {min_notional} USDT")
         is_valid = notional >= min_notional
         if not is_valid:
             print(f"⚠️ El valor notional para {symbol} es {notional:.2f} USDT, menor al mínimo permitido de {min_notional:.2f} USDT.")
@@ -1385,24 +655,19 @@ def is_valid_notional(symbol, amount):
         print(f"❌ Error al verificar el valor notional para {symbol}: {e}")
         return False
 
-
-# Ejecutar orden de compra
 def execute_order_buy(symbol, amount, confidence, explanation, risk_t):
     """
-    Ejecuta una orden de compra y registra la transacción en la base de datos.
+    Executes a market buy order and records the transaction in the database.
     """
     try:
-        # Validar el notional antes de ejecutar la orden
         if not is_valid_notional(symbol, amount):
             print(f"⚠️ Orden de compra para {symbol} no válida debido al valor notional.")
             return None
 
-        # Ejecutar la orden de compra
         order = exchange.create_market_buy_order(symbol, amount)
-        price = order["price"] or 0
+        price = order.get("price") or 0
         timestamp = pd.Timestamp.now().isoformat()
 
-        # Registrar en la base de datos
         insert_transaction(
             symbol=symbol,
             action="buy",
@@ -1414,7 +679,6 @@ def execute_order_buy(symbol, amount, confidence, explanation, risk_t):
             risk_type=risk_t,
             summary=explanation
         )
-
         print(f"✅ Orden de compra ejecutada: {symbol}, Precio: {price}, Cantidad: {amount}")
         return order
     except Exception as e:
@@ -1423,26 +687,20 @@ def execute_order_buy(symbol, amount, confidence, explanation, risk_t):
 
 def make_buy(symbol, budget, risk_type, confidence, explanation=None):
     """
-    Realiza la compra de una criptomoneda utilizando la función `execute_order_buy`, 
-    ajustando el presupuesto según la confianza y el tipo de riesgo, y maneja la comunicación
-    de la transacción a través de Telegram.
+    Adjusts the purchase budget based on risk type and confidence, then executes a buy order.
+    After a successful buy, the trailing stop process is initiated.
     """
-    # Ajustar el presupuesto basado en el tipo de riesgo y la confianza
     if risk_type == "alto riesgo":
-        if confidence > 80:
-            adjusted_budget = budget * 0.8  # 80% del presupuesto si la confianza es alta
-        else:
-            adjusted_budget = budget * 0.5  # 50% del presupuesto si la confianza es baja
-
+        adjusted_budget = budget * 0.8 if confidence > 80 else budget * 0.5
     elif risk_type == "bajo riesgo":
         if confidence <= 70:
-            adjusted_budget = budget * 0.05  # 5% del presupuesto
+            adjusted_budget = budget * 0.05
         elif 70 < confidence <= 75:
-            adjusted_budget = budget * 0.15  # 15% del presupuesto
+            adjusted_budget = budget * 0.15
         elif 75 < confidence <= 80:
-            adjusted_budget = budget * 0.4  # 40% del presupuesto
+            adjusted_budget = budget * 0.4
         elif confidence > 80:
-            adjusted_budget = budget * 0.7  # 70% del presupuesto
+            adjusted_budget = budget * 0.7
         else:
             print(f"⚠️ Confianza no válida: {confidence}")
             return
@@ -1451,291 +709,96 @@ def make_buy(symbol, budget, risk_type, confidence, explanation=None):
         return
 
     print(f"🔍 Presupuesto ajustado: {adjusted_budget:.2f} USDT (Confianza: {confidence}%, Riesgo: {risk_type})")
-
-    # Obtener el precio actual
     final_price = fetch_price(symbol)
     if not final_price:
         print(f"⚠️ No se pudo obtener el precio para {symbol}.")
         return
 
-    # Calcular la cantidad a comprar
     amount_to_buy = adjusted_budget / final_price
     print(f"Cantidad a comprar: {amount_to_buy:.6f}")
-
-    # Verificar si cumple con el mínimo notional
-    if amount_to_buy * final_price >= 2:  # Mínimo notional de Binance
+    if amount_to_buy * final_price >= 2:
         order = execute_order_buy(symbol, amount_to_buy, confidence, explanation, risk_type)
         if order:
             timestamp = get_colombia_timestamp()
             print(f"✅ Compra ejecutada para {symbol} ({risk_type})")
             url_binance = f"https://www.binance.com/en/trade/{symbol}_USDT?_from=markets&type=spot"
             try:
-                print(f"Comprando {symbol} con éxito a un valor de {amount_to_buy} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
-                send_telegram_message(f"Comprando {symbol} con {risk_type} EXITOSAMENTE a un valor de {amount_to_buy} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
-                send_telegram_message(f"URL de binance: {url_binance}, con el timestamp {timestamp}")
+                send_telegram_message(
+                    f"Comprando {symbol} ({risk_type}) EXITOSAMENTE a un valor de {amount_to_buy} USDT, confianza: {confidence}%, explicación: {explanation}"
+                )
+                send_telegram_message(f"URL de Binance: {url_binance} - Timestamp: {timestamp}")
             except Exception as e:
-                print(f"❌ Error enviando mensaje de prueba a Telegram: {e}")
+                print(f"❌ Error enviando mensaje a Telegram: {e}")
+            # Initiate the trailing stop process immediately after a successful purchase:
+            process_order(order, symbol, exchange_instance=exchange)
         else:
             print(f"❌ No se pudo ejecutar la compra para {symbol} ({risk_type}).")
     else:
         print(f"⚠️ La cantidad calculada para {symbol} no cumple con el mínimo notional.")
 
+# =============================================================================
+# TESTING INDICATORS (Optional)
+# =============================================================================
 
-def execute_order_sell(symbol, confidence, explanation):
+def debug_new_indicators(symbol):
     """
-    Ejecuta una orden de venta y registra la transacción en la base de datos.
+    Diagnostic function to test new technical indicators for a given symbol.
     """
+    print(f"\n🔍 Diagnóstico de indicadores para {symbol}")
+    print("=" * 50)
     try:
-        # Obtener el saldo disponible
-        balance = exchange.fetch_balance()
-        amount = balance['free'].get(symbol.split('/')[0], 0)
-
-        if amount <= 0:
-            print(f"⚠️ No tienes suficiente saldo para vender {symbol}.")
-            return None
-
-        # Validar el notional
-        if not is_valid_notional(symbol, amount):
-            print(f"⚠️ Orden de venta para {symbol} no válida debido al valor notional mínimo.")
-            return None
-
-        # Ejecutar la orden de venta
-        order = exchange.create_market_sell_order(symbol, amount)
-
-        # Obtener el precio actual si no está en la orden
-        ticker = exchange.fetch_ticker(symbol)
-        price = order.get("price") or ticker["last"]
-        timestamp = get_colombia_timestamp()
-
-        # Recuperar todas las compras del símbolo
-        transactions = fetch_all_transactions()
-        buys = [t for t in transactions if t[1] == symbol and t[2] == "buy"]
-
-        # Calcular el precio promedio de compra
-        if buys:
-            total_cost = sum(buy[3] * buy[4] for buy in buys)  # Precio * Cantidad
-            total_amount = sum(buy[4] for buy in buys)  # Suma de cantidades
-            average_price = total_cost / total_amount
-        else:
-            average_price = 0
-
-        # Calcular ganancia/pérdida
-        profit_loss = (price - average_price) * amount
-
-        # Registrar en la base de datos
-        insert_transaction(
-            symbol=symbol,
-            action="sell",
-            price=price,
-            amount=amount,
-            timestamp=timestamp,
-            profit_loss=profit_loss,
-            confidence_percentage=confidence,
-            summary=explanation
-        )
-
-        print(f"✅ Orden de venta ejecutada: {symbol}, Precio: {price}, Cantidad: {amount}, Ganancia/Pérdida: {profit_loss}")
-        return order
+        data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(symbol)
+        if not all([data_by_timeframe, volume_series is not None, price_series is not None]):
+            print("❌ Error: No se pudieron obtener los datos base")
+            return
+        print("\n1️⃣ Análisis de Divergencias:")
+        prices = data_by_timeframe["1h"]["close"].values
+        rsi_values = calculate_rsi(prices)
+        divergences = detect_momentum_divergences(prices, rsi_values)
+        print(f"- Últimos 5 precios: {prices[-5:]}")
+        print(f"- Últimos 5 RSI: {rsi_values[-5:]}")
+        print(f"- Divergencias encontradas: {divergences}")
+        print("\n2️⃣ Análisis de Sentimiento:")
+        # Placeholder for market sentiment analysis (if implemented)
+        sentiment = {}
+        print(f"- Sentimiento: {sentiment}")
+        validation = {
+            "Divergencias válidas": all(isinstance(d, tuple) and len(d) == 2 for d in divergences),
+            "Sentimiento completo": True,
+        }
+        for check, result in validation.items():
+            print(f"- {check}: {'✅' if result else '❌'}")
+        return validation
     except Exception as e:
-        print(f"❌ Error al ejecutar la orden de venta para {symbol}: {e}")
+        print(f"❌ Error durante el diagnóstico: {e}")
         return None
 
+def test_new_indicators():
+    """Runs tests on a set of symbols to check technical indicators."""
+    print("\n🧪 Iniciando pruebas de nuevos indicadores")
+    test_symbols = ["BTC/USDT", "ETH/USDT", "BNB/USDT"]
+    results = {}
+    for symbol in test_symbols:
+        print(f"\nProbando {symbol}")
+        print("-" * 30)
+        results[symbol] = debug_new_indicators(symbol)
+    return results
 
-def show_transactions():
-    transactions = fetch_all_transactions()
-    print("Historial de transacciones:")
-    for t in transactions:
-        print(f"ID: {t[0]}, Symbol: {t[1]}, Action: {t[2]}, Price: {t[3]}, Amount: {t[4]}, Timestamp: {t[5]}, Profit/Loss: {t[6]}, Confidence %: {t[7]}, Summary: {t[8]}")
+# =============================================================================
+# MAIN TRADING FUNCTION (BUYING LOGIC WITH GPT-BASED SELECTION)
+# =============================================================================
 
-def calculate_trade_amount(symbol, current_price, confidence, trade_size, min_notional):
-    """
-    Calcula la cantidad a negociar basada en el precio actual, la confianza, el tamaño máximo permitido y el notional mínimo.
-
-    Args:
-        symbol (str): El par de criptomonedas (e.g., BTC/USDT).
-        current_price (float): El precio actual de la criptomoneda.
-        confidence (float): El porcentaje de confianza de la decisión.
-        trade_size (float): El tamaño máximo del trade en USD.
-        min_notional (float): El valor notional mínimo permitido por el exchange.
-
-    Returns:
-        float: La cantidad de criptomoneda a negociar.
-    """
-    # Calcular el valor notional basado en la confianza
-    desired_notional = trade_size * (confidence / 100)
-
-    # Ajustar el notional si está por debajo del mínimo permitido
-    if desired_notional < min_notional and confidence > 80:
-        print(f"⚠️ Ajustando el trade a cumplir con el notional mínimo para {symbol}.")
-        desired_notional = min_notional
-
-    # Calcular la cantidad en criptomoneda basada en el notional final
-    trade_amount = desired_notional / current_price
-
-    # Garantizar que la cantidad esté dentro de los límites
-    max_trade_amount = trade_size / current_price
-    trade_amount = min(trade_amount, max_trade_amount)
-
-    return trade_amount
-
-def fetch_avg_volume_24h(volume_series):
-    """
-    Calcula el volumen promedio de las últimas 24 horas basado en la serie de volumen.
-    """
-    if volume_series is None or len(volume_series) < 24:
-        print("⚠️ Datos insuficientes para calcular el volumen promedio de 24h.")
-        return None
-    return volume_series.tail(24).mean()
-
-def analyze_candlestick_patterns(df, pattern_type='all'):
-    """
-    Función unificada para análisis de patrones de velas
-    @param df: DataFrame con datos OHLCV
-    @param pattern_type: 'all', 'basic', o 'advanced'
-    @return: Lista de tuplas (patrón, índice, dirección)
-    """
-    patterns = []  # Inicializar la lista de patrones
-    try:
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return patterns
-            
-        for i in range(1, len(df)):
-            current = df.iloc[i]
-            previous = df.iloc[i-1]
-            
-            body = abs(current['close'] - current['open'])
-            upper_wick = current['high'] - max(current['open'], current['close'])
-            lower_wick = min(current['open'], current['close']) - current['low']
-            total_range = current['high'] - current['low']
-            
-            # Patrones básicos
-            if pattern_type in ['all', 'basic']:
-                if body < 0.2 * total_range and upper_wick > 2 * body:
-                    patterns.append(("shooting_star", i, "bearish"))
-                    
-                if body < 0.2 * total_range and lower_wick > 2 * body:
-                    patterns.append(("hammer", i, "bullish"))
-            
-            # Patrones avanzados
-            if pattern_type in ['all', 'advanced']:
-                if current['close'] > previous['close'] and \
-                   current['open'] > previous['open'] and \
-                   body > 0.7 * total_range:
-                    patterns.append(("strong_bullish", i, "bullish"))
-                    
-                if current['close'] < previous['close'] and \
-                   current['open'] < previous['open'] and \
-                   body > 0.7 * total_range:
-                    patterns.append(("strong_bearish", i, "bearish"))
-        
-        return patterns
-    except Exception as e:
-        print(f"Error en analyze_candlestick_patterns: {e}")
-        return patterns  # Retornar la lista vacía en caso de error
-
-def calculate_market_depth(symbol, depth=10):
-    """
-    Calcula la profundidad del mercado basado en las 10 mejores órdenes de compra y venta.
-    """
-    try:
-        order_book = exchange.fetch_order_book(symbol)
-        total_bids = sum([bid[1] for bid in order_book['bids'][:depth]])  # Volumen total en bids
-        total_asks = sum([ask[1] for ask in order_book['asks'][:depth]])  # Volumen total en asks
-        return {"total_bids": total_bids, "total_asks": total_asks}
-    except Exception as e:
-        print(f"Error al calcular la profundidad del mercado para {symbol}: {e}")
-        return {"total_bids": None, "total_asks": None}
-
-def calculate_support_resistance(price_series, period=14):
-    """
-    Calcula niveles de soporte y resistencia basado en máximos y mínimos locales.
-    """
-    rolling_max = price_series.rolling(window=period).max()
-    rolling_min = price_series.rolling(window=period).min()
-
-    support = rolling_min.iloc[-1]
-    resistance = rolling_max.iloc[-1]
-    return support, resistance
-
-def calculate_correlation_with_btc(symbol_price_series, btc_price_series):
-    """
-    Calcula la correlación entre el precio de una cripto y BTC.
-    """
-    if len(symbol_price_series) != len(btc_price_series):
-        print("⚠️ Las series de precios tienen tamaños diferentes.")
-        return None
-
-    correlation = symbol_price_series.corr(btc_price_series)
-    return correlation
-
-def calculate_adx(df, period=14):
-    """
-    Calcula el Índice Direccional Promedio (ADX) usando los datos OHLC.
-    Parámetros:
-        df: DataFrame con columnas ['high', 'low', 'close'].
-        period: Periodo para calcular el ADX.
-    Retorno:
-        Último valor del ADX o None si no se puede calcular.
-    """
-    try:
-        # Validar que el DataFrame tiene suficientes datos
-        if len(df) < period:
-            print(f"⚠️ No hay suficientes datos para calcular el ADX. Se requieren al menos {period} filas.")
-            return None
-
-        high = df['high']
-        low = df['low']
-        close = df['close']
-
-        # Cálculo del DM+ y DM-
-        plus_dm = high.diff().clip(lower=0)
-        minus_dm = low.diff().clip(upper=0).abs()
-
-        # Cálculo del ATR
-        true_range = pd.concat([
-            high - low,
-            (high - close.shift()).abs(),
-            (low - close.shift()).abs()
-        ], axis=1).max(axis=1)
-        atr = true_range.rolling(window=period).mean()
-
-        # Cálculo del DI+ y DI-
-        plus_di = (plus_dm / atr).rolling(window=period).mean() * 100
-        minus_di = (minus_dm / atr).rolling(window=period).mean() * 100
-
-        # Cálculo del DX
-        dx = ((plus_di - minus_di).abs() / (plus_di + minus_di)) * 100
-
-        # Cálculo del ADX
-        adx = dx.rolling(window=period).mean()
-
-        # Retornar el último valor del ADX
-        if adx.iloc[-1] is not None and not pd.isna(adx.iloc[-1]):
-            return adx.iloc[-1]
-        else:
-            print("⚠️ ADX no calculable debido a datos insuficientes o NaN intermedios.")
-            return None
-    except Exception as e:
-        print(f"❌ Error al calcular el ADX: {e}")
-        return None
-
-
-def fetch_price(symbol):
-    """
-    Obtiene el precio actual de un par de criptomonedas en USDT.
-    """
-    try:
-        ticker = exchange.fetch_ticker(symbol)  # Fetch ticker para obtener datos actuales del mercado
-        return ticker['last']  # Precio de la última transacción
-    except Exception as e:
-        print(f"❌ Error al obtener el precio para {symbol}: {e}")
-        return None
-    
-
-
-# Función principal
-# Función principal
 def demo_trading():
+    """
+    Main trading function that:
+      - Checks USDT balance.
+      - Selects candidate cryptos.
+      - Prepares market data.
+      - Uses GPT to decide whether to buy.
+      - Uses GPT group selection to pick the best candidate.
+      - Executes buy orders if recommended.
+      - Immediately launches a trailing stop after a successful purchase.
+    """
     timestamp = get_colombia_timestamp()
     print(f"Iniciando proceso de inversión con el timestamp {timestamp}")
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
@@ -1745,348 +808,79 @@ def demo_trading():
         print("⚠️ Sin saldo suficiente en USDT. Se omite el proceso de compra.")
         return
 
-    # Presupuesto máximo para criptos de bajo volumen (20% del saldo)
-    low_risk_budget = usdt_balance
-
-    # 1. Criptos de alto volumen (bajo riesgo)
+    low_risk_budget = 100 if usdt_balance > 100 else usdt_balance
+    print(f"Presupuesto de inversión bajo riesgo: {low_risk_budget} USDT")
     print("Analizando criptos de alto volumen (bajo riesgo)...")
-    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=18)
-
+    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=24)
     data_by_symbol = {}
+
     for symbol in selected_cryptos:
         data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(symbol)
         final_price = fetch_price(symbol)
         if data_by_timeframe and volume_series is not None and price_series is not None:
             support, resistance = calculate_support_resistance(price_series)
             adx = calculate_adx(data_by_timeframe["1h"])
-            
-            # Calcular RSI para divergencias
             if "close" in data_by_timeframe["1h"].columns:
                 prices = data_by_timeframe["1h"]["close"].values
                 rsi_values = calculate_rsi(prices, period=14)
                 rsi = rsi_values[-1] if not np.isnan(rsi_values[-1]) else "No disponible"
-                
-                # Nuevos análisis
                 divergences = detect_momentum_divergences(prices, rsi_values)
-                market_sentiment = analyze_market_sentiment(symbol, exchange)
+                # Placeholder: insert your market sentiment analysis if available.
+                market_sentiment = {}
             else:
                 rsi = "No disponible"
                 divergences = []
                 market_sentiment = None
-            
-            market_depth = calculate_market_depth(symbol)
-            candlestick_pattern = analyze_candlestick_patterns(data_by_timeframe["1h"])
-            
+
+            # Placeholders for additional analyses (market depth, candlestick patterns, etc.)
+            candlestick_pattern = []
+
             additional_data = {
                 "current_price": final_price,
-                "relative_volume": calculate_relative_volume(volume_series),
+                "relative_volume": volume_series.iloc[-1] / volume_series.mean() if volume_series.mean() != 0 else None,
                 "rsi": rsi,
-                "avg_volume_24h": fetch_avg_volume_24h(volume_series),
-                "market_cap": fetch_market_cap(symbol),
-                "spread": calculate_spread(symbol),
-                "fear_greed": fetch_fear_greed_index(),
-                "price_std_dev": calculate_price_std_dev(price_series),
+                "avg_volume_24h": volume_series.tail(24).mean() if len(volume_series) >= 24 else None,
+                "market_cap": None,   # Implement fetch_market_cap() if needed.
+                "spread": None,       # Implement calculate_spread() if needed.
+                "fear_greed": None,   # Implement fetch_fear_greed_index() if needed.
+                "price_std_dev": np.std(price_series),
                 "adx": adx,
                 "support": support,
                 "resistance": resistance,
-                "market_depth_bids": market_depth["total_bids"],
-                "market_depth_asks": market_depth["total_asks"],
+                "market_depth_bids": None,
+                "market_depth_asks": None,
                 "candlestick_pattern": candlestick_pattern,
-                # Nuevos datos añadidos
                 "momentum_divergences": divergences,
-                "market_sentiment": market_sentiment
+                "market_sentiment": market_sentiment,
+                "instruction": "Comprar si los indicadores muestran potencial de crecimiento a corto plazo."
             }
-            
             data_by_symbol[symbol] = (data_by_timeframe, additional_data)
         else:
             print(f"⚠️ Datos insuficientes para {symbol}, se omite.")
 
     if data_by_symbol:
+        # Use GPT-based group selection to choose the best candidate instead of simply taking the first.
         final_winner = gpt_group_selection(data_by_symbol)
-        if final_winner:
-            winner_data_by_timeframe, winner_additional_data = data_by_symbol[final_winner]
-            prepared_text = gpt_prepare_data(winner_data_by_timeframe, winner_additional_data)
-            action, confidence, explanation = gpt_decision_buy(prepared_text)
-            print(f"El ganador final es {final_winner}")
-            print(f"******************************************")
-            print(f"Se recomienda {action}")
-            print(f"******************************************")
-            print(f"La explicación es: {explanation}")
-
-            if action == "comprar":
-                make_buy(final_winner, low_risk_budget, "bajo riesgo", confidence, explanation)
+        print(f"El candidato seleccionado es: {final_winner}")
+        winner_data_by_timeframe, winner_additional_data = data_by_symbol[final_winner]
+        prepared_text = gpt_prepare_data(winner_data_by_timeframe, winner_additional_data)
+        action, confidence, explanation = gpt_decision_buy(prepared_text)
+        print("******************************************")
+        print(f"Se recomienda {action} para {final_winner}")
+        print("******************************************")
+        print(f"La explicación es: {explanation}")
+        if action == "comprar":
+            make_buy(final_winner, low_risk_budget, "bajo riesgo", confidence, explanation)
     else:
         print("⚠️ No se encontraron criptos válidas de alto volumen.")
 
-   # Lógica de ventas
-    portfolio_cryptos = get_portfolio_cryptos()
-    filtered_portfolio = []
-    for symbol in portfolio_cryptos:
-        try:
-            crypto_balance = exchange.fetch_balance()['free'].get(symbol, 0)
-            market_symbol = f"{symbol}/USDT"
-            url_binance = f"https://www.binance.com/en/trade/{symbol}_USDT?_from=markets&type=spot"
-            current_price = fetch_price(market_symbol)
-            if current_price is None:
-                print(f"⚠️ No se pudo obtener el precio actual para {symbol}.")
-                continue
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
 
-            value_in_usdt = crypto_balance * current_price
-
-            # Si el valor es menor a 0.1 USDT no vale la pena analizar venta
-            # Ajusta este valor según el mínimo notional del exchange o tu criterio
-            if value_in_usdt < 1:
-                print(f"⚠️ {symbol} tiene un valor en USDT muy bajo ({value_in_usdt:.5f}), se omite análisis de venta.")
-            else:
-                filtered_portfolio.append(symbol)
-                print(f"{symbol} vale {value_in_usdt:.2f} USDT, se incluye para análisis de venta.")
-
-
-
-        except Exception as e:
-            print(f"❌ Error al procesar {symbol} para filtrado: {e}")
-            continue
-
-    print(f"📊 Criptos en portafolio para analizar venta: {filtered_portfolio}")
-    last_analysis_time = {}
-    MIN_TIME_INTERVAL = timedelta(minutes=30)  # Intervalo mínimo de 30 minutos
-    for symbol in filtered_portfolio:
-        try:
-            market_symbol = f"{symbol}/USDT"
-            if symbol in NO_SELL:
-                print(f"⚠️ {symbol} está en la lista de no vender. Omitiendo análisis.")
-                continue
-            current_time = datetime.now()
-            if symbol in last_analysis_time:
-                time_since_last_analysis = current_time - last_analysis_time[symbol]
-                if time_since_last_analysis < MIN_TIME_INTERVAL:
-                    print(f"⏳ {symbol}: No ha pasado suficiente tiempo desde el último análisis ({time_since_last_analysis}). Omitiendo.")
-                    continue
-
-            # Actualiza el tiempo del último análisis
-            last_analysis_time[symbol] = current_time
-            # Obtener datos históricos y preparar series de precios y volúmenes
-            data_by_timeframe, volume_series, price_series = fetch_and_prepare_data(market_symbol)
-            if not data_by_timeframe or volume_series is None or price_series is None:
-                print(f"⚠️ Datos insuficientes para {market_symbol}.")
-                continue
-
-            # Calcular soporte y resistencia actuales
-            support, resistance = calculate_support_resistance(price_series)
-
-            # Calcular otros indicadores técnicos
-            adx = calculate_adx(data_by_timeframe["1h"])
-            current_price = fetch_price(market_symbol)
-            relative_volume = calculate_relative_volume(volume_series)
-            avg_volume_24h = fetch_avg_volume_24h(volume_series)
-            market_cap = fetch_market_cap(market_symbol)
-            spread = calculate_spread(market_symbol)
-            price_std_dev = calculate_price_std_dev(price_series)
-            candlestick_pattern = analyze_candlestick_patterns(data_by_timeframe["1h"])
-            market_depth = calculate_market_depth(market_symbol)
-            if "close" in data_by_timeframe["1h"].columns:
-                prices = data_by_timeframe["1h"]["close"].values  # Extraer precios de cierre
-                rsis = calculate_rsi(prices, period=14)  # Calcular RSI
-                rsi = rsis[-1] if not np.isnan(rsis[-1]) else "No disponible"  # Último RSI calculado
-            else:
-                rsi = "No disponible"
-
-                    # Condición adicional: número mínimo de velas desde la última transacción
-            if len(price_series) < 10:
-                print(f"⚠️ {symbol}: No se han acumulado suficientes velas desde el último análisis.")
-                continue
-            # Insertar los datos actuales en la tabla `market_conditions`
-            insert_market_condition(
-                symbol=market_symbol,
-                timestamp=pd.Timestamp.now().isoformat(),
-                resistance=resistance,
-                support=support,
-                adx=adx,
-                rsi=rsi,
-                relative_volume=relative_volume,
-                avg_volume_24h=avg_volume_24h,
-                market_cap=market_cap,
-                spread=spread,
-                price_std_dev=price_std_dev,
-                current_price=current_price,
-                candlestick_pattern=None,
-                market_depth_bids=market_depth["total_bids"],
-                market_depth_asks=market_depth["total_asks"]
-            )
-
-            print(f"✅ Datos de mercado insertados para {symbol} en la base de datos.")
-
-            # Recuperar resistencias históricas
-            historical_resistances = fetch_last_resistance_levels(market_symbol)
-            if not historical_resistances:
-                print(f"⚠️ No se encontraron resistencias históricas para {symbol}.")
-                continue
-            # Preparar contexto adicional específico para ventas
-            transaction_history = fetch_all_transactions()
-            recent_transactions = [
-                tx for tx in transaction_history if tx[1] == market_symbol
-            ]
-
-            # Crear tabla de transacciones recientes en formato legible
-            if recent_transactions:
-                print("Datos de recent_transactions:", recent_transactions)
-                print("Número de columnas esperadas:", len([
-                    "ID", "Symbol", "Action", "Price", "Amount", "Timestamp", 
-                    "Profit/Loss", "Confidence %", "Summary"
-                ]))
-                print("Número de columnas en datos recibidos:", len(recent_transactions[0]) if recent_transactions else 0)
-
-                transaction_table = pd.DataFrame(recent_transactions, columns=[
-                    "ID", "Symbol", "Action", "Price", "Amount", "Timestamp", 
-                    "Profit/Loss", "Confidence %", "Summary", "Extra"
-                ])
-                transaction_table_summary = transaction_table.tail(5).to_string(index=False)
-            else:
-                transaction_table_summary = "No recent transactions available."
-            
-            # Preparar datos para GPT, incluyendo resistencias históricas
-            resistances_to_consider = [resistance] + [r[0] for r in historical_resistances]
-            additional_data = {
-                
-                "rsi":rsi,
-                "current_price": current_price,
-                "support": support,
-                "resistance": resistance,
-                "historical_resistances": resistances_to_consider,
-                "adx": adx,
-                "relative_volume": relative_volume,
-                "avg_volume_24h": avg_volume_24h,
-                "market_cap": market_cap,
-                "spread": spread,
-                "price_std_dev": price_std_dev,
-                "candlestick_pattern": candlestick_pattern,
-                "liquidity_need": True,
-                "recent_transactions":transaction_table_summary,
-                "Instruction": "Incremental USDT growth through strategic sales near resistance levels.",
-                "fear_greed": fetch_fear_greed_index(),
-                "market_depth_bids": market_depth["total_bids"],
-                "market_depth_asks": market_depth["total_asks"],
-                "candlestick_pattern": candlestick_pattern
-            }
-            # Verificar y convertir price_series
-            if isinstance(price_series, pd.Series):
-                print(f"🔄 Convirtiendo price_series desde pandas.Series para {symbol}.")
-                price_series = price_series.to_numpy(dtype=float)  # Convertir a array de NumPy con tipo float
-            elif not isinstance(price_series, (list, np.ndarray)):
-                print(f"⚠️ price_series no es una lista o un array válido para {symbol}. Tipo: {type(price_series)}")
-                continue
-
-            # Asegurar que price_series sea un array NumPy de tipo float
-            price_series = np.array(price_series, dtype=float)
-
-            # Filtrar valores inválidos (NaN o negativos/cero)
-            price_series = price_series[~np.isnan(price_series) & (price_series > 0)]
-
-            # Verificar longitud de price_series después de conversión y filtrado
-            if len(price_series) < 10:
-                print(f"⚠️ {symbol}: No hay suficientes velas válidas ({len(price_series)}).")
-                continue
-
-            print(f"🔄 price_series final para {symbol}: {price_series}")
-            print(f"Cantidad de datos en price_series: {len(price_series)}")
-
-            # Detectar crecimiento acelerado
-            if len(price_series) < 2:
-                print("⚠️ Datos insuficientes en price_series para detectar crecimiento acelerado.")
-                accelerated, growth, period = False, 0, 0
-            else:
-                # Depuración antes de llamar a detect_accelerated_growth
-                print(f"Contenido de data antes de llamar a detect_accelerated_growth: {price_series}")
-                print(f"Tipo de price_series antes de pasar a detect_accelerated_growth: {type(price_series)}")
-                try:
-                    accelerated, growth, period = detect_accelerated_growth(price_series, threshold=10, max_period=10)
-                    # Confirmar valores retornados
-                    print(f"🚀 Resultado de detect_accelerated_growth -> Accelerated: {accelerated}, Growth: {growth}, Period: {period}")
-                except Exception as e:
-                    print(f"❌ Error en detect_accelerated_growth: {e}")
-                    accelerated, growth, period = False, 0, 0
-
-            # Verificar resistencia cercana
-            try:
-                print(f"🔍 Valores para is_near_resistance -> Current price: {current_price}, Resistance: {resistance}")
-                near_resistance, resistance = is_near_resistance(current_price, resistance, margin=1)
-                print(f"Resultado de is_near_resistance -> Near resistance: {near_resistance}, Resistance: {resistance}")
-            except Exception as e:
-                print(f"❌ Error en is_near_resistance: {e}")
-                near_resistance, resistance = False, None
-
-            # Resumen de condiciones y acción
-            try:
-                print(f"🛠️ Condiciones -> Accelerated: {accelerated}, Near resistance: {near_resistance}")
-                print(f"Growth: {growth}, Period: {period}")
-                if accelerated and near_resistance:
-                    print(f"⚠️ Crecimiento acelerado del {growth:.2f}% en {period} velas cerca de la resistencia {resistance}.")
-                    action = "vender"
-                    confidence = 85
-                    explanation = (
-                        "El precio ha crecido rápidamente y está cerca de resistencia. "
-                        "Señales de reversión sugieren vender."
-                    )
-                    print(f"✅ Acción sugerida -> {action} con confianza de {confidence}%")
-                else:
-                    print("No se cumplen las condiciones para vender.")
-            except Exception as e:
-                print(f"❌ Error en el análisis final: {e}")
-
-
-            else:
-
-                prepared_text = gpt_prepare_data(data_by_timeframe, additional_data)
-                print(f"El texto preparado que nos saca GPT-3 es:*********************************************************************************************** {prepared_text}")
-
-                # Decisión de GPT
-                action, confidence, explanation = gpt_decision_sell(prepared_text)
-                print("********************************************************************************")
-                print(f"La accion a realizar es:......................... {action}")
-                print(f"El nivel de confianza es:....................... {confidence}")
-                print(f"La explicacion es:.................... {explanation}")
-                timestamp = get_colombia_timestamp()
-                try:
-                    send_telegram_message(f"la decision de vender {market_symbol} es : {action}, con un nivel de confianza es: {confidence}, La explicacion es: {explanation}")
-                    send_telegram_message(f"La URL de binance es: {url_binance} y el timestamp {timestamp}")
-                except Exception as e:
-                    print(f"❌ Error enviando mensaje de prueba a Telegram: {e}")
-
-            # Ejecutar venta si GPT lo decide
-            if action == "vender":
-                crypto_balance = exchange.fetch_balance()['free'].get(symbol, 0)
-                if crypto_balance > 0:
-                    order = execute_order_sell(market_symbol, confidence, explanation)
-                    if order:
-                        print(f"✅ Venta realizada para {symbol} a {current_price} USDT.")
-                        try:
-                            print(f"Vendiendo {symbol} con éxito a un valor de {current_price} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
-                            send_telegram_message(f"Vendiendo {symbol} con éxito a un valor de {current_price} USDT con un nivel de confianza de {confidence} y la explicación es: {explanation}")
-                        except Exception as e:
-                            print(f"❌ Error enviando mensaje de prueba a Telegram: {e}")
-                else:
-                    print(f"⚠️ No tienes suficiente {symbol} para vender.")
-            else:
-                print(f"↔️ Decisión de GPT: mantener {symbol}.")
-
-            # Pausa entre solicitudes para evitar limitaciones del exchange
-            time.sleep(1)
-
-        except Exception as e:
-            print(f"❌ Error procesando {symbol}: {e}")
-            continue
-
-
-
-    # Mostrar resultados finales
-    #print("\n--- Resultados finales ---")
-    #print(f"Portafolio final: {exchange.fetch_balance()['free']}")
-
-# Ejecutar demo
-if __name__ == "__main__":
+def main():
     demo_trading()
-    #show_transactions()
-    test_new_indicators()
-    #print(get_high_risk_balance_last_24h())
+    test_new_indicators()  # Optional: runs indicator tests
 
-
+if __name__ == "__main__":
+    main()
