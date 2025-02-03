@@ -5,4 +5,5 @@ python-dotenv
 flask
 gunicorn
 requests
-TA-lib
+ta
+python-dotenv

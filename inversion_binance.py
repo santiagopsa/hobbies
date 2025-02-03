@@ -30,8 +30,7 @@ from db_manager_real import (
 # CONFIGURATION & INITIALIZATION
 # =============================================================================
 
-if os.getenv("HEROKU") is None:
-    load_dotenv()
+load_dotenv()
 
 GPT_MODEL = "gpt-4o-mini"
 
@@ -44,7 +43,12 @@ initialize_db()
 NO_SELL = ["BTC", "TRUMP"]
 
 # Configure the Binance exchange via CCXT
-exchange = ccxt.binance({"enableRateLimit": True})
+exchange = ccxt.binance({
+    'enableRateLimit': True,
+    'options': {
+        'adjustForTimeDifference': True,
+    },
+})
 exchange.apiKey = os.getenv("BINANCE_API_KEY_REAL")
 exchange.secret = os.getenv("BINANCE_SECRET_KEY_REAL")
 # exchange.set_sandbox_mode(True)  # Enable if needed
@@ -81,7 +85,6 @@ def get_colombia_timestamp():
     colombia_time = datetime.now(colombia_timezone)
     return colombia_time.strftime("%Y-%m-%d %H:%M:%S")
 
-def get_high_risk_balance_last_24h():
     """
     Calculates the net balance (buys minus sells) for high risk transactions
     in the last 24 hours.
@@ -364,7 +367,7 @@ def gpt_decision_buy(prepared_text):
         Basándote en el siguiente texto estructurado, decide si COMPRAR esta criptomoneda para tener un retorno en el corto plazo, o si debes MANTENER.
 
         Condiciones clave:
-        - Queremos ser más arriesgados, ya que el trailing stop reduce nuestro riesgo.
+        - No compres si hay sobrecompra
         - Buscamos alta probabilidad de crecimiento y aumento de volumen de manera inmediata.
         - Si los indicadores sugieren potencial de crecimiento, preferimos COMPRAR para mantener el capital en movimiento.
         - MANTENER solo en caso de señales negativas claras.
@@ -444,7 +447,7 @@ def gpt_group_selection(data_by_symbol):
             data_by_timeframe, additional_data = data_by_symbol[symbol]
             sub_text = gpt_prepare_data(data_by_timeframe, additional_data)
             prompt_for_group += f"\n### {symbol}\n{sub_text}\n"
-        prompt_for_group += "\nBasándote en la información anterior, ¿cuál de estas criptos es la mejor opción para comprar? Devuelve solo el símbolo de la mejor."
+        prompt_for_group += "\nBasándote en la información anterior, ¿cuál de estas criptos es la mejor opción para comprar teniendo en cuenta que quiero vender en el corto plazo? Devuelve solo el símbolo de la mejor con el formato 'BTC/USDT'."
 
         response = client.chat.completions.create(
             model=GPT_MODEL,
@@ -486,7 +489,7 @@ def gpt_group_selection(data_by_symbol):
         final_response = client.chat.completions.create(
             model=GPT_MODEL,
             messages=[
-                {"role": "developer", "content": "Eres un experto en análisis financiero. DEBES responder ÚNICAMENTE con el símbolo exacto de la mejor cripto."},
+                {"role": "developer", "content": "Eres un experto en análisis financiero de criptomonedas. DEBES responder ÚNICAMENTE con el símbolo exacto de la mejor cripto."},
                 {"role": "user", "content": prompt_final}
             ],
             temperature=0
@@ -514,11 +517,11 @@ def gpt_group_selection(data_by_symbol):
 # TRAILING STOP FUNCTIONS (SELLING LOGIC)
 # =============================================================================
 
-def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5, exchange_instance=None):
+def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=3, exchange_instance=None):
     """
     Configures a trailing stop for the given symbol.
     
-    When the current price reaches the activation level (here, 1.5× the purchase price),
+    When the current price reaches the activation level (here, 1.3× the purchase price),
     the trailing stop logic starts tracking the highest price reached.
     Once the price falls below the highest price minus the trailing percentage,
     a STOP_LOSS_LIMIT order is placed.
@@ -528,7 +531,7 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5, exchan
 
     def trailing_stop_logic():
         try:
-            activation_price = purchase_price * 1.1
+            activation_price = purchase_price
             logging.info(f"Trailing stop para {symbol} se activará al alcanzar {activation_price} USDT")
             send_telegram_message(f"🔄 *Trailing Stop configurado* para `{symbol}`\nActivación al alcanzar `{activation_price} USDT`")
             
@@ -548,6 +551,7 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5, exchan
                         updated_price = fetch_price(symbol)
                         if updated_price is None:
                             logging.error(f"No se pudo obtener el precio actual para {symbol}.")
+                            send_telegram_message(f"❌ *Error al obtener el precio actual* para `{symbol}`\nDetalles: No se pudo obtener el precio actual.")
                             time.sleep(60)
                             continue
                         
@@ -558,6 +562,7 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5, exchan
                         
                         stop_price = highest_price * (1 - trailing_percent / 100)
                         logging.debug(f"{symbol}: Precio actual: {updated_price} USDT, Stop Price: {stop_price} USDT")
+                        send_telegram_message(f"📉 *Precio de Stop Calculado* para `{symbol}`\nPrecio de Stop: `{stop_price} USDT`")
                         
                         if updated_price < stop_price:
                             try:
@@ -862,6 +867,25 @@ def demo_trading():
         # Use GPT-based group selection to choose the best candidate instead of simply taking the first.
         final_winner = gpt_group_selection(data_by_symbol)
         print(f"El candidato seleccionado es: {final_winner}")
+            # Check if the final_winner was bought in the last 8 hours
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        eight_hours_ago = datetime.now() - timedelta(hours=8)
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM transactions
+            WHERE symbol = ? AND action = 'buy' AND timestamp >= ?
+            """,
+            (final_winner, eight_hours_ago.strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        recent_buys = cursor.fetchone()[0]
+        conn.close()
+
+        if recent_buys > 0:
+            print(f"⚠️ {final_winner} fue comprado en las últimas 8 horas. Se omite la compra.")
+            send_telegram_message(f"⚠️ {final_winner} fue comprado en las últimas 8 horas. Se omite la compra.")
+            return
         winner_data_by_timeframe, winner_additional_data = data_by_symbol[final_winner]
         prepared_text = gpt_prepare_data(winner_data_by_timeframe, winner_additional_data)
         action, confidence, explanation = gpt_decision_buy(prepared_text)
@@ -869,6 +893,7 @@ def demo_trading():
         print(f"Se recomienda {action} para {final_winner}")
         print("******************************************")
         print(f"La explicación es: {explanation}")
+
         if action == "comprar":
             make_buy(final_winner, low_risk_budget, "bajo riesgo", confidence, explanation)
     else:
