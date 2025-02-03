@@ -532,8 +532,8 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=3, exchan
     def trailing_stop_logic():
         try:
             activation_price = purchase_price
-            logging.info(f"Trailing stop para {symbol} se activará al alcanzar {activation_price} USDT")
-            send_telegram_message(f"🔄 *Trailing Stop configurado* para `{symbol}`\nActivación al alcanzar `{activation_price} USDT`")
+            logging.info(f"Trailing stop para {symbol} se activará al alcanzar {activation_price}")
+            send_telegram_message(f"🔄 *Trailing Stop configurado* para `{symbol}`\nActivación al alcanzar `{activation_price}`")
             
             while True:
                 current_price = fetch_price(symbol)
@@ -544,7 +544,7 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=3, exchan
 
                 if current_price >= activation_price:
                     logging.info(f"{symbol}: Precio de activación alcanzado. Configurando trailing stop.")
-                    send_telegram_message(f"📊 *Trailing Stop Activado* para `{symbol}`\nPrecio Actual: `{current_price} USDT`")
+                    send_telegram_message(f"📊 *Trailing Stop Activado* para `{symbol}`\nPrecio Actual: `{current_price} `")
                     
                     highest_price = current_price
                     while True:
@@ -557,12 +557,12 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=3, exchan
                         
                         if updated_price > highest_price:
                             highest_price = updated_price
-                            logging.info(f"{symbol}: Nuevo precio más alto alcanzado: {highest_price} USDT")
-                            send_telegram_message(f"📈 *Nuevo Precio Más Alto Alcanzado* para `{symbol}`\nNuevo Precio: `{highest_price} USDT`")
+                            logging.info(f"{symbol}: Nuevo precio más alto alcanzado: {highest_price} ")
+                            send_telegram_message(f"📈 *Nuevo Precio Más Alto Alcanzado* para `{symbol}`\nNuevo Precio: `{highest_price} `")
                         
                         stop_price = highest_price * (1 - trailing_percent / 100)
-                        logging.debug(f"{symbol}: Precio actual: {updated_price} USDT, Stop Price: {stop_price} USDT")
-                        send_telegram_message(f"📉 *Precio de Stop Calculado* para `{symbol}`\nPrecio de Stop: `{stop_price} USDT`")
+                        logging.debug(f"{symbol}: Precio actual: {updated_price} , Stop Price: {stop_price} ")
+                        send_telegram_message(f"📉 *Precio de Stop Calculado* para `{symbol}`\nPrecio de Stop: `{stop_price}`")
                         
                         if updated_price < stop_price:
                             try:
@@ -580,8 +580,8 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=3, exchan
                                 stop_order_id = stop_order.get('id', 'N/A')
                                 timestamp = datetime.now(timezone.utc).isoformat()
                                 insert_transaction(symbol, 'stop_sell', stop_price, amount, timestamp, stop_order_id)
-                                logging.info(f"Trailing stop activado para {symbol} a {stop_price} USDT")
-                                send_telegram_message(f"🔄 *Trailing Stop Activado*\nSímbolo: `{symbol}`\nPrecio de stop: `{stop_price} USDT`")
+                                logging.info(f"Trailing stop activado para {symbol} a {stop_price} ")
+                                send_telegram_message(f"🔄 *Trailing Stop Activado*\nSímbolo: `{symbol}`\nPrecio de stop: `{stop_price} `")
                                 break
                             except Exception as e:
                                 logging.error(f"Error al colocar orden de trailing stop para {symbol}: {e}")
@@ -629,7 +629,7 @@ def process_order(order, symbol, exchange_instance=exchange):
             send_telegram_message(f"⚠️ *Aviso de Saldo Insuficiente*\nSímbolo: `{symbol}`\nCantidad manejada: `{manage_amount}` en lugar de `{amount}`.")
         
         logging.info(f"Configurando trailing stop para {symbol} (purchase price: {purchase_price} USDT, cantidad: {manage_amount}).")
-        set_trailing_stop(symbol, manage_amount, purchase_price, trailing_percent=20, exchange_instance=exchange_instance)
+        set_trailing_stop(symbol, manage_amount, purchase_price, trailing_percent=5, exchange_instance=exchange_instance)
     else:
         logging.error(f"No se recibió orden para {symbol}.")
 
