@@ -199,7 +199,7 @@ def buy_symbol(symbol, exchange_instance=None):
         if min_notional is None or min_notional <= 0:
             logging.warning(f"No se encontró un 'min_notional' válido para {symbol}. Usando presupuesto por defecto de 5 USDT.")
             min_notional = 5
-        budget = max(min_notional+1, 5)
+        budget = max(min_notional+1, 10)
         logging.info(f"Presupuesto: {budget} USDT")
         
         # Calcular la cantidad a comprar
@@ -368,16 +368,9 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=10, excha
                         if updated_price < stop_price:
                             try:
                                 # Binance usa 'STOP_LOSS_LIMIT' para este tipo de órdenes
-                                stop_order = exchange_instance.create_order(
+                                stop_order = exchange_instance.create_market_sell_order(
                                     symbol,
-                                    'STOP_LOSS_LIMIT',
-                                    'sell',
-                                    amount,
-                                    exchange_instance.price_to_precision(symbol, stop_price * 0.99),  # Precio límite ligeramente inferior
-                                    {
-                                        'stopPrice': exchange_instance.price_to_precision(symbol, stop_price),
-                                        'price': exchange_instance.price_to_precision(symbol, stop_price * 0.99)
-                                    }
+                                    amount
                                 )
                                 stop_order_id = stop_order.get('id', 'N/A')
                                 timestamp = datetime.now(timezone.utc).isoformat()
