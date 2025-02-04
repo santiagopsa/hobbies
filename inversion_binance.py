@@ -519,18 +519,18 @@ def gpt_group_selection(data_by_symbol):
 
 def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=3, exchange_instance=None):
     """
-    Configures a trailing stop for the given symbol.
+    Configura un trailing stop para el símbolo dado.
     
-    When the current price reaches the activation level (here, 1.3× the purchase price),
-    the trailing stop logic starts tracking the highest price reached.
-    Once the price falls below the highest price minus the trailing percentage,
-    a STOP_LOSS_LIMIT order is placed.
+    Cuando el precio actual alcanza el nivel de activación (en este caso, igual al precio de compra),
+    la lógica del trailing stop comienza a seguir el precio máximo alcanzado.
+    Una vez que el precio cae por debajo del máximo menos el trailing percentage, se ejecuta una venta inmediata.
     """
     if exchange_instance is None:
         exchange_instance = exchange
 
     def trailing_stop_logic():
         try:
+            # En este ejemplo, la activación se realiza tan pronto se alcanza el precio de compra.
             activation_price = purchase_price
             logging.info(f"Trailing stop para {symbol} se activará al alcanzar {activation_price}")
             send_telegram_message(f"🔄 *Trailing Stop configurado* para `{symbol}`\nActivación al alcanzar `{activation_price}`")
@@ -544,7 +544,7 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=3, exchan
 
                 if current_price >= activation_price:
                     logging.info(f"{symbol}: Precio de activación alcanzado. Configurando trailing stop.")
-                    send_telegram_message(f"📊 *Trailing Stop Activado* para `{symbol}`\nPrecio Actual: `{current_price} `")
+                    send_telegram_message(f"📊 *Trailing Stop Activado* para `{symbol}`\nPrecio Actual: `{current_price}`")
                     
                     highest_price = current_price
                     while True:
@@ -557,35 +557,26 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=3, exchan
                         
                         if updated_price > highest_price:
                             highest_price = updated_price
-                            logging.info(f"{symbol}: Nuevo precio más alto alcanzado: {highest_price} ")
-                            send_telegram_message(f"📈 *Nuevo Precio Más Alto Alcanzado* para `{symbol}`\nNuevo Precio: `{highest_price} `")
+                            logging.info(f"{symbol}: Nuevo precio más alto alcanzado: {highest_price}")
+                            send_telegram_message(f"📈 *Nuevo Precio Más Alto Alcanzado* para `{symbol}`\nNuevo Precio: `{highest_price} comprado a {purchase_price}`")
                         
                         stop_price = highest_price * (1 - trailing_percent / 100)
-                        logging.debug(f"{symbol}: Precio actual: {updated_price} , Stop Price: {stop_price} ")
-                        send_telegram_message(f"📉 *Precio de Stop Calculado* para `{symbol}`\nPrecio de Stop: `{stop_price}`")
+                        logging.debug(f"{symbol}: Precio actual: {updated_price} , Precio de stop: {stop_price}")
+                        send_telegram_message(f"📉 *Precio de Stop Calculado* para `{symbol}`\nPrecio de Stop: `{stop_price}, precio comprado: {purchase_price}`")
                         
                         if updated_price < stop_price:
                             try:
-                                stop_order = exchange_instance.create_order(
-                                    symbol,
-                                    'STOP_LOSS_LIMIT',
-                                    'sell',
-                                    amount,
-                                    exchange_instance.price_to_precision(symbol, stop_price * 0.99),
-                                    {
-                                        'stopPrice': exchange_instance.price_to_precision(symbol, stop_price),
-                                        'price': exchange_instance.price_to_precision(symbol, stop_price * 0.99)
-                                    }
-                                )
-                                stop_order_id = stop_order.get('id', 'N/A')
+                                # Ejecutar venta inmediata (orden de mercado)
+                                sell_order = exchange_instance.create_market_sell_order(symbol, amount)
+                                sell_order_id = sell_order.get('id', 'N/A')
                                 timestamp = datetime.now(timezone.utc).isoformat()
-                                insert_transaction(symbol, 'stop_sell', stop_price, amount, timestamp, stop_order_id)
-                                logging.info(f"Trailing stop activado para {symbol} a {stop_price} ")
-                                send_telegram_message(f"🔄 *Trailing Stop Activado*\nSímbolo: `{symbol}`\nPrecio de stop: `{stop_price} `")
+                                insert_transaction(symbol, 'market_sell', updated_price, amount, timestamp, sell_order_id)
+                                logging.info(f"Venta ejecutada para {symbol} a mercado, al precio: {updated_price}")
+                                send_telegram_message(f"🔄 *Venta Ejecutada a Mercado* para `{symbol}`\nPrecio: `{updated_price}`\nCantidad: `{amount}`, precio comprado: `{purchase_price}` ganancia/perdida: `{(updated_price - purchase_price)*100/purchase_price} %`")
                                 break
                             except Exception as e:
-                                logging.error(f"Error al colocar orden de trailing stop para {symbol}: {e}")
-                                send_telegram_message(f"❌ *Error al configurar trailing stop* `{symbol}`\nDetalles: {e}")
+                                logging.error(f"Error al ejecutar la venta de mercado para {symbol}: {e}")
+                                send_telegram_message(f"❌ *Error al ejecutar la venta de mercado* `{symbol}`\nDetalles: {e}")
                                 break
                         time.sleep(60)
                     break
