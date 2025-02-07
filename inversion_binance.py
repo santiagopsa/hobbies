@@ -620,7 +620,7 @@ def process_order(order, symbol, exchange_instance=exchange):
             send_telegram_message(f"⚠️ *Aviso de Saldo Insuficiente*\nSímbolo: `{symbol}`\nCantidad manejada: `{manage_amount}` en lugar de `{amount}`.")
         
         logging.info(f"Configurando trailing stop para {symbol} (purchase price: {purchase_price} USDT, cantidad: {manage_amount}).")
-        set_trailing_stop(symbol, manage_amount, purchase_price, trailing_percent=5, exchange_instance=exchange_instance)
+        set_trailing_stop(symbol, manage_amount, purchase_price, trailing_percent=3, exchange_instance=exchange_instance)
     else:
         logging.error(f"No se recibió orden para {symbol}.")
 
