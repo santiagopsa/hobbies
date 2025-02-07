@@ -112,9 +112,11 @@ def fetch_balance():
 def fetch_current_symbols():
     """
     Obtiene la lista actual de símbolos disponibles en Binance que terminan en /USDT.
+    Forzamos la recarga de los mercados para detectar nuevas monedas.
     """
     try:
-        markets = exchange.load_markets()
+        # Forzar la recarga de mercados para obtener datos actualizados
+        markets = exchange.load_markets(True)
         symbols = [symbol.upper() for symbol in markets.keys() if symbol.endswith('/USDT')]
         symbols = list(set(symbols))  # Eliminar duplicados
         logging.info(f"Símbolos cargados: {len(symbols)}")
@@ -312,7 +314,7 @@ def sell_symbol(symbol, amount, target_price, stop_price=None, exchange_instance
         send_telegram_message(f"❌ *Error al vender* `{symbol}`\nDetalles: {e}")
     return None
 
-def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=10, exchange_instance=None):
+def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5, exchange_instance=None):
     """
     Configura un trailing stop para el símbolo especificado en un hilo separado.
     
@@ -431,7 +433,7 @@ def process_order(order, symbol, exchange_instance):
         
         # Configurar trailing stop con precio objetivo de 3x y promedio de 1.5x
         logging.info(f"Configurando trailing stop para {symbol} con objetivo de 3x y promedio de 1.5x.")
-        threading.Thread(target=set_trailing_stop, args=(symbol, manage_amount, purchase_price, 20, exchange_instance), daemon=True).start()
+        threading.Thread(target=set_trailing_stop, args=(symbol, manage_amount, purchase_price, 5, exchange_instance), daemon=True).start()
 
 def verify_symbol_matching(previous_symbols, current_symbols):
     """
@@ -451,22 +453,24 @@ def main():
     initialize_db()
     logging.info("Iniciando bot de trading.")
 
+    # Cargar la lista inicial de símbolos (forzando la actualización de los mercados)
     previous_symbols = set(fetch_current_symbols())
     logging.info(f"Símbolos iniciales cargados: {len(previous_symbols)}")
-    logging.info(f"Se queda en loop hasta que encuentre nuevas monedas")
+    logging.info("Se queda en loop hasta que encuentre nuevas monedas")
 
     while True:
         try:
+            # Forzar la actualización de la lista de símbolos en cada iteración
             current_symbols = set(fetch_current_symbols())
             last_symbol = list(current_symbols)[-1] if current_symbols else None  # Manejar caso vacío
             if last_symbol:
                 logging.info(f"Última moneda detectada: {last_symbol}")
             
-            # Verificación de correspondencia entre listas de símbolos
+            # Verificar las diferencias entre la lista previa y la actual
             verify_symbol_matching(previous_symbols, current_symbols)
             
+            # Identificar nuevas monedas
             new_symbols = get_new_symbols(previous_symbols, current_symbols)
-            # Logging detallado de los símbolos para depuración
             logging.info(f"Cantidad de símbolos anteriores: {len(previous_symbols)}")
             logging.info(f"Cantidad de símbolos actuales: {len(current_symbols)}")
             logging.info(f"Nuevas monedas detectadas: {len(new_symbols)}")
@@ -484,14 +488,12 @@ def main():
                     logging.error(f"No se pudo obtener el precio actual para {symbol}.")
                     continue
                 send_telegram_message(f"🚀 *Precio actual*: `{current_price} USDT`")
-            
                 
-
                 order = buy_symbol(symbol, exchange_instance=exchange)
                 if order:
                     process_order(order, symbol, exchange)
 
-            # Actualizar la lista de símbolos previos
+            # Actualizar la lista de símbolos previos para la siguiente iteración
             previous_symbols = current_symbols
 
             # Esperar antes de la siguiente verificación (por ejemplo, 60 segundos)
