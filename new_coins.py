@@ -331,7 +331,7 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5, exchan
     def trailing_stop_logic():
         try:
             # Calcular el precio de activación al alcanzar 1.5x el precio de compra
-            activation_price = purchase_price * 1.5
+            activation_price = purchase_price
             logging.info(f"Trailing stop para {symbol} se activará al alcanzar {activation_price} USDT")
             send_telegram_message(f"🔄 *Trailing Stop configurado* para `{symbol}`\nActivación al alcanzar `{activation_price} USDT`")
             
@@ -339,7 +339,7 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5, exchan
                 current_price = fetch_price(symbol, exchange_instance)
                 if current_price is None:
                     logging.error(f"No se pudo obtener el precio actual para {symbol}.")
-                    time.sleep(60)  # Esperar antes de volver a intentar
+                    time.sleep(10)  # Esperar antes de volver a intentar
                     continue
 
                 # Verificar si el precio ha alcanzado el precio de activación
@@ -353,7 +353,7 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5, exchan
                         updated_price = fetch_price(symbol, exchange_instance)
                         if updated_price is None:
                             logging.error(f"No se pudo obtener el precio actual para {symbol}.")
-                            time.sleep(60)
+                            time.sleep(10)
                             continue
                         
                         if updated_price > highest_price:
@@ -384,9 +384,9 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5, exchan
                                 logging.error(f"Error al colocar orden de trailing stop para {symbol}: {e}")
                                 send_telegram_message(f"❌ *Error al configurar trailing stop* `{symbol}`\nDetalles: {e}")
                                 break
-                        time.sleep(60)  # Esperar antes de la siguiente verificación
+                        time.sleep(10)  # Esperar antes de la siguiente verificación
                     break  # Salir del bucle externo una vez que se ha configurado el trailing stop
-                time.sleep(60)  # Esperar antes de la siguiente verificación
+                time.sleep(10)  # Esperar antes de la siguiente verificación
 
         except Exception as e:
             logging.error(f"Error en trailing_stop_logic para {symbol}: {e}")
@@ -497,13 +497,13 @@ def main():
             previous_symbols = current_symbols
 
             # Esperar antes de la siguiente verificación (por ejemplo, 60 segundos)
-            time.sleep(60)
+            time.sleep(30)
         except KeyboardInterrupt:
             logging.info("Bot de trading detenido manualmente.")
             break
         except Exception as e:
             logging.error(f"Error en el loop principal: {e}")
-            time.sleep(60)  # Esperar antes de reintentar
+            time.sleep(30)  # Esperar antes de reintentar
 
 if __name__ == "__main__":
     main()
