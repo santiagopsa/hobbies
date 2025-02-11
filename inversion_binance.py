@@ -361,15 +361,15 @@ def gpt_decision_buy(prepared_text):
     """
     prompt = f"""
         Eres un experto en trading enfocado en criptomonedas de alta especulación.
-        Tu objetivo es conseguir al menos un 3% de crecimiento en el corto plazo de la criptomoneda que queremos comprar, los indicadores te deben sugerir que es una buena oportunidad.
+        Tu objetivo es definir cuales criptos van a crecer y comprarlas en el momento correcto del mercado, los indicadores te deben sugerir que es una buena oportunidad.
 
         Basándote en el siguiente texto estructurado, decide si COMPRAR esta criptomoneda por la tendencia que sugieren los indicadores, o si debes MANTENER.
 
         Condiciones clave:
         - No compres si hay sobrecompra
         - Buscamos alta probabilidad de crecimiento y aumento de volumen de manera inmediata.
-        - Si los indicadores sugieren potencial de crecimiento, preferimos COMPRAR para mantener el capital en movimiento.
-        - MANTENER solo en caso de señales negativas.
+        - Vamos a comprar si hay claras señales de que la cripto va a crecer.
+        - MANTENER en caso de señales negativas.
 
         Información disponible:
         {prepared_text}
