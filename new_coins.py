@@ -313,16 +313,28 @@ def main():
     
     while True:
         try:
-            # Sincronizar con la hora: polling desde 0.5 seg antes hasta 1 seg después de la hora
+            # Medir el tiempo antes del proceso de sincronización
+            t_sync_start = time.time()
             wait_for_next_hour_polling()
+            t_sync_end = time.time()
+            logging.info(f"Tiempo de sincronización (wait_for_next_hour_polling): {t_sync_end - t_sync_start:.3f} s")
 
+            # Medir tiempo de obtención de símbolos
+            t_fetch_start = time.time()
             current_symbols = set(fetch_current_symbols())
+            t_fetch_end = time.time()
+            logging.info(f"Tiempo de fetch_current_symbols: {t_fetch_end - t_fetch_start:.3f} s")
+            
+            # Medir tiempo de comparación
+            t_compare_start = time.time()
             new_symbols = get_new_symbols(previous_symbols, current_symbols)
-
+            t_compare_end = time.time()
+            logging.info(f"Tiempo de get_new_symbols: {t_compare_end - t_compare_start:.3f} s")
+            
             if new_symbols:
                 logging.info(f"Nuevas monedas detectadas: {new_symbols}")
-                # Ejecutar la compra inmediatamente en hilos para cada nueva moneda detectada
                 for symbol in new_symbols:
+                    # Lanza cada orden en un hilo para que se ejecute inmediatamente
                     threading.Thread(target=execute_trade, args=(symbol,), daemon=True).start()
             else:
                 logging.info("No se detectaron nuevas monedas en esta iteración.")
@@ -331,6 +343,7 @@ def main():
         except Exception as e:
             logging.error(f"Error en el loop principal: {e}")
             time.sleep(30)  # Espera antes de reintentar
+
 
 if __name__ == "__main__":
     main()
