@@ -145,10 +145,9 @@ def fetch_current_symbols():
         return []
 
 def get_new_symbols(previous_symbols, current_symbols):
-    """
-    Compara las listas para detectar nuevas monedas.
-    """
-    return list(set(current_symbols) - set(previous_symbols))
+    return list(current_symbols - previous_symbols)
+
+
 
 def fetch_price(symbol):
     """
@@ -194,21 +193,33 @@ def buy_symbol(symbol):
         return None
 
 def sell_symbol(symbol, amount):
-    """
-    Ejecuta una venta inmediata (orden de mercado) y registra la transacción.
-    """
     try:
-        order = exchange.create_market_sell_order(symbol, amount)
+        # Obtener el activo base del par, e.g., "BTC" de "BTC/USDT"
+        base_asset = symbol.split('/')[0]
+        balance = exchange.fetch_balance()
+        available = balance.get(base_asset, {}).get('free', 0)
+        
+        # Si el balance disponible es menor que el monto deseado, ajustamos el monto.
+        if available < amount:
+            logging.warning(f"Balance insuficiente detectado para {symbol}: disponible {available} vs. pedido {amount}.")
+            amount = available
+        
+        # Aplicar un margen de seguridad para evitar exceder ligeramente el balance.
+        safe_amount = float(amount) * 0.999  # Vender el 99.9% del balance disponible
+        safe_amount = exchange.amount_to_precision(symbol, safe_amount)
+        
+        order = exchange.create_market_sell_order(symbol, safe_amount)
         order_price = order.get('average', order.get('price', None))
         timestamp = datetime.now(timezone.utc).isoformat()
-        insert_transaction(symbol, 'sell', order_price, amount, timestamp)
-        send_telegram_message(f"✅ *Venta ejecutada*\nSímbolo: `{symbol}`\nPrecio: `{order_price} USDT`\nCantidad: `{amount}`")
-        logging.info(f"Venta ejecutada: {symbol} a {order_price} USDT, cantidad: {amount}")
+        insert_transaction(symbol, 'sell', order_price, safe_amount, timestamp)
+        send_telegram_message(f"✅ *Venta ejecutada*\nSímbolo: `{symbol}`\nPrecio: `{order_price} USDT`\nCantidad: `{safe_amount}`")
+        logging.info(f"Venta ejecutada: {symbol} a {order_price} USDT, cantidad: {safe_amount}")
         return order
     except Exception as e:
         logging.error(f"Error al vender {symbol}: {e}")
         send_telegram_message(f"❌ *Error al vender* `{symbol}`\nDetalles: {e}")
         return None
+
 
 def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5):
     """
@@ -230,18 +241,18 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5):
         while True:
             current_price = fetch_price(symbol)
             if current_price is None:
-                time.sleep(5)
+                time.sleep(0.5)
                 continue
             if current_price > purchase_price:
                 highest_price = current_price
                 break
-            time.sleep(5)
+            time.sleep(0.3)
 
         # Monitorear el precio y actualizar el máximo alcanzado
         while True:
             current_price = fetch_price(symbol)
             if current_price is None:
-                time.sleep(5)
+                time.sleep(0.5)
                 continue
 
             if current_price > highest_price:
@@ -257,7 +268,7 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5):
                 sell_symbol(symbol, amount)
                 break
 
-            time.sleep(5)
+            time.sleep(0.5)
     except Exception as e:
         logging.error(f"Error en trailing stop para {symbol}: {e}")
         send_telegram_message(f"❌ *Error en trailing stop* `{symbol}`\nDetalles: {e}")
@@ -277,16 +288,28 @@ def process_order(symbol, order_details):
         time.sleep(5)
         threading.Thread(target=set_trailing_stop, args=(symbol, amount, purchase_price, 5), daemon=True).start()
 
-def wait_for_next_hour():
+def wait_for_next_hour_polling():
     """
-    Calcula y espera el tiempo restante hasta 5 segundos después de la siguiente hora en punto.
+    Duerme hasta 0.5 segundos antes de la siguiente hora en punto y luego
+    hace polling de alta frecuencia hasta 2 segundos después del cambio de hora.
+    Esto permite iniciar el proceso justo antes y extenderlo un poco después,
+    asegurando que se capture el listado actualizado.
     """
     now = datetime.now()
-    # Se configura la siguiente verificación a la hora en punto más 5 segundos
-    next_hour = now.replace(minute=0, second=5, microsecond=0) + timedelta(hours=1)
-    wait_time = (next_hour - now).total_seconds()
-    logging.info(f"Esperando {wait_time:.2f} segundos hasta la siguiente verificación...")
-    time.sleep(wait_time)
+    # Calcular el inicio de la siguiente hora en punto.
+    next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    # Definir hasta cuándo queremos seguir haciendo polling (2 segundos después de la hora).
+    target_time = next_hour + timedelta(seconds=2)
+    
+    # Dormir hasta 0.5 segundos antes de la hora en punto.
+    sleep_time = (next_hour - timedelta(seconds=0.5) - now).total_seconds()
+    if sleep_time > 0:
+        time.sleep(sleep_time)
+    
+    # Polling de alta frecuencia desde 0.5 segundos antes hasta 2 segundos después de la hora.
+    while datetime.now() < target_time:
+        time.sleep(0.05)
+
 
 def main():
     initialize_db()
@@ -297,7 +320,7 @@ def main():
     while True:
         try:
             # Espera hasta 5 segundos después de la hora en punto
-            wait_for_next_hour()
+            wait_for_next_hour_polling()
 
             current_symbols = set(fetch_current_symbols())
             new_symbols = get_new_symbols(previous_symbols, current_symbols)
