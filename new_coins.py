@@ -141,6 +141,29 @@ def fetch_current_symbols():
     except Exception as e:
         logging.error(f"Error al cargar mercados: {e}")
         return []
+    
+def fetch_current_symbols_fast():
+    """
+    Obtiene la lista de símbolos disponibles (por ejemplo, los que terminan en USDT)
+    usando el endpoint de exchangeInfo de Binance de forma directa.
+    Se formatea el símbolo en el formato "BASE/QUOTE" (ejemplo: BTC/USDT).
+    """
+    try:
+        # Ajusta el timeout según sea necesario (por ejemplo, 1 o 2 segundos)
+        response = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=1)
+        data = response.json()
+        symbols = []
+        for s in data.get("symbols", []):
+            # Filtra los mercados que están activos y que son USDT
+            if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT":
+                # Formatea el símbolo (por ejemplo, "BTCUSDT" → "BTC/USDT")
+                base = s.get("baseAsset")
+                quote = s.get("quoteAsset")
+                symbols.append(f"{base}/{quote}")
+        return set(symbols)
+    except Exception as e:
+        logging.error(f"Error en fetch_current_symbols_fast: {e}")
+        return set()    
 
 def get_new_symbols(previous_symbols, current_symbols):
     """
@@ -321,7 +344,7 @@ def main():
 
             # Medir tiempo de obtención de símbolos
             t_fetch_start = time.time()
-            current_symbols = set(fetch_current_symbols())
+            current_symbols = set(fetch_current_symbols_fast())
             t_fetch_end = time.time()
             logging.info(f"Tiempo de fetch_current_symbols: {t_fetch_end - t_fetch_start:.3f} s")
             
