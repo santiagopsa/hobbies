@@ -17,7 +17,7 @@ load_dotenv()
 
 # Configuración de logging
 logging.basicConfig(
-    level=logging.INFO,  # Puedes cambiar a DEBUG para más detalle
+    level=logging.INFO,  # Cambia a DEBUG para mayor detalle
     filename='new_coins.log',
     filemode='a',
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -70,7 +70,6 @@ def initialize_db():
     """
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # Tabla para registrar transacciones (compra/venta)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS transactions_new_coins (
             symbol TEXT,
@@ -80,7 +79,6 @@ def initialize_db():
             timestamp TEXT
         )
     ''')
-    # Tabla para llevar el control de compras diarias
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS daily_purchases (
             date TEXT PRIMARY KEY,
@@ -145,9 +143,10 @@ def fetch_current_symbols():
         return []
 
 def get_new_symbols(previous_symbols, current_symbols):
+    """
+    Compara el conjunto de símbolos previos con el actual para detectar nuevos.
+    """
     return list(current_symbols - previous_symbols)
-
-
 
 def fetch_price(symbol):
     """
@@ -173,7 +172,7 @@ def buy_symbol(symbol):
     try:
         ticker = exchange.fetch_ticker(symbol)
         price = ticker['last']
-        budget = 10  # Presupuesto en USDT para la compra (ajusta este valor según prefieras)
+        budget = 10  # Presupuesto en USDT para la compra (ajústalo según prefieras)
         amount = budget / price
         amount = exchange.amount_to_precision(symbol, amount)
 
@@ -193,19 +192,21 @@ def buy_symbol(symbol):
         return None
 
 def sell_symbol(symbol, amount):
+    """
+    Ejecuta una orden de venta de mercado y registra la transacción.
+    """
     try:
         # Obtener el activo base del par, e.g., "BTC" de "BTC/USDT"
         base_asset = symbol.split('/')[0]
         balance = exchange.fetch_balance()
         available = balance.get(base_asset, {}).get('free', 0)
         
-        # Si el balance disponible es menor que el monto deseado, ajustamos el monto.
         if available < amount:
-            logging.warning(f"Balance insuficiente detectado para {symbol}: disponible {available} vs. pedido {amount}.")
+            logging.warning(f"Balance insuficiente para {symbol}: disponible {available} vs pedido {amount}.")
             amount = available
         
-        # Aplicar un margen de seguridad para evitar exceder ligeramente el balance.
-        safe_amount = float(amount) * 0.999  # Vender el 99.9% del balance disponible
+        # Aplicar un margen de seguridad para evitar sobrepasar el balance
+        safe_amount = float(amount) * 0.999  # Vender el 99.9%
         safe_amount = exchange.amount_to_precision(symbol, safe_amount)
         
         order = exchange.create_market_sell_order(symbol, safe_amount)
@@ -220,24 +221,17 @@ def sell_symbol(symbol, amount):
         send_telegram_message(f"❌ *Error al vender* `{symbol}`\nDetalles: {e}")
         return None
 
-
 def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5):
     """
     Monitorea el precio del símbolo y, una vez activado el trailing stop,
     vende inmediatamente si el precio cae por debajo del nivel calculado.
-
-    Lógica:
-      - Se espera hasta que el precio supere el precio de compra (activación).
-      - Luego se guarda el precio máximo alcanzado.
-      - Si el precio actual cae por debajo de (máximo * (1 - trailing_percent/100)),
-        se ejecuta una venta inmediata.
     """
     try:
         logging.info(f"Configurando trailing stop para {symbol} con trailing del {trailing_percent}%")
         send_telegram_message(f"🔄 *Trailing Stop configurado* para `{symbol}`")
         highest_price = purchase_price
 
-        # Esperar a que el precio suba para activar el trailing stop
+        # Espera a que el precio supere el precio de compra (activación)
         while True:
             current_price = fetch_price(symbol)
             if current_price is None:
@@ -248,7 +242,7 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5):
                 break
             time.sleep(0.3)
 
-        # Monitorear el precio y actualizar el máximo alcanzado
+        # Monitoreo activo del precio
         while True:
             current_price = fetch_price(symbol)
             if current_price is None:
@@ -260,7 +254,6 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5):
                 logging.info(f"{symbol}: Nuevo máximo alcanzado: {highest_price} USDT")
                 send_telegram_message(f"📈 *Nuevo máximo* para `{symbol}`: {highest_price} USDT")
 
-            # Calcular el precio de stop
             stop_price = highest_price * (1 - trailing_percent / 100)
             if current_price < stop_price:
                 logging.info(f"{symbol}: Precio {current_price} USDT cayó por debajo del trailing stop ({stop_price} USDT). Ejecutando venta inmediata.")
@@ -275,41 +268,42 @@ def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5):
 
 def process_order(symbol, order_details):
     """
-    Una vez realizada la compra, este método espera unos segundos y lanza el trailing stop en un hilo separado.
+    Una vez realizada la compra, espera unos segundos y lanza el trailing stop en un hilo.
     """
     if order_details:
         purchase_price = order_details.get('price')
         amount = order_details.get('filled')
         if purchase_price is None or amount is None or float(amount) <= 0:
-            logging.error(f"Datos insuficientes para configurar el trailing stop en {symbol}.")
+            logging.error(f"Datos insuficientes para trailing stop en {symbol}.")
             send_telegram_message(f"❌ *Error*: Datos insuficientes para trailing stop en `{symbol}`.")
             return
-        # Pequeña pausa para que se actualicen balances, etc.
-        time.sleep(5)
+        time.sleep(5)  # Pequeña pausa para que se actualicen balances, etc.
         threading.Thread(target=set_trailing_stop, args=(symbol, amount, purchase_price, 5), daemon=True).start()
 
 def wait_for_next_hour_polling():
     """
-    Duerme hasta 0.5 segundos antes de la siguiente hora en punto y luego
-    hace polling de alta frecuencia hasta 2 segundos después del cambio de hora.
-    Esto permite iniciar el proceso justo antes y extenderlo un poco después,
-    asegurando que se capture el listado actualizado.
+    Duerme hasta 0.5 segundos antes de la siguiente hora y hace polling de alta frecuencia
+    (cada 10 ms) hasta 1 segundo después del cambio de hora.
+    Esto permite detectar nuevas monedas en el primer segundo.
     """
     now = datetime.now()
-    # Calcular el inicio de la siguiente hora en punto.
     next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    # Definir hasta cuándo queremos seguir haciendo polling (2 segundos después de la hora).
-    target_time = next_hour + timedelta(seconds=2)
-    
-    # Dormir hasta 0.5 segundos antes de la hora en punto.
+    target_time = next_hour + timedelta(seconds=1)  # Polling hasta 1 segundo después
     sleep_time = (next_hour - timedelta(seconds=0.5) - now).total_seconds()
     if sleep_time > 0:
         time.sleep(sleep_time)
-    
-    # Polling de alta frecuencia desde 0.5 segundos antes hasta 2 segundos después de la hora.
     while datetime.now() < target_time:
-        time.sleep(0.05)
+        time.sleep(0.01)
 
+def execute_trade(symbol):
+    """
+    Ejecuta inmediatamente la compra y lanza el trailing stop.
+    """
+    order_details = buy_symbol(symbol)
+    send_telegram_message(f"🚀 *Nueva moneda detectada*: `{symbol}`")
+    
+    if order_details:
+        process_order(symbol, order_details)
 
 def main():
     initialize_db()
@@ -319,7 +313,7 @@ def main():
     
     while True:
         try:
-            # Espera hasta 5 segundos después de la hora en punto
+            # Sincronizar con la hora: polling desde 0.5 seg antes hasta 1 seg después de la hora
             wait_for_next_hour_polling()
 
             current_symbols = set(fetch_current_symbols())
@@ -327,15 +321,12 @@ def main():
 
             if new_symbols:
                 logging.info(f"Nuevas monedas detectadas: {new_symbols}")
+                # Ejecutar la compra inmediatamente en hilos para cada nueva moneda detectada
                 for symbol in new_symbols:
-                    send_telegram_message(f"🚀 *Nueva moneda detectada*: `{symbol}`")
-                    order_details = buy_symbol(symbol)
-                    if order_details:
-                        process_order(symbol, order_details)
+                    threading.Thread(target=execute_trade, args=(symbol,), daemon=True).start()
             else:
                 logging.info("No se detectaron nuevas monedas en esta iteración.")
 
-            # Actualiza la lista de símbolos para la siguiente iteración
             previous_symbols = current_symbols
         except Exception as e:
             logging.error(f"Error en el loop principal: {e}")
