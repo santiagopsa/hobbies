@@ -361,16 +361,15 @@ def gpt_decision_buy(prepared_text):
     """
     prompt = f"""
         Eres un experto en trading enfocado en criptomonedas de alta especulación.
-        Estás dispuesto a asumir un riesgo elevado, respaldado por un trailing stop.
-        Tu objetivo es conseguir al menos un 3% de crecimiento diario en el corto plazo.
+        Tu objetivo es conseguir al menos un 3% de crecimiento en el corto plazo de la criptomoneda que queremos comprar, los indicadores te deben sugerir que es una buena oportunidad.
 
-        Basándote en el siguiente texto estructurado, decide si COMPRAR esta criptomoneda para tener un retorno en el corto plazo, o si debes MANTENER.
+        Basándote en el siguiente texto estructurado, decide si COMPRAR esta criptomoneda por la tendencia que sugieren los indicadores, o si debes MANTENER.
 
         Condiciones clave:
         - No compres si hay sobrecompra
         - Buscamos alta probabilidad de crecimiento y aumento de volumen de manera inmediata.
         - Si los indicadores sugieren potencial de crecimiento, preferimos COMPRAR para mantener el capital en movimiento.
-        - MANTENER solo en caso de señales negativas claras.
+        - MANTENER solo en caso de señales negativas.
 
         Información disponible:
         {prepared_text}
@@ -386,7 +385,7 @@ def gpt_decision_buy(prepared_text):
         response = client.chat.completions.create(
             model=GPT_MODEL,
             messages=[
-                {"role": "developer", "content": "Eres un experto en trading enfocado en criptomonedas de alta especulación."},
+                {"role": "developer", "content": "Eres un experto en trading enfocado en criptomonedas."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0,
