@@ -18,7 +18,7 @@ load_dotenv()
 # Configuración de logging
 logging.basicConfig(
     level=logging.INFO,  # Puedes cambiar a DEBUG para más detalle
-    filename='trading_bot.log',
+    filename='new_coins.log',
     filemode='a',
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
