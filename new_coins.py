@@ -3,21 +3,21 @@ import time
 import os
 import logging
 from dotenv import load_dotenv
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import sqlite3
 import requests
 import threading
 from decimal import Decimal, ROUND_UP, getcontext
 
-# Configurar la precisión máxima que necesitarás
-getcontext().prec = 10  # Puedes ajustar según tus necesidades
+# Configurar la precisión decimal (ajústala según tus necesidades)
+getcontext().prec = 10
 
-# Cargar variables de entorno
+# Cargar variables de entorno desde el archivo .env
 load_dotenv()
 
 # Configuración de logging
 logging.basicConfig(
-    level=logging.INFO,  # Cambia a DEBUG para mayor detalle durante depuración
+    level=logging.INFO,  # Puedes cambiar a DEBUG para más detalle
     filename='trading_bot.log',
     filemode='a',
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -29,7 +29,7 @@ exchange = ccxt.binance({
     'secret': os.getenv('BINANCE_SECRET_KEY_REAL'),
     'enableRateLimit': True,
     'options': {
-        'defaultType': 'spot'  # Cambia a 'future' si operas en futuros
+        'defaultType': 'spot'
     }
 })
 
@@ -60,450 +60,263 @@ def send_telegram_message(message):
     except Exception as e:
         logging.error(f"Excepción al enviar mensaje a Telegram: {e}")
 
-def initialize_db(db_name="trading_bot.db"):
+# Nombre de la base de datos y límite de compras diarias
+DB_NAME = "trading_bot.db"
+MAX_DAILY_PURCHASES = 3
+
+def initialize_db():
     """
-    Inicializa la base de datos SQLite para registrar transacciones.
+    Inicializa la base de datos SQLite para registrar transacciones y contar compras diarias.
     """
-    conn = sqlite3.connect(db_name)
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+    # Tabla para registrar transacciones (compra/venta)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS transactions_new_coins (
             symbol TEXT,
             action TEXT,
             price REAL,
             amount REAL,
-            timestamp TEXT,
-            order_id TEXT,
-            stop_order_id TEXT
+            timestamp TEXT
+        )
+    ''')
+    # Tabla para llevar el control de compras diarias
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS daily_purchases (
+            date TEXT PRIMARY KEY,
+            count INTEGER DEFAULT 0
         )
     ''')
     conn.commit()
     conn.close()
 
-def insert_transaction(symbol, action, price, amount, timestamp, order_id=None, stop_order_id=None, db_name="trading_bot.db"):
+def insert_transaction(symbol, action, price, amount, timestamp):
     """
-    Inserta una transacción en la base de datos.
+    Registra una transacción en la base de datos.
     """
     try:
-        conn = sqlite3.connect(db_name)
+        conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO transactions_new_coins (symbol, action, price, amount, timestamp, order_id, stop_order_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (symbol, action, price, amount, timestamp, order_id, stop_order_id))
+            INSERT INTO transactions_new_coins (symbol, action, price, amount, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (symbol, action, price, amount, timestamp))
         conn.commit()
         conn.close()
-        logging.info(f"Transacción registrada: {action} {symbol} a {price} por {amount}")
     except Exception as e:
         logging.error(f"Error al insertar transacción: {e}")
 
-def fetch_balance():
+def get_daily_purchases():
     """
-    Obtiene el balance disponible en USDT.
+    Retorna la cantidad de compras realizadas hoy.
     """
-    try:
-        balance = exchange.fetch_balance()
-        usdt_balance = balance['free'].get('USDT', 0)
-        return usdt_balance
-    except Exception as e:
-        logging.error(f"Error al obtener balance: {e}")
-        return 0
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    today = datetime.now().strftime('%Y-%m-%d')
+    cursor.execute("SELECT count FROM daily_purchases WHERE date = ?", (today,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else 0
+
+def increment_daily_purchases():
+    """
+    Incrementa el contador de compras diarias.
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    today = datetime.now().strftime('%Y-%m-%d')
+    cursor.execute(
+        "INSERT INTO daily_purchases (date, count) VALUES (?, 1) "
+        "ON CONFLICT(date) DO UPDATE SET count = count + 1", (today,)
+    )
+    conn.commit()
+    conn.close()
 
 def fetch_current_symbols():
     """
     Obtiene la lista actual de símbolos disponibles en Binance que terminan en /USDT.
-    Forzamos la recarga de los mercados para detectar nuevas monedas.
     """
     try:
-        # Forzar la recarga de mercados para obtener datos actualizados
-        markets = exchange.load_markets(True)
+        markets = exchange.load_markets(True)  # Forzar la recarga de mercados
         symbols = [symbol.upper() for symbol in markets.keys() if symbol.endswith('/USDT')]
-        symbols = list(set(symbols))  # Eliminar duplicados
-        logging.info(f"Símbolos cargados: {len(symbols)}")
-        return symbols
+        return list(set(symbols))  # Eliminar duplicados
     except Exception as e:
         logging.error(f"Error al cargar mercados: {e}")
         return []
 
 def get_new_symbols(previous_symbols, current_symbols):
     """
-    Identifica los símbolos que son nuevos en la lista actual y terminan en /USDT.
+    Compara las listas para detectar nuevas monedas.
     """
-    previous_set = set(previous_symbols)
-    current_set = set(current_symbols)
-    new_symbols = list(current_set - previous_set)
-    logging.info(f"Símbolos anteriores: {len(previous_set)}")
-    logging.info(f"Símbolos actuales: {len(current_set)}")
-    logging.info(f"Nuevas monedas detectadas: {len(new_symbols)}")
-    
-    # Loguear algunos ejemplos de nuevos símbolos
-    if new_symbols:
-        logging.info(f"Ejemplos de símbolos nuevos: {new_symbols[:5]}")
-    return new_symbols
+    return list(set(current_symbols) - set(previous_symbols))
 
-def verify_symbol_matching(previous_symbols, current_symbols):
+def fetch_price(symbol):
     """
-    Verifica si la diferencia entre previous_symbols y current_symbols es coherente.
+    Retorna el precio actual del símbolo.
     """
-    added_symbols = current_symbols - previous_symbols
-    removed_symbols = previous_symbols - current_symbols
-
-    if added_symbols:
-        logging.info(f"Símbolos añadidos: {len(added_symbols)}")
-        logging.debug(f"Símbolos añadidos: {added_symbols}")
-    if removed_symbols:
-        logging.info(f"Símbolos eliminados: {len(removed_symbols)}")
-        logging.debug(f"Símbolos eliminados: {removed_symbols}")
-
-def fetch_price(symbol, exchange_instance=None):
-    """
-    Obtiene el precio actual de un par de criptomonedas en USDT.
-    """
-    if exchange_instance is None:
-        exchange_instance = ccxt.binance({
-            'apiKey': os.getenv('BINANCE_API_KEY_REAL'),
-            'secret': os.getenv('BINANCE_SECRET_KEY_REAL'),
-            'enableRateLimit': True,
-            'options': {
-                'defaultType': 'spot'  # Cambia a 'future' si operas en futuros
-            }
-        })
     try:
-        ticker = exchange_instance.fetch_ticker(symbol)
+        ticker = exchange.fetch_ticker(symbol)
         return ticker['last']
     except Exception as e:
         logging.error(f"Error al obtener el precio para {symbol}: {e}")
         return None
 
-def buy_symbol(symbol, exchange_instance=None):
+def buy_symbol(symbol):
     """
-    Realiza una orden de compra de mercado para el símbolo especificado con el presupuesto dado.
-    
-    :param symbol: Par de trading, por ejemplo, 'VTHO/USDT'
-    :param budget: Presupuesto en la moneda de cotización, por ejemplo, 5 USDT
-    :param exchange_instance: Instancia de CCXT para el intercambio
-    :return: Diccionario con detalles de la orden si se ejecuta correctamente, None en caso contrario
+    Realiza una orden de compra de mercado para la nueva moneda detectada,
+    siempre y cuando no se supere el límite diario.
     """
-    if exchange_instance is None:
-        logging.error("La instancia de exchange no se ha proporcionado.")
+    if get_daily_purchases() >= MAX_DAILY_PURCHASES:
+        logging.info(f"⚠️ Límite de compras diarias alcanzado ({MAX_DAILY_PURCHASES}/día).")
+        send_telegram_message(f"⚠️ *Límite de compras alcanzado*: No se comprará `{symbol}` hoy.")
         return None
-    
+
     try:
-        # Obtener el precio actual
-        ticker = exchange_instance.fetch_ticker(symbol)
-        current_price = ticker['last']
-        market = exchange.markets.get(symbol, None)
-        if not market:
-            logging.error(f"El símbolo {symbol} no está disponible en exchange.markets.")
-            return None
-        min_notional = market.get('limits', {}).get('cost', {}).get('min', 0)
-        logging.info(f"Min notional: {min_notional}")
-        if min_notional is None or min_notional <= 0:
-            logging.warning(f"No se encontró un 'min_notional' válido para {symbol}. Usando presupuesto por defecto de 5 USDT.")
-            min_notional = 5
-        budget = max(min_notional+1, 10)
-        logging.info(f"Presupuesto: {budget} USDT")
-        
-        # Calcular la cantidad a comprar
-        amount = budget / current_price
-        
-        # Obtener la precisión permitida para la cantidad
-        market = exchange_instance.markets[symbol]
-        precision = market.get('precision', {}).get('amount', 8)
-        amount = exchange_instance.amount_to_precision(symbol, amount)
-        
-        # Calcular el valor de la orden
-        order_notional = float(amount) * float(current_price)
-        min_notional = market.get('limits', {}).get('cost', {}).get('min', 0)
-        
-        logging.info(f"Presupuesto: {budget} USDT")
-        logging.info(f"Precio actual: {current_price} USDT")
-        logging.info(f"Cantidad calculada: {amount} {symbol.split('/')[0]}")
-        logging.info(f"Valor de la orden: {order_notional} USDT")
-        
-        if order_notional < min_notional:
-            logging.error(f"Valor de la orden insuficiente: {order_notional} USDT es menor que el Min Notional de {min_notional} USDT")
-            send_telegram_message(f"❌ *Error al comprar* `{symbol}`\nDetalles: Valor de la orden insuficiente ({order_notional} USDT < {min_notional} USDT)")
-            return None
-        
-        # Colocar la orden de compra de mercado
-        order = exchange_instance.create_market_buy_order(symbol, amount)
-        price = order.get('average', order.get('price', None))
+        ticker = exchange.fetch_ticker(symbol)
+        price = ticker['last']
+        budget = 10  # Presupuesto en USDT para la compra (ajusta este valor según prefieras)
+        amount = budget / price
+        amount = exchange.amount_to_precision(symbol, amount)
+
+        order = exchange.create_market_buy_order(symbol, amount)
+        order_price = order.get('average', order.get('price', None))
         filled = order.get('filled', 0)
-        order_id = order.get('id', 'N/A')
         timestamp = datetime.now(timezone.utc).isoformat()
-        
-        # Registrar la transacción en tu sistema
-        insert_transaction(symbol, 'buy', price, filled, timestamp, order_id)
-        
-        logging.info(f"Compra realizada: {symbol} - Precio: {price} - Cantidad: {filled}")
-        send_telegram_message(f"✅ *Compra realizada*\nSímbolo: `{symbol}`\nPrecio: `{price} USDT`\nCantidad: `{filled}`")
-        return {
-            'price': price,
-            'filled': filled,
-            'order_id': order_id
-        }
-    except ccxt.InsufficientFunds as e:
-        logging.error(f"Fondos insuficientes para comprar {symbol}: {e}")
-        send_telegram_message(f"❌ *Error al comprar* `{symbol}`\nDetalles: Fondos insuficientes.")
-    except ccxt.ExchangeError as e:
-        logging.error(f"Error del intercambio al comprar {symbol}: {e}")
-        send_telegram_message(f"❌ *Error al comprar* `{symbol}`\nDetalles: {e}")
+        insert_transaction(symbol, 'buy', order_price, filled, timestamp)
+        increment_daily_purchases()
+
+        logging.info(f"✅ Compra realizada: {symbol} a {order_price} USDT, cantidad: {filled}")
+        send_telegram_message(f"✅ *Compra realizada*\nSímbolo: `{symbol}`\nPrecio: `{order_price} USDT`\nCantidad: `{filled}`")
+        return {'price': order_price, 'filled': filled}
     except Exception as e:
         logging.error(f"Error al comprar {symbol}: {e}")
         send_telegram_message(f"❌ *Error al comprar* `{symbol}`\nDetalles: {e}")
-    return None
-
-def sell_symbol(symbol, amount, target_price, stop_price=None, exchange_instance=None):
-    """
-    Coloca una orden de venta limitada para el símbolo especificado.
-    
-    :param symbol: Par de trading, por ejemplo, 'VTHO/USDT'
-    :param amount: Cantidad de la criptomoneda a vender
-    :param target_price: Precio objetivo para la orden de venta
-    :param stop_price: Precio de stop para la orden (opcional)
-    :param exchange_instance: Instancia de CCXT para el intercambio
-    :return: ID de la orden si se ejecuta correctamente, None en caso contrario
-    """
-    if exchange_instance is None:
-        logging.error("La instancia de exchange no se ha proporcionado.")
         return None
-    
+
+def sell_symbol(symbol, amount):
+    """
+    Ejecuta una venta inmediata (orden de mercado) y registra la transacción.
+    """
     try:
-        # Obtener la precisión permitida para el precio y la cantidad
-        market = exchange_instance.markets.get(symbol, None)
-        if not market:
-            logging.error(f"El símbolo {symbol} no está disponible en exchange.markets.")
-            send_telegram_message(f"❌ *Error al vender* `{symbol}`\nDetalles: Símbolo no disponible en mercados.")
-            return None
-        
-        price_precision = market.get('precision', {}).get('price', 8)
-        amount_precision = market.get('precision', {}).get('amount', 8)
-        
-        # Redondear el precio y la cantidad según la precisión permitida
-        target_price = exchange_instance.price_to_precision(symbol, target_price)
-        amount = exchange_instance.amount_to_precision(symbol, amount)
-        
-        # Verificar el balance disponible
-        asset = symbol.split('/')[0]
-        balance = exchange_instance.fetch_balance()
-        available_amount = balance['free'].get(asset, 0)
-        
-        # Ajustar la cantidad a vender si es necesario
-        sell_amount = min(float(amount), available_amount)
-        if sell_amount <= 0:
-            logging.error(f"No hay suficiente {asset} para vender.")
-            send_telegram_message(f"❌ *Error al vender* `{symbol}`\nDetalles: No hay suficiente `{asset}` para vender.")
-            return None
-        elif sell_amount < float(amount):
-            logging.warning(f"Saldo insuficiente para vender la cantidad completa de {symbol}. Vendiendo {sell_amount} en lugar de {amount}.")
-            send_telegram_message(f"⚠️ *Aviso de Saldo Insuficiente*\nSímbolo: `{symbol}`\nCantidad vendida: `{sell_amount}` en lugar de `{amount}`.")
-        
-        # Colocar la orden de venta limitada
-        order = exchange_instance.create_limit_sell_order(symbol, sell_amount, target_price)
-        order_id = order.get('id', 'N/A')
-        
-        logging.info(f"Orden de venta limitada colocada para {symbol} a {target_price} USDT - ID: {order_id}")
-        send_telegram_message(f"📈 *Orden de venta limitada colocada*\nSímbolo: `{symbol}`\nPrecio objetivo: `{target_price} USDT`\nID Orden: `{order_id}`")
-        return order_id
-    except ccxt.ExchangeError as e:
-        logging.error(f"Error del intercambio al vender {symbol}: {e}")
-        send_telegram_message(f"❌ *Error al vender* `{symbol}`\nDetalles: {e}")
+        order = exchange.create_market_sell_order(symbol, amount)
+        order_price = order.get('average', order.get('price', None))
+        timestamp = datetime.now(timezone.utc).isoformat()
+        insert_transaction(symbol, 'sell', order_price, amount, timestamp)
+        send_telegram_message(f"✅ *Venta ejecutada*\nSímbolo: `{symbol}`\nPrecio: `{order_price} USDT`\nCantidad: `{amount}`")
+        logging.info(f"Venta ejecutada: {symbol} a {order_price} USDT, cantidad: {amount}")
+        return order
     except Exception as e:
         logging.error(f"Error al vender {symbol}: {e}")
         send_telegram_message(f"❌ *Error al vender* `{symbol}`\nDetalles: {e}")
-    return None
+        return None
 
-def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5, exchange_instance=None):
+def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5):
     """
-    Configura un trailing stop para el símbolo especificado en un hilo separado.
-    
-    :param symbol: Par de trading, por ejemplo, 'VTHO/USDT'
-    :param amount: Cantidad de la criptomoneda
-    :param purchase_price: Precio de compra de la criptomoneda
-    :param trailing_percent: Porcentaje de trailing para el stop
-    :param exchange_instance: Instancia de CCXT para el intercambio
+    Monitorea el precio del símbolo y, una vez activado el trailing stop,
+    vende inmediatamente si el precio cae por debajo del nivel calculado.
+
+    Lógica:
+      - Se espera hasta que el precio supere el precio de compra (activación).
+      - Luego se guarda el precio máximo alcanzado.
+      - Si el precio actual cae por debajo de (máximo * (1 - trailing_percent/100)),
+        se ejecuta una venta inmediata.
     """
-    if exchange_instance is None:
-        logging.error("La instancia de exchange no se ha proporcionado para configurar el trailing stop.")
-        return
-    
-    def trailing_stop_logic():
-        try:
-            # Calcular el precio de activación al alcanzar 1.5x el precio de compra
-            activation_price = purchase_price
-            logging.info(f"Trailing stop para {symbol} se activará al alcanzar {activation_price} USDT")
-            send_telegram_message(f"🔄 *Trailing Stop configurado* para `{symbol}`\nActivación al alcanzar `{activation_price} USDT`")
-            
-            while True:
-                current_price = fetch_price(symbol, exchange_instance)
-                if current_price is None:
-                    logging.error(f"No se pudo obtener el precio actual para {symbol}.")
-                    time.sleep(10)  # Esperar antes de volver a intentar
-                    continue
+    try:
+        logging.info(f"Configurando trailing stop para {symbol} con trailing del {trailing_percent}%")
+        send_telegram_message(f"🔄 *Trailing Stop configurado* para `{symbol}`")
+        highest_price = purchase_price
 
-                # Verificar si el precio ha alcanzado el precio de activación
-                if current_price >= activation_price:
-                    logging.info(f"{symbol}: Precio de activación alcanzado. Configurando trailing stop.")
-                    send_telegram_message(f"📊 *Trailing Stop Activado* para `{symbol}`\nPrecio Actual: `{current_price} USDT`")
-                    
-                    # Inicializar el precio más alto alcanzado
-                    highest_price = current_price
-                    while True:
-                        updated_price = fetch_price(symbol, exchange_instance)
-                        if updated_price is None:
-                            logging.error(f"No se pudo obtener el precio actual para {symbol}.")
-                            time.sleep(10)
-                            continue
-                        
-                        if updated_price > highest_price:
-                            highest_price = updated_price
-                            logging.info(f"{symbol}: Nuevo precio más alto alcanzado: {highest_price} USDT")
-                            send_telegram_message(f"📈 *Nuevo Precio Más Alto Alcanzado* para `{symbol}`\nNuevo Precio: `{highest_price} USDT`")
-                        
-                        # Calcular el stop price con el margen del trailing_percent
-                        stop_price = highest_price * (1 - trailing_percent / 100)
-                        
-                        logging.debug(f"{symbol}: Precio actual: {updated_price} USDT, Stop Price: {stop_price} USDT")
-                        
-                        # Si el precio actual cae por debajo del stop price, colocar la orden de venta
-                        if updated_price < stop_price:
-                            try:
-                                # Binance usa 'STOP_LOSS_LIMIT' para este tipo de órdenes
-                                stop_order = exchange_instance.create_market_sell_order(
-                                    symbol,
-                                    amount
-                                )
-                                stop_order_id = stop_order.get('id', 'N/A')
-                                timestamp = datetime.now(timezone.utc).isoformat()
-                                insert_transaction(symbol, 'stop_sell', stop_price, amount, timestamp, stop_order_id)
-                                logging.info(f"Trailing stop activado para {symbol} a {stop_price} USDT")
-                                send_telegram_message(f"🔄 *Trailing Stop Activado*\nSímbolo: `{symbol}`\nPrecio de stop: `{stop_price} USDT`")
-                                break  # Salir del bucle interno
-                            except Exception as e:
-                                logging.error(f"Error al colocar orden de trailing stop para {symbol}: {e}")
-                                send_telegram_message(f"❌ *Error al configurar trailing stop* `{symbol}`\nDetalles: {e}")
-                                break
-                        time.sleep(10)  # Esperar antes de la siguiente verificación
-                    break  # Salir del bucle externo una vez que se ha configurado el trailing stop
-                time.sleep(10)  # Esperar antes de la siguiente verificación
+        # Esperar a que el precio suba para activar el trailing stop
+        while True:
+            current_price = fetch_price(symbol)
+            if current_price is None:
+                time.sleep(5)
+                continue
+            if current_price > purchase_price:
+                highest_price = current_price
+                break
+            time.sleep(5)
 
-        except Exception as e:
-            logging.error(f"Error en trailing_stop_logic para {symbol}: {e}")
-            send_telegram_message(f"❌ *Error en trailing_stop_logic* `{symbol}`\nDetalles: {e}")
+        # Monitorear el precio y actualizar el máximo alcanzado
+        while True:
+            current_price = fetch_price(symbol)
+            if current_price is None:
+                time.sleep(5)
+                continue
 
-    # Crear y empezar el hilo
-    trailing_thread = threading.Thread(target=trailing_stop_logic, daemon=True)
-    trailing_thread.start()
+            if current_price > highest_price:
+                highest_price = current_price
+                logging.info(f"{symbol}: Nuevo máximo alcanzado: {highest_price} USDT")
+                send_telegram_message(f"📈 *Nuevo máximo* para `{symbol}`: {highest_price} USDT")
 
-def process_order(order, symbol, exchange_instance):
+            # Calcular el precio de stop
+            stop_price = highest_price * (1 - trailing_percent / 100)
+            if current_price < stop_price:
+                logging.info(f"{symbol}: Precio {current_price} USDT cayó por debajo del trailing stop ({stop_price} USDT). Ejecutando venta inmediata.")
+                send_telegram_message(f"🔴 *Trailing Stop activado* para `{symbol}`. Ejecutando venta inmediata.")
+                sell_symbol(symbol, amount)
+                break
+
+            time.sleep(5)
+    except Exception as e:
+        logging.error(f"Error en trailing stop para {symbol}: {e}")
+        send_telegram_message(f"❌ *Error en trailing stop* `{symbol}`\nDetalles: {e}")
+
+def process_order(symbol, order_details):
     """
-    Procesa la orden de compra y configura el trailing stop correspondiente.
-    
-    :param order: Diccionario con detalles de la orden de compra
-    :param symbol: Par de trading, por ejemplo, 'VTHO/USDT'
-    :param exchange_instance: Instancia de CCXT para el intercambio
+    Una vez realizada la compra, este método espera unos segundos y lanza el trailing stop en un hilo separado.
     """
-    if order:
-        logging.info(f"Iniciando procesamiento de la orden para {symbol}.")
-        purchase_price = order['price']
-        amount = order['filled']
-        
-        if purchase_price is None or amount <= 0:
-            logging.error(f"Datos insuficientes en la orden para {symbol}. Precio: {purchase_price}, Cantidad: {amount}")
-            send_telegram_message(f"❌ *Error al procesar la orden de compra* `{symbol}`\nDetalles: Datos insuficientes.")
+    if order_details:
+        purchase_price = order_details.get('price')
+        amount = order_details.get('filled')
+        if purchase_price is None or amount is None or float(amount) <= 0:
+            logging.error(f"Datos insuficientes para configurar el trailing stop en {symbol}.")
+            send_telegram_message(f"❌ *Error*: Datos insuficientes para trailing stop en `{symbol}`.")
             return
-        
-        # Pausa para permitir la actualización del balance
-        logging.info(f"Pausando por 5 segundos para permitir la actualización del balance.")
-        time.sleep(5)  # Pausa de 5 segundos
-        
-        # Verificar el balance disponible
-        asset = symbol.split('/')[0]
-        logging.info(f"Verificando el balance disponible para {asset}.")
-        balance = exchange_instance.fetch_balance()
-        available_amount = balance['free'].get(asset, 0)
-        logging.info(f"Balance disponible para {asset}: {available_amount}")
-        
-        # Ajustar la cantidad a manejar
-        manage_amount = min(amount, available_amount)
-        if manage_amount < amount:
-            logging.warning(f"Saldo insuficiente para manejar la cantidad completa de {symbol}. Manejar {manage_amount} en lugar de {amount}.")
-            send_telegram_message(f"⚠️ *Aviso de Saldo Insuficiente*\nSímbolo: `{symbol}`\nCantidad manejada: `{manage_amount}` en lugar de `{amount}`.")
-        
-        # Configurar trailing stop con precio objetivo de 3x y promedio de 1.5x
-        logging.info(f"Configurando trailing stop para {symbol} con objetivo de 3x y promedio de 1.5x.")
-        threading.Thread(target=set_trailing_stop, args=(symbol, manage_amount, purchase_price, 5, exchange_instance), daemon=True).start()
+        # Pequeña pausa para que se actualicen balances, etc.
+        time.sleep(5)
+        threading.Thread(target=set_trailing_stop, args=(symbol, amount, purchase_price, 5), daemon=True).start()
 
-def verify_symbol_matching(previous_symbols, current_symbols):
+def wait_for_next_hour():
     """
-    Verifica si la diferencia entre previous_symbols y current_symbols es coherente.
+    Calcula y espera el tiempo restante hasta 5 segundos después de la siguiente hora en punto.
     """
-    added_symbols = current_symbols - previous_symbols
-    removed_symbols = previous_symbols - current_symbols
-
-    if added_symbols:
-        logging.info(f"Símbolos añadidos: {len(added_symbols)}")
-        logging.debug(f"Símbolos añadidos: {added_symbols}")
-    if removed_symbols:
-        logging.info(f"Símbolos eliminados: {len(removed_symbols)}")
-        logging.debug(f"Símbolos eliminados: {removed_symbols}")
+    now = datetime.now()
+    # Se configura la siguiente verificación a la hora en punto más 5 segundos
+    next_hour = now.replace(minute=0, second=5, microsecond=0) + timedelta(hours=1)
+    wait_time = (next_hour - now).total_seconds()
+    logging.info(f"Esperando {wait_time:.2f} segundos hasta la siguiente verificación...")
+    time.sleep(wait_time)
 
 def main():
     initialize_db()
-    logging.info("Iniciando bot de trading.")
-
-    # Cargar la lista inicial de símbolos (forzando la actualización de los mercados)
+    logging.info("Iniciando bot de trading de nuevas monedas.")
     previous_symbols = set(fetch_current_symbols())
     logging.info(f"Símbolos iniciales cargados: {len(previous_symbols)}")
-    logging.info("Se queda en loop hasta que encuentre nuevas monedas")
-
+    
     while True:
         try:
-            # Forzar la actualización de la lista de símbolos en cada iteración
+            # Espera hasta 5 segundos después de la hora en punto
+            wait_for_next_hour()
+
             current_symbols = set(fetch_current_symbols())
-            last_symbol = list(current_symbols)[-1] if current_symbols else None  # Manejar caso vacío
-            if last_symbol:
-                logging.info(f"Última moneda detectada: {last_symbol}")
-            
-            # Verificar las diferencias entre la lista previa y la actual
-            verify_symbol_matching(previous_symbols, current_symbols)
-            
-            # Identificar nuevas monedas
             new_symbols = get_new_symbols(previous_symbols, current_symbols)
-            logging.info(f"Cantidad de símbolos anteriores: {len(previous_symbols)}")
-            logging.info(f"Cantidad de símbolos actuales: {len(current_symbols)}")
-            logging.info(f"Nuevas monedas detectadas: {len(new_symbols)}")
+
             if new_symbols:
-                logging.info(f"Lista completa de nuevas monedas: {new_symbols}")
+                logging.info(f"Nuevas monedas detectadas: {new_symbols}")
+                for symbol in new_symbols:
+                    send_telegram_message(f"🚀 *Nueva moneda detectada*: `{symbol}`")
+                    order_details = buy_symbol(symbol)
+                    if order_details:
+                        process_order(symbol, order_details)
             else:
                 logging.info("No se detectaron nuevas monedas en esta iteración.")
-            
-            for symbol in new_symbols:
-                logging.info(f"Nueva moneda detectada: {symbol}")
-                send_telegram_message(f"🚀 *Nueva moneda detectada*: `{symbol}`")
-                
-                current_price = fetch_price(symbol, exchange)
-                if current_price is None:
-                    logging.error(f"No se pudo obtener el precio actual para {symbol}.")
-                    continue
-                send_telegram_message(f"🚀 *Precio actual*: `{current_price} USDT`")
-                
-                order = buy_symbol(symbol, exchange_instance=exchange)
-                if order:
-                    process_order(order, symbol, exchange)
 
-            # Actualizar la lista de símbolos previos para la siguiente iteración
+            # Actualiza la lista de símbolos para la siguiente iteración
             previous_symbols = current_symbols
-
-            # Esperar antes de la siguiente verificación (por ejemplo, 60 segundos)
-            time.sleep(30)
-        except KeyboardInterrupt:
-            logging.info("Bot de trading detenido manualmente.")
-            break
         except Exception as e:
             logging.error(f"Error en el loop principal: {e}")
-            time.sleep(30)  # Esperar antes de reintentar
+            time.sleep(30)  # Espera antes de reintentar
 
 if __name__ == "__main__":
     main()
