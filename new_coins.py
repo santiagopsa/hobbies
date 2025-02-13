@@ -312,7 +312,7 @@ def wait_for_next_hour_polling():
     de modo que la respuesta HTTP (que tarda aproximadamente 1 s)
     se reciba lo más cerca posible de la hora exacta.
     """
-    http_latency_estimate = 1  # Tiempo estimado en segundos que tarda la llamada HTTP
+    http_latency_estimate = 0.5  # Tiempo estimado en segundos que tarda la llamada HTTP
     now = datetime.now()
     # Calcula el inicio de la siguiente hora
     next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
