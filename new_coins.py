@@ -305,18 +305,30 @@ def process_order(symbol, order_details):
 
 def wait_for_next_hour_polling():
     """
-    Duerme hasta 0.5 segundos antes de la siguiente hora y hace polling de alta frecuencia
-    (cada 10 ms) hasta 1 segundo después del cambio de hora.
-    Esto permite detectar nuevas monedas en el primer segundo.
+    Espera de forma eficiente hasta un instante antes de la hora exacta,
+    tomando en cuenta un tiempo estimado de latencia HTTP (por ejemplo, 1 segundo).
+
+    Esto permite iniciar la adquisición de datos justo antes de la hora,
+    de modo que la respuesta HTTP (que tarda aproximadamente 1 s)
+    se reciba lo más cerca posible de la hora exacta.
     """
+    http_latency_estimate = 1  # Tiempo estimado en segundos que tarda la llamada HTTP
     now = datetime.now()
+    # Calcula el inicio de la siguiente hora
     next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    target_time = next_hour + timedelta(seconds=1)  # Polling hasta 1 segundo después
-    sleep_time = (next_hour - timedelta(seconds=0.5) - now).total_seconds()
+    # Define el instante objetivo para finalizar el polling: 1 segundo antes de next_hour
+    target_time = next_hour - timedelta(seconds=http_latency_estimate)
+
+    # Dormir hasta 0.2 segundos antes del target para luego hacer polling fino
+    sleep_until = target_time - timedelta(seconds=0.2)
+    sleep_time = (sleep_until - datetime.now()).total_seconds()
     if sleep_time > 0:
         time.sleep(sleep_time)
+    
+    # Polling de alta frecuencia hasta alcanzar target_time
     while datetime.now() < target_time:
-        time.sleep(0.01)
+        time.sleep(0.005)
+
 
 def execute_trade(symbol):
     """
