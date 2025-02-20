@@ -167,36 +167,63 @@ def fetch_price(symbol):
         logging.error(f"Error al obtener el precio para {symbol}: {e}")
         return None
 
-def buy_symbol(symbol):
+import time
+import logging
+
+def buy_symbol_fast(symbol):
     """
-    Antes de comprar, se fuerza la actualización de mercados si el símbolo no está presente.
+    Intenta comprar la moneda en el instante exacto en que esté disponible en Binance.
+    Reintenta enviar la orden cada 50ms hasta que Binance acepte el símbolo.
     """
-    if symbol not in exchange.markets:
-        logging.info(f"Símbolo {symbol} no encontrado en exchange.markets. Actualizando mercados...")
-        exchange.load_markets()
-    if get_daily_purchases() >= MAX_DAILY_PURCHASES:
-        logging.info(f"⚠️ Límite de compras diarias alcanzado ({MAX_DAILY_PURCHASES}/día).")
-        send_telegram_message(f"⚠️ *Límite de compras alcanzado*: No se comprará `{symbol}` hoy.")
-        return None
-    try:
-        ticker = exchange.fetch_ticker(symbol)
-        price = ticker['last']
-        budget = 5  # USDT a invertir
-        amount = budget / price
-        amount = exchange.amount_to_precision(symbol, amount)
-        order = exchange.create_market_buy_order(symbol, amount)
-        order_price = order.get('average', order.get('price', None))
-        filled = order.get('filled', 0)
-        ts = datetime.now(timezone.utc).isoformat()
-        insert_transaction(symbol, 'buy', order_price, filled, ts)
-        increment_daily_purchases()
-        logging.info(f"✅ Compra realizada: {symbol} a {order_price} USDT, cantidad: {filled}")
-        send_telegram_message(f"✅ *Compra realizada*\nSímbolo: `{symbol}`\nPrecio: `{order_price} USDT`\nCantidad: `{filled}`")
-        return {'price': order_price, 'filled': filled}
-    except Exception as e:
-        logging.error(f"Error al comprar {symbol}: {e}")
-        send_telegram_message(f"❌ *Error al comprar* `{symbol}`\nDetalles: {e}")
-        return None
+    max_attempts = 50  # Número máximo de intentos (ajusta según pruebas)
+    retry_delay = 0.05  # 50ms entre intentos
+
+    logging.info(f"🚀 Intentando comprar {symbol} en cuanto esté disponible...")
+
+    for attempt in range(max_attempts):
+        exchange.load_markets()  # Recargar mercados para detectar cuándo se habilita el símbolo
+        if symbol in exchange.markets:  # Verificar si la moneda ya está en Binance
+            logging.info(f"✅ {symbol} encontrado en Binance en intento {attempt+1}. Ejecutando compra...")
+
+            # Obtener el precio actual
+            price = fetch_price(symbol)
+            if price is None:
+                logging.error(f"⚠️ No se pudo obtener el precio de {symbol}.")
+                return None
+
+            price_limit = round(price * 1.02, 6)  # Precio límite 2% por encima del detectado
+            budget = 5  # USDT a invertir
+            amount = budget / price_limit
+            amount = exchange.amount_to_precision(symbol, amount)
+
+            # Crear orden límite con IOC
+            order = exchange.create_order(
+                symbol=symbol,
+                type="limit",
+                side="buy",
+                amount=amount,
+                price=price_limit,
+                params={"timeInForce": "IOC"}
+            )
+
+            order_price = order.get('price')
+            filled = order.get('filled', 0)
+            timestamp = datetime.now(timezone.utc).isoformat()
+            insert_transaction(symbol, 'buy', order_price, filled, timestamp)
+
+            logging.info(f"✅ Orden ejecutada: {symbol} a {order_price} USDT, cantidad: {filled}")
+            send_telegram_message(f"✅ *Orden de compra ejecutada*\nSímbolo: `{symbol}`\nPrecio: `{order_price} USDT`\nCantidad: `{filled}`")
+            return {'price': order_price, 'filled': filled}
+
+        else:
+            logging.info(f"⏳ {symbol} aún no está disponible. Intento {attempt+1}/{max_attempts}...")
+            time.sleep(retry_delay)  # Esperar 50ms antes de reintentar
+
+    logging.error(f"❌ {symbol} no estuvo disponible después de {max_attempts} intentos.")
+    send_telegram_message(f"❌ *Error*: `{symbol}` no estuvo disponible después de varios intentos.")
+    return None
+
+
 
 def sell_symbol(symbol, amount):
     """
@@ -341,7 +368,7 @@ def start_ws_thread():
 # --- Función para ejecutar la compra y trailing stop ---
 def execute_trade(symbol):
     send_telegram_message(f"🚀 *Nueva moneda detectada*: `{symbol}`")
-    order_details = buy_symbol(symbol)
+    order_details = buy_symbol_fast(symbol)
     if order_details:
         process_order(symbol, order_details)
 
