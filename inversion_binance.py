@@ -5,7 +5,6 @@ import sqlite3
 import os
 import time
 import requests
-import json
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
@@ -74,6 +73,9 @@ def fetch_and_prepare_data(symbol):
         data = {}
         for tf in timeframes:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=50)
+            if not ohlcv:
+                logging.warning(f"No se obtuvieron datos OHLCV para {symbol} en {tf}")
+                return None, None, None
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
@@ -83,7 +85,12 @@ def fetch_and_prepare_data(symbol):
             df['BB_upper'] = bb.bollinger_hband()
             df['BB_lower'] = bb.bollinger_lband()
             data[tf] = df
-        return data, data['1h']['volume'], data['1h']['close']
+        volume_series = data['1h']['volume']
+        price_series = data['1h']['close']
+        if volume_series.empty or price_series.empty:
+            logging.warning(f"Datos vacíos para {symbol}: volumen o precios no disponibles")
+            return None, None, None
+        return data, volume_series, price_series
     except Exception as e:
         logging.error(f"Error al obtener datos de {symbol}: {e}")
         return None, None, None
@@ -115,6 +122,8 @@ def detect_momentum_divergences(price_series, rsi_series):
         return "none"
 
 def get_bb_position(price, bb_upper, bb_lower):
+    if price is None or bb_upper is None or bb_lower is None:
+        return "unknown"
     if price > bb_upper:
         return "above_upper"
     elif price < bb_lower:
@@ -132,11 +141,11 @@ def gpt_prepare_data(data_by_timeframe, additional_data):
     Analiza los siguientes datos y decide si comprar esta criptomoneda:
     {combined_data}
     Indicadores adicionales:
-    - RSI: {additional_data['rsi']}
-    - ADX: {additional_data['adx']}
-    - Divergencias: {additional_data['momentum_divergences']}
-    - Volumen relativo: {additional_data['relative_volume']}
-    - Precio actual: {additional_data['current_price']}
+    - RSI: {additional_data.get('rsi', 'No disponible')}
+    - ADX: {additional_data.get('adx', 'No disponible')}
+    - Divergencias: {additional_data.get('momentum_divergences', 'No disponible')}
+    - Volumen relativo: {additional_data.get('relative_volume', 'No disponible')}
+    - Precio actual: {additional_data.get('current_price', 'No disponible')}
     """
     return prompt
 
@@ -144,7 +153,10 @@ def gpt_decision_buy(prepared_text):
     prompt = f"""
     Eres un experto en trading de criptomonedas. Basándote en los datos:
     {prepared_text}
-    Decide si "comprar" o "mantener". Responde en JSON con "accion", "confianza" (0-100), y "explicacion".
+    Decide si "comprar" o "mantener". Responde en texto plano con tres líneas separadas:
+    Acción: [comprar o mantener]
+    Confianza: [número entre 0 y 100]
+    Explicación: [una breve justificación]
     Criterios:
     - Comprar si hay señales de crecimiento (RSI < 70, ADX > 25, volumen creciendo, divergencias alcistas).
     - Mantener si hay sobrecompra (RSI > 70) o señales débiles.
@@ -155,13 +167,24 @@ def gpt_decision_buy(prepared_text):
             messages=[{"role": "user", "content": prompt}],
             temperature=0
         )
-        decision = json.loads(response.choices[0].message.content.strip())
-        return (decision.get("accion", "mantener"), 
-                decision.get("confianza", 50), 
-                decision.get("explicacion", "Decisión por defecto"))
+        lines = response.choices[0].message.content.strip().split('\n')
+        if len(lines) != 3:
+            logging.error(f"Respuesta de GPT mal formada: {lines}")
+            return "mantener", 50, "Respuesta inválida de GPT"
+        
+        accion_line = lines[0].split(": ")[1].strip().lower()
+        confianza = int(lines[1].split(": ")[1].strip())
+        explicacion = lines[2].split(": ")[1].strip()
+
+        if accion_line not in ["comprar", "mantener"]:
+            accion_line = "mantener"
+        if not (0 <= confianza <= 100):
+            confianza = 50
+
+        return accion_line, confianza, explicacion
     except Exception as e:
         logging.error(f"Error en GPT: {e}")
-        return "mantener", 50, "Error en GPT"
+        return "mantener", 50, "Error al procesar respuesta de GPT"
 
 # Lógica de Trading
 def get_daily_buys():
@@ -177,6 +200,9 @@ def execute_order_buy(symbol, amount, indicators, confidence):
     try:
         order = exchange.create_market_buy_order(symbol, amount)
         price = order.get("price", fetch_price(symbol))
+        if price is None:
+            logging.error(f"No se pudo obtener precio para {symbol} después de la orden")
+            return None
         timestamp = datetime.now(timezone.utc).isoformat()
         trade_id = f"{symbol}_{timestamp.replace(':', '-')}"
         
@@ -187,12 +213,12 @@ def execute_order_buy(symbol, amount, indicators, confidence):
             amount=amount, 
             timestamp=timestamp, 
             trade_id=trade_id,
-            rsi=indicators['rsi'],
-            adx=indicators['adx'],
-            atr=indicators['atr'],
-            relative_volume=indicators['relative_volume'],
-            divergence=indicators['divergence'],
-            bb_position=indicators['bb_position'],
+            rsi=indicators.get('rsi'),
+            adx=indicators.get('adx'),
+            atr=indicators.get('atr'),
+            relative_volume=indicators.get('relative_volume'),
+            divergence=indicators.get('divergence'),
+            bb_position=indicators.get('bb_position'),
             confidence=confidence
         )
         logging.info(f"Compra ejecutada: {symbol} a {price} por {amount} (ID: {trade_id})")
@@ -204,6 +230,15 @@ def execute_order_buy(symbol, amount, indicators, confidence):
 def sell_symbol(symbol, amount, trade_id):
     try:
         data, volume_series, price_series = fetch_and_prepare_data(symbol)
+        if data is None:
+            logging.error(f"No se pudieron obtener datos para vender {symbol}")
+            price = fetch_price(symbol)
+            timestamp = datetime.now(timezone.utc).isoformat()
+            order = exchange.create_market_sell_order(symbol, amount)
+            sell_price = order.get("price", price)
+            insert_transaction(symbol=symbol, action="sell", price=sell_price, amount=amount, timestamp=timestamp, trade_id=trade_id)
+            return
+        
         price = fetch_price(symbol)
         timestamp = datetime.now(timezone.utc).isoformat()
         rsi = data['1h']['RSI'].iloc[-1] if not pd.isna(data['1h']['RSI'].iloc[-1]) else None
@@ -232,8 +267,13 @@ def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id):
     def trailing_logic():
         try:
             data, _, price_series = fetch_and_prepare_data(symbol)
-            atr = data['1h']['ATR'].iloc[-1]
-            volatility = atr / purchase_price * 100
+            if data is None:
+                logging.error(f"No se pudieron obtener datos iniciales para trailing stop de {symbol}")
+                sell_symbol(symbol, amount, trade_id)
+                return
+            
+            atr = data['1h']['ATR'].iloc[-1] if not pd.isna(data['1h']['ATR'].iloc[-1]) else 0
+            volatility = atr / purchase_price * 100 if purchase_price else 0
             trailing_percent = max(2, min(5, volatility * 1.5))
             stop_loss_percent = trailing_percent * 0.5
             highest_price = purchase_price
@@ -246,6 +286,7 @@ def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id):
                 current_price = fetch_price(symbol)
                 current_data, _, _ = fetch_and_prepare_data(symbol)
                 if not current_price or not current_data:
+                    logging.warning(f"Datos no disponibles para {symbol}, reintentando en 5s")
                     time.sleep(5)
                     continue
 
@@ -313,11 +354,11 @@ def generate_profit_loss_table():
             sell_price = sell_data["price"]
             amount = min(buy_data["amount"], sell_data["amount"])
             profit_loss = (sell_price - buy_price) * amount
-            profit_percent = (sell_price - buy_price) / buy_price * 100
+            profit_percent = (sell_price - buy_price) / buy_price * 100 if buy_price else 0
             buy_time = pd.to_datetime(buy_data["timestamp"])
             sell_time = pd.to_datetime(sell_data["timestamp"])
             trade_duration = (sell_time - buy_time).total_seconds() / 60
-            trailing_percent = max(2, min(5, (buy_data["atr"] / buy_price * 100) * 1.5))
+            trailing_percent = max(2, min(5, (buy_data["atr"] / buy_price * 100) * 1.5)) if buy_data["atr"] and buy_price else 3
 
             completed_trades.append({
                 "trade_id": trade_id,
@@ -383,22 +424,28 @@ def demo_trading():
 
     for symbol in selected_cryptos:
         data, volume_series, price_series = fetch_and_prepare_data(symbol)
-        if not data:
+        if not data or volume_series is None or price_series is None:
+            logging.warning(f"Se omite {symbol} por datos insuficientes")
             continue
+        
         current_price = fetch_price(symbol)
-        rsi = data['1h']['RSI'].iloc[-1]
+        if current_price is None:
+            logging.warning(f"No se pudo obtener precio para {symbol}")
+            continue
+        
+        rsi = data['1h']['RSI'].iloc[-1] if not pd.isna(data['1h']['RSI'].iloc[-1]) else None
         adx = calculate_adx(data['1h'])
-        atr = data['1h']['ATR'].iloc[-1]
-        relative_volume = volume_series.iloc[-1] / volume_series.mean()
+        atr = data['1h']['ATR'].iloc[-1] if not pd.isna(data['1h']['ATR'].iloc[-1]) else None
+        relative_volume = volume_series.iloc[-1] / volume_series.mean() if volume_series.mean() != 0 else None
         divergence = detect_momentum_divergences(price_series, data['1h']['RSI'])
         bb_position = get_bb_position(current_price, data['1h']['BB_upper'].iloc[-1], data['1h']['BB_lower'].iloc[-1])
         
         additional_data = {
             "current_price": current_price,
-            "rsi": rsi,
-            "adx": adx,
-            "atr": atr,
-            "relative_volume": relative_volume,
+            "rsi": rsi if rsi is not None else "No disponible",
+            "adx": adx if adx is not None else "No disponible",
+            "atr": atr if atr is not None else "No disponible",
+            "relative_volume": relative_volume if relative_volume is not None else "No disponible",
             "momentum_divergences": divergence
         }
         indicators = {
@@ -423,8 +470,12 @@ def demo_trading():
 
     for i in range(buys_to_execute):
         symbol, confidence, explanation, indicators = candidates[i]
-        amount = budget_per_trade / fetch_price(symbol)
-        if amount * fetch_price(symbol) >= MIN_NOTIONAL:
+        current_price = fetch_price(symbol)
+        if current_price is None:
+            logging.warning(f"No se pudo obtener precio actual para {symbol}, omitiendo compra")
+            continue
+        amount = budget_per_trade / current_price
+        if amount * current_price >= MIN_NOTIONAL:
             order = execute_order_buy(symbol, amount, indicators, confidence)
             if order:
                 logging.info(f"Compra ejecutada para {symbol}: {explanation}")
