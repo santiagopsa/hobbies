@@ -5,6 +5,7 @@ import sqlite3
 import os
 import time
 import requests
+import json
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
@@ -42,6 +43,9 @@ logging.basicConfig(
 # Constantes
 MAX_DAILY_BUYS = 5
 MIN_NOTIONAL = 10
+RSI_THRESHOLD = 70
+ADX_THRESHOLD = 25
+VOLUME_GROWTH_THRESHOLD = 1.0
 
 # Funciones Utilitarias
 def send_telegram_message(message):
@@ -153,38 +157,44 @@ def gpt_decision_buy(prepared_text):
     prompt = f"""
     Eres un experto en trading de criptomonedas. Basándote en los datos:
     {prepared_text}
-    Decide si "comprar" o "mantener". Responde en texto plano con tres líneas separadas:
-    Acción: [comprar o mantener]
-    Confianza: [número entre 0 y 100]
-    Explicación: [una breve justificación]
+    Decide si "comprar" o "mantener". Responde SOLO con un JSON válido como este:
+    {{"accion": "comprar", "confianza": 85, "explicacion": "RSI bajo y volumen creciendo"}}
+    No incluyas texto adicional fuera del JSON, ni etiquetas como ```json```.
     Criterios:
     - Comprar si hay señales de crecimiento (RSI < 70, ADX > 25, volumen creciendo, divergencias alcistas).
     - Mantener si hay sobrecompra (RSI > 70) o señales débiles.
     """
-    try:
-        response = client.chat.completions.create(
-            model=GPT_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-        lines = response.choices[0].message.content.strip().split('\n')
-        if len(lines) != 3:
-            logging.error(f"Respuesta de GPT mal formada: {lines}")
-            return "mantener", 50, "Respuesta inválida de GPT"
-        
-        accion_line = lines[0].split(": ")[1].strip().lower()
-        confianza = int(lines[1].split(": ")[1].strip())
-        explicacion = lines[2].split(": ")[1].strip()
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model=GPT_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0
+            )
+            raw_response = response.choices[0].message.content.strip()
+            decision = json.loads(raw_response)
+            
+            accion = decision.get("accion", "mantener").lower()
+            confianza = decision.get("confianza", 50)
+            explicacion = decision.get("explicacion", "Respuesta incompleta")
 
-        if accion_line not in ["comprar", "mantener"]:
-            accion_line = "mantener"
-        if not (0 <= confianza <= 100):
-            confianza = 50
+            if accion not in ["comprar", "mantener"]:
+                accion = "mantener"
+            if not isinstance(confianza, (int, float)) or not 0 <= confianza <= 100:
+                confianza = 50
+                explicacion = "Confianza inválida, ajustada a 50"
 
-        return accion_line, confianza, explicacion
-    except Exception as e:
-        logging.error(f"Error en GPT: {e}")
-        return "mantener", 50, "Error al procesar respuesta de GPT"
+            return accion, confianza, explicacion
+        except json.JSONDecodeError as e:
+            logging.error(f"Intento {attempt + 1} fallido: Respuesta de GPT no es JSON válido - {raw_response}")
+            if attempt == max_retries:
+                return "mantener", 50, f"Error en formato JSON tras {max_retries + 1} intentos"
+        except Exception as e:
+            logging.error(f"Error en GPT (intento {attempt + 1}): {e}")
+            if attempt == max_retries:
+                return "mantener", 50, "Error al procesar respuesta de GPT"
+        time.sleep(1)
 
 # Lógica de Trading
 def get_daily_buys():
@@ -456,6 +466,14 @@ def demo_trading():
             "divergence": divergence,
             "bb_position": bb_position
         }
+        
+        # Filtro cuantitativo previo al LLM
+        if (rsi is not None and rsi >= RSI_THRESHOLD) or \
+           (adx is not None and adx < ADX_THRESHOLD) or \
+           (relative_volume is not None and relative_volume < VOLUME_GROWTH_THRESHOLD):
+            logging.info(f"Se omite {symbol} por no cumplir filtros cuantitativos: RSI={rsi}, ADX={adx}, Volumen Relativo={relative_volume}")
+            continue
+        
         data_by_symbol[symbol] = (data, additional_data, indicators)
 
     candidates = []
