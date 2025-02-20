@@ -4,7 +4,7 @@ import ccxt
 import os
 import requests
 import numpy as np
-from inversion_binance import demo_trading
+from inversion_binance import demo_trading, choose_best_cryptos
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,14 +19,15 @@ exchange = ccxt.binance({
 # Constantes
 MONITOR_INTERVAL = 300  # 5 minutos
 EXECUTION_INTERVAL = 14400  # 4 horas
-THRESHOLD_VOLUME_CHANGE = 0.3  # 30% (más estricto para reducir falsos positivos)
+THRESHOLD_VOLUME_CHANGE = 0.3  # 30%
 THRESHOLD_PRICE_CHANGE = 0.05  # 5%
 THRESHOLD_ATR = 0.02  # 2% de volatilidad
 THRESHOLD_RSI_OVERBOUGHT = 70
 THRESHOLD_RSI_OVERSOLD = 30
+SYMBOLS_TO_MONITOR = 100  # Número de símbolos de alto volumen a monitorear
 
 # Variables globales
-last_conditions = {}  # Almacena condiciones previas por símbolo
+last_conditions = {}
 next_execution_time = time.time() + EXECUTION_INTERVAL
 
 def fetch_klines(symbol, interval="1h", limit=15):
@@ -78,7 +79,7 @@ def calculate_atr(symbol, period=14):
             tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
             true_ranges.append(tr)
         atr = np.mean(true_ranges)
-        return atr / float(klines[-1][4])  # Como porcentaje del precio actual
+        return atr / float(klines[-1][4])
     except Exception as e:
         print(f"Error calculating ATR for {symbol}: {e}")
         return None
@@ -108,13 +109,11 @@ def fetch_portfolio_symbols():
         return []
 
 def should_execute_trading(symbol):
-    """Evalúa si las condiciones justifican ejecutar demo_trading."""
     global last_conditions
     
     if symbol not in last_conditions:
         last_conditions[symbol] = {"price": None, "volume": None, "rsi": None}
 
-    # Obtener datos actuales
     current_price = fetch_price(symbol)
     current_volume = fetch_volume(symbol)
     klines = fetch_klines(symbol)
@@ -127,31 +126,22 @@ def should_execute_trading(symbol):
     if rsi is None or atr is None:
         return False
 
-    # Condiciones para ejecutar trading
     execute = False
     last = last_conditions[symbol]
 
-    # 1. RSI extremo
     if rsi > THRESHOLD_RSI_OVERBOUGHT or rsi < THRESHOLD_RSI_OVERSOLD:
         print(f"⚠️ RSI extremo para {symbol}: {rsi}")
         execute = True
-
-    # 2. Cambio significativo en precio
     if last["price"] and abs((current_price - last["price"]) / last["price"]) > THRESHOLD_PRICE_CHANGE:
         print(f"⚠️ Cambio significativo en precio para {symbol}: {current_price} vs {last['price']}")
         execute = True
-
-    # 3. Cambio significativo en volumen
     if last["volume"] and abs((current_volume - last["volume"]) / last["volume"]) > THRESHOLD_VOLUME_CHANGE:
         print(f"⚠️ Cambio significativo en volumen para {symbol}: {current_volume} vs {last['volume']}")
         execute = True
-
-    # 4. Alta volatilidad (ATR)
     if atr > THRESHOLD_ATR:
         print(f"⚠️ Alta volatilidad para {symbol}: ATR {atr*100:.2f}%")
         execute = True
 
-    # Actualizar condiciones
     last_conditions[symbol] = {"price": current_price, "volume": current_volume, "rsi": rsi}
     return execute
 
@@ -164,19 +154,18 @@ def run_trading():
         print(f"❌ Error al ejecutar demo_trading: {e}")
 
 def main_loop():
-    """Bucle principal optimizado para minimizar costos de GPT y capturar trades."""
     global next_execution_time
     
-    base_symbols = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "ADA/USDT"]
     print("🚀 Ejecución inicial al iniciar el programa.")
     run_trading()
 
     while True:
         current_time = time.time()
         portfolio_symbols = fetch_portfolio_symbols()
-        symbols = list(set(base_symbols + portfolio_symbols))
+        high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=SYMBOLS_TO_MONITOR)
+        symbols = list(set(portfolio_symbols + high_volume_symbols))  # Combinar y eliminar duplicados
         
-        print(f"🔍 Monitoreando {len(symbols)} símbolos a las {datetime.datetime.now()}")
+        print(f"🔍 Monitoreando {len(symbols)} símbolos: {symbols} a las {datetime.datetime.now()}")
         execute_now = False
         
         for symbol in symbols:
