@@ -472,7 +472,7 @@ def demo_trading():
         return
 
     budget_per_trade = available_for_trading / (MAX_DAILY_BUYS - daily_buys)
-    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=24)
+    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=100)
     data_by_symbol = {}
 
     # Obtener el saldo actual para verificar posiciones abiertas

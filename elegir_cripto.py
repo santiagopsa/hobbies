@@ -2,7 +2,6 @@ import ccxt
 import pandas as pd
 import numpy as np
 import time
-from ta.trend import ADXIndicator
 from ta.momentum import RSIIndicator
 from dotenv import load_dotenv
 import os
@@ -23,14 +22,14 @@ exchange = ccxt.binance({
     'options': {'defaultType': 'spot'}
 })
 
-def fetch_ohlcv_safe(symbol, timeframe='1h', limit=48):
+def fetch_ohlcv_safe(symbol, timeframe='1h', limit=24):
     """
     Obtiene datos OHLCV de manera segura para un símbolo.
     
     Args:
         symbol (str): Símbolo del par (e.g., "BTC/USDT").
         timeframe (str): Marco temporal (default: '1h').
-        limit (int): Número de velas (default: 48 horas).
+        limit (int): Número de velas (default: 24 horas).
     
     Returns:
         pd.DataFrame: Datos OHLCV o None si falla.
@@ -39,20 +38,21 @@ def fetch_ohlcv_safe(symbol, timeframe='1h', limit=48):
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        if len(df) < limit:
-            logging.warning(f"Datos incompletos para {symbol}: solo {len(df)} velas")
+        if len(df) < 14:  # Mínimo para RSI
+            logging.warning(f"Datos insuficientes para {symbol}: solo {len(df)} velas")
+            return None
         return df
     except Exception as e:
         logging.error(f"Error al obtener datos OHLCV para {symbol}: {e}")
         return None
 
-def get_top_symbols_by_volume(base_currency="USDT", min_volume=50000):
+def get_top_symbols_by_volume(base_currency="USDT", min_volume=10000):
     """
     Obtiene pares de trading con volumen significativo.
     
     Args:
         base_currency (str): Moneda base (e.g., "USDT").
-        min_volume (float): Volumen mínimo en USD (ajustado a 50,000).
+        min_volume (float): Volumen mínimo en USD (ajustado a 10,000).
     
     Returns:
         list: Lista de símbolos filtrados.
@@ -81,8 +81,7 @@ def get_top_symbols_by_volume(base_currency="USDT", min_volume=50000):
 
 def choose_best_cryptos(base_currency="USDT", top_n=200):
     """
-    Selecciona las mejores criptomonedas para invertir basadas en volumen, volatilidad,
-    tendencia y momentum.
+    Selecciona las mejores criptomonedas para invertir basadas en volumen y viabilidad básica.
     
     Args:
         base_currency (str): Moneda base (e.g., "USDT").
@@ -91,53 +90,61 @@ def choose_best_cryptos(base_currency="USDT", top_n=200):
     Returns:
         list: Lista de símbolos seleccionados.
     """
-    symbols = get_top_symbols_by_volume(base_currency, min_volume=50000)
+    symbols = get_top_symbols_by_volume(base_currency, min_volume=10000)
     if not symbols:
         logging.error("No se encontraron símbolos válidos.")
         return []
 
     crypto_data = []
     max_symbols_to_analyze = min(600, len(symbols))
+    processed_count = 0
+    discarded_by_data = 0
+    discarded_by_rsi = 0
 
     logging.info(f"Analizando hasta {max_symbols_to_analyze} de {len(symbols)} símbolos disponibles")
     for symbol in symbols[:max_symbols_to_analyze]:
-        df = fetch_ohlcv_safe(symbol, timeframe='1h', limit=48)
-        if df is None or df.empty or len(df) < 48:
+        df = fetch_ohlcv_safe(symbol, timeframe='1h', limit=24)
+        if df is None or df.empty:
+            discarded_by_data += 1
             continue
 
         volatility = ((df['high'] - df['low']) / df['close']).mean() * 100
         avg_volume = (df['volume'] * df['close']).mean()
-        adx = ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
-        adx_value = adx.iloc[-1] if not pd.isna(adx.iloc[-1]) else 0
-        price_change_6h = (df['close'].iloc[-1] - df['close'].iloc[-7]) / df['close'].iloc[-7] * 100
         rsi = RSIIndicator(df['close'], window=14).rsi()
         rsi_value = rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50
 
-        if (adx_value > 20 and volatility > 0.5 and rsi_value < 70 and price_change_6h > -2):
-            score = (avg_volume * volatility * adx_value * (1 + price_change_6h / 100))
-            crypto_data.append({
-                'symbol': symbol,
-                'volatility': volatility,
-                'avg_volume': avg_volume,
-                'adx': adx_value,
-                'price_change_6h': price_change_6h,
-                'rsi': rsi_value,
-                'score': score
-            })
-        else:
-            logging.debug(f"{symbol} descartado - ADX: {adx_value}, Volatility: {volatility}, RSI: {rsi_value}, Price Change 6h: {price_change_6h}")
-        
-        time.sleep(0.05)
+        if rsi_value >= 80:  # Solo descartar sobrecompra extrema
+            discarded_by_rsi += 1
+            logging.debug(f"{symbol} descartado por RSI: {rsi_value}")
+            continue
+
+        # Puntaje simple basado en volumen y volatilidad
+        score = avg_volume * volatility
+        crypto_data.append({
+            'symbol': symbol,
+            'volatility': volatility,
+            'avg_volume': avg_volume,
+            'rsi': rsi_value,
+            'score': score
+        })
+
+        processed_count += 1
+        if processed_count % 50 == 0:
+            logging.info(f"Progreso: {processed_count} procesados, {len(crypto_data)} válidos, "
+                         f"Descartados - Datos: {discarded_by_data}, RSI: {discarded_by_rsi}")
+
+        time.sleep(0.02)
 
     if not crypto_data:
-        logging.error("No se encontraron criptos que cumplan los criterios.")
-        return []
+        logging.error("No se encontraron criptos viables. Devolviendo top por volumen.")
+        return symbols[:top_n]
 
     df = pd.DataFrame(crypto_data)
     df = df.sort_values(by='score', ascending=False)
     selected_symbols = df['symbol'].head(top_n).tolist()
     
     logging.info(f"Símbolos analizados: {len(crypto_data)}, seleccionados: {len(selected_symbols)}")
+    logging.info(f"Descartados totales - Datos: {discarded_by_data}, RSI: {discarded_by_rsi}")
     return selected_symbols
 
 if __name__ == "__main__":
