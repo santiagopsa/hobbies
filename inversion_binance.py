@@ -42,11 +42,12 @@ logging.basicConfig(
 )
 
 # Constantes
-MAX_DAILY_BUYS = 10
+MAX_DAILY_BUYS = 5
 MIN_NOTIONAL = 10
-RSI_THRESHOLD = 60  # Umbral ajustado para ser más estricto
-ADX_THRESHOLD = 30  # Umbral ajustado para mayor tendencia
-VOLUME_GROWTH_THRESHOLD = 1.5  # Crecimiento de volumen ajustado
+RSI_THRESHOLD = 60  # Umbral ajustado
+ADX_THRESHOLD = 35  # Umbral más estricto para tendencias fuertes
+VOLUME_GROWTH_THRESHOLD = 1.5
+MIN_DAILY_VOLUME = 1000000  # Volumen mínimo diario en USD
 
 # Cache de decisiones
 decision_cache = {}
@@ -74,6 +75,14 @@ def fetch_price(symbol):
         return ticker['last']
     except Exception as e:
         logging.error(f"Error al obtener precio de {symbol}: {e}")
+        return None
+
+def fetch_volume(symbol):
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+        return ticker['quoteVolume']  # Volumen en moneda base (USDT en este caso)
+    except Exception as e:
+        logging.error(f"Error al obtener volumen de {symbol}: {e}")
         return None
 
 def fetch_and_prepare_data(symbol):
@@ -169,7 +178,7 @@ def gpt_decision_buy(prepared_text):
     {{"accion": "comprar", "confianza": 85, "explicacion": "RSI bajo y volumen creciendo"}}
     No incluyas texto adicional fuera del JSON, ni etiquetas como ```json```.
     Criterios:
-    - Comprar si hay señales de crecimiento (RSI < 60, ADX > 30, volumen creciendo, divergencias alcistas).
+    - Comprar si hay señales de crecimiento (RSI < 60, ADX > 35, volumen creciendo, divergencias alcistas).
     - Mantener si hay sobrecompra (RSI > 70) o señales débiles.
     """
     max_retries = 2
@@ -240,7 +249,7 @@ def execute_order_buy(symbol, amount, indicators, confidence):
             confidence=confidence
         )
         logging.info(f"Compra ejecutada: {symbol} a {price} por {amount} (ID: {trade_id})")
-        return {"price": price, "filled": amount, "trade_id": trade_id}
+        return {"price": price, "filled": amount, "trade_id": trade_id, "indicators": indicators}
     except Exception as e:
         logging.error(f"Error al comprar {symbol}: {e}")
         return None
@@ -281,7 +290,7 @@ def sell_symbol(symbol, amount, trade_id):
     except Exception as e:
         logging.error(f"Error al vender {symbol}: {e}")
 
-def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id):
+def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, entry_indicators):
     def trailing_logic():
         try:
             data, _, price_series = fetch_and_prepare_data(symbol)
@@ -297,8 +306,24 @@ def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id):
             highest_price = purchase_price
             activated = False
 
-            logging.info(f"Trailing stop para {symbol}: {trailing_percent}% (ID: {trade_id})")
-            send_telegram_message(f"🔄 *Trailing Stop Dinámico* para `{symbol}`\nTrailing: `{trailing_percent}%`\nStop Loss: `{stop_loss_percent}%`")
+            # Registrar información detallada al entrar al trailing stop
+            entry_msg = (
+                f"🔄 *Trailing Stop Dinámico Iniciado* para `{symbol}`\n"
+                f"Precio de Compra: `{purchase_price}`\n"
+                f"Cantidad: `{amount}`\n"
+                f"Trailing Percent: `{trailing_percent:.2f}%`\n"
+                f"Stop Loss Inicial: `{stop_loss_percent:.2f}%`\n"
+                f"RSI Inicial: `{entry_indicators.get('rsi', 'N/A')}`\n"
+                f"ADX Inicial: `{entry_indicators.get('adx', 'N/A')}`\n"
+                f"ATR Inicial: `{entry_indicators.get('atr', 'N/A')}`\n"
+                f"Volumen Relativo: `{entry_indicators.get('relative_volume', 'N/A')}`\n"
+                f"Divergencia: `{entry_indicators.get('divergence', 'N/A')}`\n"
+                f"Posición BB: `{entry_indicators.get('bb_position', 'N/A')}`\n"
+                f"MACD: `{entry_indicators.get('macd', 'N/A')}`\n"
+                f"MACD Signal: `{entry_indicators.get('macd_signal', 'N/A')}`"
+            )
+            logging.info(entry_msg)
+            send_telegram_message(entry_msg)
 
             while True:
                 current_price = fetch_price(symbol)
@@ -434,31 +459,29 @@ def get_cached_decision(symbol, current_indicators):
     return None
 
 def demo_trading():
-    # Obtener el saldo disponible en USDT
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
     if usdt_balance < MIN_NOTIONAL:
         logging.warning("Saldo insuficiente en USDT.")
         return
 
-    # Calcular la reserva del 10% del saldo en USDT
-    reserve = 0.30 * usdt_balance
+    reserve = 0.10 * usdt_balance
     available_for_trading = usdt_balance - reserve
 
-    # Verificar el límite diario de compras
     daily_buys = get_daily_buys()
     if daily_buys >= MAX_DAILY_BUYS:
         logging.info("Límite diario de compras alcanzado.")
         return
 
-    # Calcular el presupuesto por operación usando solo el saldo disponible para trading
     budget_per_trade = available_for_trading / (MAX_DAILY_BUYS - daily_buys)
-
-    # Seleccionar las mejores criptomonedas
-    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=150)
+    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=24)
     data_by_symbol = {}
 
-    # Procesar datos e indicadores para cada símbolo
     for symbol in selected_cryptos:
+        daily_volume = fetch_volume(symbol)
+        if daily_volume is None or daily_volume < MIN_DAILY_VOLUME:
+            logging.info(f"Se omite {symbol} por volumen insuficiente: {daily_volume}")
+            continue
+
         data, volume_series, price_series = fetch_and_prepare_data(symbol)
         if not data or volume_series is None or price_series is None:
             logging.warning(f"Se omite {symbol} por datos insuficientes")
@@ -469,7 +492,6 @@ def demo_trading():
             logging.warning(f"No se pudo obtener precio para {symbol}")
             continue
         
-        # Calcular indicadores técnicos
         rsi = data['1h']['RSI'].iloc[-1] if not pd.isna(data['1h']['RSI'].iloc[-1]) else None
         adx = calculate_adx(data['1h'])
         atr = data['1h']['ATR'].iloc[-1] if not pd.isna(data['1h']['ATR'].iloc[-1]) else None
@@ -479,7 +501,6 @@ def demo_trading():
         macd = data['1h']['MACD'].iloc[-1]
         macd_signal = data['1h']['MACD_signal'].iloc[-1]
         
-        # Almacenar datos adicionales e indicadores
         additional_data = {
             "current_price": current_price,
             "rsi": rsi if rsi is not None else "No disponible",
@@ -499,7 +520,6 @@ def demo_trading():
             "macd_signal": macd_signal
         }
         
-        # Filtro cuantitativo previo al LLM
         if (rsi is None or rsi >= RSI_THRESHOLD) or \
            (adx is None or adx < ADX_THRESHOLD) or \
            (relative_volume is None or relative_volume < VOLUME_GROWTH_THRESHOLD) or \
@@ -509,23 +529,19 @@ def demo_trading():
         
         data_by_symbol[symbol] = (data, additional_data, indicators)
 
-    # Seleccionar top 5 candidatos con RSI más bajo
     candidates = sorted(data_by_symbol.items(), key=lambda x: x[1][2]['rsi'])[:5]
     buys_to_execute = min(MAX_DAILY_BUYS - daily_buys, len(candidates))
 
-    # Ejecutar operaciones de compra
     for symbol, (data, additional_data, indicators) in candidates:
         current_price = fetch_price(symbol)
         if current_price is None:
             logging.warning(f"No se pudo obtener precio actual para {symbol}, omitiendo compra")
             continue
 
-        # Verificar cache para decisiones previas
         cached_decision = get_cached_decision(symbol, indicators)
         if cached_decision:
             action, confidence, explanation = cached_decision
         else:
-            # Lógica de decisión basada en indicadores
             if indicators['rsi'] is not None and indicators['rsi'] < 30 and indicators['adx'] is not None and indicators['adx'] > 35:
                 action = "comprar"
                 confidence = 90
@@ -535,7 +551,6 @@ def demo_trading():
                 action, confidence, explanation = gpt_decision_buy(prepared_text)
                 decision_cache[symbol] = (time.time(), (action, confidence, explanation), indicators.copy())
 
-        # Ejecutar compra si se cumple la condición
         if action == "comprar" and confidence >= 70:
             amount = budget_per_trade / current_price
             if amount * current_price >= MIN_NOTIONAL:
@@ -543,7 +558,7 @@ def demo_trading():
                 if order:
                     logging.info(f"Compra ejecutada para {symbol}: {explanation}")
                     send_telegram_message(f"✅ *Compra* `{symbol}`\nConfianza: `{confidence}%`\nExplicación: `{explanation}`")
-                    dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'])
+                    dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], order['indicators'])
 
     generate_profit_loss_table()
 
