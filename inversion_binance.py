@@ -42,7 +42,7 @@ logging.basicConfig(
 )
 
 # Constantes
-MAX_DAILY_BUYS = 5
+MAX_DAILY_BUYS = 10
 MIN_NOTIONAL = 10
 RSI_THRESHOLD = 60  # Umbral ajustado para ser más estricto
 ADX_THRESHOLD = 30  # Umbral ajustado para mayor tendencia
@@ -441,7 +441,7 @@ def demo_trading():
         return
 
     # Calcular la reserva del 10% del saldo en USDT
-    reserve = 0.10 * usdt_balance
+    reserve = 0.30 * usdt_balance
     available_for_trading = usdt_balance - reserve
 
     # Verificar el límite diario de compras
@@ -454,7 +454,7 @@ def demo_trading():
     budget_per_trade = available_for_trading / (MAX_DAILY_BUYS - daily_buys)
 
     # Seleccionar las mejores criptomonedas
-    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=24)
+    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=150)
     data_by_symbol = {}
 
     # Procesar datos e indicadores para cada símbolo
