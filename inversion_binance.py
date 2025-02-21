@@ -42,12 +42,12 @@ logging.basicConfig(
 )
 
 # Constantes
-MAX_DAILY_BUYS = 10
+MAX_DAILY_BUYS = 5
 MIN_NOTIONAL = 10
-RSI_THRESHOLD = 60  # Umbral ajustado
-ADX_THRESHOLD = 35  # Umbral más estricto para tendencias fuertes
+RSI_THRESHOLD = 60
+ADX_THRESHOLD = 35
 VOLUME_GROWTH_THRESHOLD = 1.5
-MIN_DAILY_VOLUME = 1000000  # Volumen mínimo diario en USD
+MIN_DAILY_VOLUME = 1000000
 
 # Cache de decisiones
 decision_cache = {}
@@ -80,7 +80,7 @@ def fetch_price(symbol):
 def fetch_volume(symbol):
     try:
         ticker = exchange.fetch_ticker(symbol)
-        return ticker['quoteVolume']  # Volumen en moneda base (USDT en este caso)
+        return ticker['quoteVolume']
     except Exception as e:
         logging.error(f"Error al obtener volumen de {symbol}: {e}")
         return None
@@ -306,7 +306,6 @@ def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, entry_indica
             highest_price = purchase_price
             activated = False
 
-            # Registrar información detallada al entrar al trailing stop
             entry_msg = (
                 f"🔄 *Trailing Stop Dinámico Iniciado* para `{symbol}`\n"
                 f"Precio de Compra: `{purchase_price}`\n"
@@ -464,7 +463,7 @@ def demo_trading():
         logging.warning("Saldo insuficiente en USDT.")
         return
 
-    reserve = 0.30 * usdt_balance
+    reserve = 0.10 * usdt_balance
     available_for_trading = usdt_balance - reserve
 
     daily_buys = get_daily_buys()
@@ -476,7 +475,18 @@ def demo_trading():
     selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=24)
     data_by_symbol = {}
 
+    # Obtener el saldo actual para verificar posiciones abiertas
+    balance = exchange.fetch_balance()['free']
+
     for symbol in selected_cryptos:
+        # Extraer el símbolo base (por ejemplo, "BTC" de "BTC/USDT")
+        base_asset = symbol.split('/')[0]
+        
+        # Verificar si ya tienes una posición abierta en esta moneda
+        if base_asset in balance and balance[base_asset] > 0:
+            logging.info(f"Se omite {symbol} porque ya tienes una posición abierta.")
+            continue
+
         daily_volume = fetch_volume(symbol)
         if daily_volume is None or daily_volume < MIN_DAILY_VOLUME:
             logging.info(f"Se omite {symbol} por volumen insuficiente: {daily_volume}")
