@@ -464,7 +464,7 @@ def demo_trading():
         logging.warning("Saldo insuficiente en USDT.")
         return
 
-    reserve = 0.10 * usdt_balance
+    reserve = 0.30 * usdt_balance
     available_for_trading = usdt_balance - reserve
 
     daily_buys = get_daily_buys()
