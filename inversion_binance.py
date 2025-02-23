@@ -11,16 +11,39 @@ import threading
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from openai import OpenAI
-from elegir_cripto import choose_best_cryptos
-import ta
 from ta.trend import MACD
 import pytz
-from db_manager_real import initialize_db, insert_transaction, fetch_all_transactions
 
 # Configuración e Inicialización
 load_dotenv()
 GPT_MODEL = "gpt-4o-mini"
 DB_NAME = "trading_real.db"
+
+# Inicializar la base de datos (crear tabla si no existe)
+def initialize_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS transactions_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            action TEXT NOT NULL,
+            price REAL NOT NULL,
+            amount REAL NOT NULL,
+            timestamp TEXT NOT NULL,
+            trade_id TEXT NOT NULL,
+            rsi REAL,
+            adx REAL,
+            atr REAL,
+            relative_volume REAL,
+            divergence TEXT,
+            bb_position TEXT,
+            confidence REAL
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
 initialize_db()
 
 exchange = ccxt.binance({
@@ -44,9 +67,9 @@ logging.basicConfig(
 # Constantes
 MAX_DAILY_BUYS = 5
 MIN_NOTIONAL = 10
-RSI_THRESHOLD = 65  # Relajado a 65
-ADX_THRESHOLD = 25  # Ajustado a 25
-VOLUME_GROWTH_THRESHOLD = 1.0  # Ajustado a 1.0
+RSI_THRESHOLD = 65
+ADX_THRESHOLD = 25
+VOLUME_GROWTH_THRESHOLD = 1.0
 
 # Cache de decisiones
 decision_cache = {}
@@ -96,11 +119,11 @@ def fetch_and_prepare_data(symbol):
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
-            df['RSI'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-            df['ATR'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
-            bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
-            df['BB_upper'] = bb.bollinger_hband()
-            df['BB_lower'] = bb.bollinger_lband()
+            df['RSI'] = pd.Series(np.nan_to_num(pd.Series([talib.RSI(df['close'].values, timeperiod=14)]).iloc[0]))
+            df['ATR'] = pd.Series(np.nan_to_num(pd.Series([talib.ATR(df['high'].values, df['low'].values, df['close'].values, timeperiod=14)]).iloc[0]))
+            bb_upper, bb_middle, bb_lower = talib.BBANDS(df['close'], timeperiod=20, nbdevup=2, nbdevdn=2)
+            df['BB_upper'] = bb_upper
+            df['BB_lower'] = bb_lower
             macd = MACD(df['close'], window_slow=26, window_fast=12, window_sign=9)
             df['MACD'] = macd.macd()
             df['MACD_signal'] = macd.macd_signal()
@@ -117,7 +140,7 @@ def fetch_and_prepare_data(symbol):
 
 def calculate_adx(df):
     try:
-        adx = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
+        adx = talib.ADX(df['high'], df['low'], df['close'], timeperiod=14)
         return adx.iloc[-1] if not pd.isna(adx.iloc[-1]) else None
     except Exception as e:
         logging.error(f"Error al calcular ADX: {e}")
@@ -151,6 +174,17 @@ def get_bb_position(price, bb_upper, bb_lower):
     else:
         return "between"
 
+def has_recent_macd_crossover(macd_series, signal_series, lookback=5):
+    """
+    Verifica si ha habido un cruce alcista de MACD en las últimas 'lookback' velas.
+    """
+    for i in range(-1, -lookback-1, -1):
+        if i < -len(macd_series):
+            break
+        if macd_series.iloc[i-1] <= signal_series.iloc[i-1] and macd_series.iloc[i] > signal_series.iloc[i]:
+            return True, abs(i)
+    return False, None
+
 # Funciones de GPT
 def gpt_prepare_data(data_by_timeframe, additional_data):
     combined_data = ""
@@ -166,6 +200,8 @@ def gpt_prepare_data(data_by_timeframe, additional_data):
     - Divergencias: {additional_data.get('momentum_divergences', 'No disponible')}
     - Volumen relativo: {additional_data.get('relative_volume', 'No disponible')}
     - Precio actual: {additional_data.get('current_price', 'No disponible')}
+    - Cruce alcista reciente de MACD: {additional_data.get('macd_crossover', 'No disponible')}
+    - Velas desde el cruce: {additional_data.get('candles_since_crossover', 'No disponible')}
     """
     return prompt
 
@@ -174,11 +210,11 @@ def gpt_decision_buy(prepared_text):
     Eres un experto en trading de criptomonedas. Basándote en los datos:
     {prepared_text}
     Decide si "comprar" o "mantener". Responde SOLO con un JSON válido como este:
-    {{"accion": "comprar", "confianza": 85, "explicacion": "RSI bajo y volumen creciendo"}}
-    No incluyas texto adicional fuera del JSON, ni etiquetas como ```json```.
+    {{"accion": "comprar", "confianza": 85, "explicacion": "Cruce alcista de MACD reciente y RSI bajo"}}
     Criterios:
-    - Comprar si hay señales de crecimiento (RSI < 65, ADX > 25, volumen creciendo, divergencias alcistas).
-    - Mantener si hay sobrecompra (RSI > 70) o señales débiles.
+    - Prioriza los cruces alcistas recientes de MACD como una señal fuerte de compra, especialmente si están acompañados de RSI < 65, ADX > 25, y volumen relativo > 1.0.
+    - Comprar si hay señales de crecimiento combinadas con el cruce de MACD.
+    - Mantener si no hay cruce alcista reciente o si hay señales de sobrecompra (RSI > 70).
     """
     max_retries = 2
     for attempt in range(max_retries + 1):
@@ -232,21 +268,19 @@ def execute_order_buy(symbol, amount, indicators, confidence):
         timestamp = datetime.now(timezone.utc).isoformat()
         trade_id = f"{symbol}_{timestamp.replace(':', '-')}"
         
-        insert_transaction(
-            symbol=symbol, 
-            action="buy", 
-            price=price, 
-            amount=amount, 
-            timestamp=timestamp, 
-            trade_id=trade_id,
-            rsi=indicators.get('rsi'),
-            adx=indicators.get('adx'),
-            atr=indicators.get('atr'),
-            relative_volume=indicators.get('relative_volume'),
-            divergence=indicators.get('divergence'),
-            bb_position=indicators.get('bb_position'),
-            confidence=confidence
-        )
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO transactions_new (symbol, action, price, amount, timestamp, trade_id, rsi, adx, atr, relative_volume, divergence, bb_position, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            symbol, "buy", price, amount, timestamp, trade_id,
+            indicators.get('rsi'), indicators.get('adx'), indicators.get('atr'),
+            indicators.get('relative_volume'), indicators.get('divergence'), indicators.get('bb_position'), confidence
+        ))
+        conn.commit()
+        conn.close()
+        
         logging.info(f"Compra ejecutada: {symbol} a {price} por {amount} (ID: {trade_id})")
         return {"price": price, "filled": amount, "trade_id": trade_id, "indicators": indicators}
     except Exception as e:
@@ -262,7 +296,14 @@ def sell_symbol(symbol, amount, trade_id):
             timestamp = datetime.now(timezone.utc).isoformat()
             order = exchange.create_market_sell_order(symbol, amount)
             sell_price = order.get("price", price)
-            insert_transaction(symbol=symbol, action="sell", price=sell_price, amount=amount, timestamp=timestamp, trade_id=trade_id)
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO transactions_new (symbol, action, price, amount, timestamp, trade_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (symbol, "sell", sell_price, amount, timestamp, trade_id))
+            conn.commit()
+            conn.close()
             return
         
         price = fetch_price(symbol)
@@ -273,17 +314,15 @@ def sell_symbol(symbol, amount, trade_id):
         
         order = exchange.create_market_sell_order(symbol, amount)
         sell_price = order.get("price", price)
-        insert_transaction(
-            symbol=symbol, 
-            action="sell", 
-            price=sell_price, 
-            amount=amount, 
-            timestamp=timestamp, 
-            trade_id=trade_id,
-            rsi=rsi,
-            adx=adx,
-            atr=atr
-        )
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO transactions_new (symbol, action, price, amount, timestamp, trade_id, rsi, adx, atr)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (symbol, "sell", sell_price, amount, timestamp, trade_id, rsi, adx, atr))
+        conn.commit()
+        conn.close()
+        
         logging.info(f"Venta ejecutada: {symbol} a {sell_price} (ID: {trade_id})")
         send_telegram_message(f"✅ *Venta Ejecutada* para `{symbol}`\nPrecio: `{sell_price}`\nCantidad: `{amount}`")
     except Exception as e:
@@ -456,6 +495,21 @@ def get_cached_decision(symbol, current_indicators):
                 return cached_decision
     return None
 
+def choose_best_cryptos(base_currency="USDT", top_n=100):
+    try:
+        markets = exchange.load_markets()
+        symbols = [s for s in markets.keys() if s.endswith(f"/{base_currency}")]
+        tickers = exchange.fetch_tickers(symbols)
+        sorted_tickers = sorted(
+            [(s, t['quoteVolume']) for s, t in tickers.items() if 'quoteVolume' in t and t['quoteVolume'] is not None],
+            key=lambda x: x[1],
+            reverse=True
+        )
+        return [s for s, _ in sorted_tickers[:top_n]]
+    except Exception as e:
+        logging.error(f"Error al elegir criptos: {e}")
+        return []
+
 def demo_trading():
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
     if usdt_balance < MIN_NOTIONAL:
@@ -471,7 +525,7 @@ def demo_trading():
         return
 
     budget_per_trade = available_for_trading / (MAX_DAILY_BUYS - daily_buys)
-    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=100)  # Ajustado a 100
+    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=100)
     data_by_symbol = {}
 
     balance = exchange.fetch_balance()['free']
@@ -483,7 +537,7 @@ def demo_trading():
             continue
 
         daily_volume = fetch_volume(symbol)
-        if daily_volume is None or daily_volume < 1000000:  # Ajustado a 1M
+        if daily_volume is None or daily_volume < 1000000:
             logging.info(f"Se omite {symbol} por volumen insuficiente: {daily_volume}")
             continue
 
@@ -491,12 +545,12 @@ def demo_trading():
         if not data or volume_series is None or price_series is None:
             logging.warning(f"Se omite {symbol} por datos insuficientes")
             continue
-        
+
         current_price = fetch_price(symbol)
         if current_price is None:
             logging.warning(f"No se pudo obtener precio para {symbol}")
             continue
-        
+
         rsi = data['1h']['RSI'].iloc[-1] if not pd.isna(data['1h']['RSI'].iloc[-1]) else None
         adx = calculate_adx(data['1h'])
         atr = data['1h']['ATR'].iloc[-1] if not pd.isna(data['1h']['ATR'].iloc[-1]) else None
@@ -505,14 +559,20 @@ def demo_trading():
         bb_position = get_bb_position(current_price, data['1h']['BB_upper'].iloc[-1], data['1h']['BB_lower'].iloc[-1])
         macd = data['1h']['MACD'].iloc[-1]
         macd_signal = data['1h']['MACD_signal'].iloc[-1]
-        
+
+        macd_series = data['1h']['MACD']
+        signal_series = data['1h']['MACD_signal']
+        has_crossover, candles_since = has_recent_macd_crossover(macd_series, signal_series, lookback=5)
+
         additional_data = {
             "current_price": current_price,
             "rsi": rsi if rsi is not None else "No disponible",
             "adx": adx if adx is not None else "No disponible",
             "atr": atr if atr is not None else "No disponible",
             "relative_volume": relative_volume if relative_volume is not None else "No disponible",
-            "momentum_divergences": divergence
+            "momentum_divergences": divergence,
+            "macd_crossover": "Sí" if has_crossover else "No",
+            "candles_since_crossover": candles_since if has_crossover else "N/A"
         }
         indicators = {
             "rsi": rsi,
@@ -522,17 +582,18 @@ def demo_trading():
             "divergence": divergence,
             "bb_position": bb_position,
             "macd": macd,
-            "macd_signal": macd_signal
+            "macd_signal": macd_signal,
+            "has_macd_crossover": has_crossover,
+            "candles_since_crossover": candles_since
         }
-        
-        # Filtro cuantitativo ajustado
+
         if (rsi is None or rsi >= RSI_THRESHOLD) or \
            (adx is None or adx < ADX_THRESHOLD) or \
            (relative_volume is None or relative_volume < VOLUME_GROWTH_THRESHOLD) or \
-           (macd <= macd_signal and not (macd > macd_signal and macd_signal > 0)):
-            logging.info(f"Se omite {symbol} por no cumplir filtros cuantitativos: RSI={rsi}, ADX={adx}, Volumen Relativo={relative_volume}, MACD={macd} vs Signal={macd_signal}")
+           (not has_crossover and macd <= macd_signal and not (macd > macd_signal and macd_signal > 0)):
+            logging.info(f"Se omite {symbol} por no cumplir filtros cuantitativos: RSI={rsi}, ADX={adx}, Volumen Relativo={relative_volume}, MACD={macd} vs Signal={macd_signal}, Cruce MACD={'Sí' if has_crossover else 'No'}")
             continue
-        
+
         data_by_symbol[symbol] = (data, additional_data, indicators)
 
     candidates = sorted(data_by_symbol.items(), key=lambda x: x[1][2]['rsi'])[:5]
@@ -567,6 +628,7 @@ def demo_trading():
                     dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], order['indicators'])
 
     generate_profit_loss_table()
+    logging.info("Trading ejecutado correctamente")
 
 if __name__ == "__main__":
     demo_trading()
