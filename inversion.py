@@ -146,7 +146,7 @@ def should_execute_trading(symbol):
     last_conditions[symbol] = {"price": current_price, "volume": current_volume, "rsi": rsi}
     return execute
 
-def run_trading():
+def run_trading(high_volume_symbols=None):
     print(f"🏁 Ejecutando demo_trading a las {datetime.datetime.now()}")
     try:
         demo_trading()
