@@ -17,14 +17,14 @@ exchange = ccxt.binance({
 })
 
 # Constantes
-MONITOR_INTERVAL = 300  # 5 minutos
-EXECUTION_INTERVAL = 14400  # 4 horas
-THRESHOLD_VOLUME_CHANGE = 0.2  # 20%
-THRESHOLD_PRICE_CHANGE = 0.03  # 3%
-THRESHOLD_ATR = 0.02  # 2% de volatilidad
-THRESHOLD_RSI_OVERBOUGHT = 70  # Ajustado a 70
+MONITOR_INTERVAL = 300       # 5 minutos
+EXECUTION_INTERVAL = 14400   # 4 horas
+THRESHOLD_VOLUME_CHANGE = 0.2   # 20%
+THRESHOLD_PRICE_CHANGE = 0.03   # 3%
+THRESHOLD_ATR = 0.02            # 2% de volatilidad
+THRESHOLD_RSI_OVERBOUGHT = 70   # Ajustado a 70
 THRESHOLD_RSI_OVERSOLD = 30
-SYMBOLS_TO_MONITOR = 200  # Monitorear 200 símbolos
+SYMBOLS_TO_MONITOR = 200     # Monitorear 200 símbolos
 
 # Variables globales
 last_conditions = {}
@@ -162,11 +162,12 @@ def main_loop():
     while True:
         current_time = time.time()
         portfolio_symbols = fetch_portfolio_symbols()
-        high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=SYMBOLS_TO_MONITOR)
         
-        # Depuración: Mostrar cuántos símbolos vienen de cada fuente
-        #print(f"DEBUG: Símbolos en portafolio: {len(portfolio_symbols)}")
+        # Llamada bloqueante a choose_best_cryptos: el programa espera el resultado incluso si demora
+        print("⏳ Esperando a que se complete la selección de criptomonedas (choose_best_cryptos)...")
+        high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=SYMBOLS_TO_MONITOR)
         print(f"DEBUG: Símbolos de alto volumen pedidos: {SYMBOLS_TO_MONITOR}, obtenidos: {len(high_volume_symbols)}")
+        print("DEBUG: Lista de símbolos:", high_volume_symbols)
         
         symbols = list(set(high_volume_symbols))
         print(f"🔍 Monitoreando {len(symbols)} símbolos a las {datetime.datetime.now()}")
