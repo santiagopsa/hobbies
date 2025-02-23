@@ -58,7 +58,7 @@ def get_top_symbols_by_volume(base_currency="USDT", min_volume=10000):
         logging.error(f"Error al obtener símbolos por volumen: {e}")
         return []
 
-def choose_best_cryptos(base_currency="USDT", top_n=200, rsi_threshold=70, min_pct_change=5):
+def choose_best_cryptos(base_currency="USDT", top_n=100):
     symbols = get_top_symbols_by_volume(base_currency, min_volume=10000)
     if not symbols:
         logging.error("No se encontraron símbolos válidos.")
@@ -67,62 +67,51 @@ def choose_best_cryptos(base_currency="USDT", top_n=200, rsi_threshold=70, min_p
     crypto_data = []
     max_symbols_to_analyze = min(600, len(symbols))
     processed_count = 0
-    discarded_by_data = 0
-    discarded_by_rsi = 0
-    discarded_by_pct_change = 0
 
     logging.info(f"Analizando hasta {max_symbols_to_analyze} de {len(symbols)} símbolos disponibles")
     for symbol in symbols[:max_symbols_to_analyze]:
         df = fetch_ohlcv_safe(symbol, timeframe='1h', limit=24)
         if df is None or df.empty:
-            discarded_by_data += 1
             continue
 
         # Calcular cambio porcentual en las últimas 24 horas
         pct_change = (df['close'].iloc[-1] - df['close'].iloc[0]) / df['close'].iloc[0] * 100
-        if pct_change < min_pct_change:
-            discarded_by_pct_change += 1
-            logging.debug(f"{symbol} descartado por cambio porcentual: {pct_change:.2f}% < {min_pct_change}%")
-            continue
 
+        # Calcular volatilidad y volumen promedio
         volatility = ((df['high'] - df['low']) / df['close']).mean() * 100
         avg_volume = (df['volume'] * df['close']).mean()
+
+        # Calcular RSI (se usa para información; podrías incorporar un ajuste en el score si lo deseas)
         rsi = RSIIndicator(df['close'], window=14).rsi()
         rsi_value = rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50
 
-        if rsi_value >= rsi_threshold:  # Umbral ajustado a 70
-            discarded_by_rsi += 1
-            logging.debug(f"{symbol} descartado por RSI: {rsi_value}")
-            continue
-
-        # Puntaje ajustado con cambio porcentual
+        # Puntaje compuesto: mientras mayor sea el score, más atractiva se considera la criptomoneda
         score = avg_volume * volatility * (1 + pct_change / 100)
+
         crypto_data.append({
-            'symbol': symbol,
-            'volatility': volatility,
-            'avg_volume': avg_volume,
-            'rsi': rsi_value,
-            'pct_change': pct_change,
-            'score': score
+           'symbol': symbol,
+           'volatility': volatility,
+           'avg_volume': avg_volume,
+           'rsi': rsi_value,
+           'pct_change': pct_change,
+           'score': score
         })
 
         processed_count += 1
-        if processed_count % 50 == 0:
-            logging.info(f"Progreso: {processed_count} procesados, {len(crypto_data)} válidos, "
-                         f"Descartados - Datos: {discarded_by_data}, RSI: {discarded_by_rsi}, Cambio %: {discarded_by_pct_change}")
-
         time.sleep(0.02)
 
     if not crypto_data:
-        logging.error("No se encontraron criptos viables. Devolviendo top por volumen.")
-        return symbols[:top_n]
+        logging.error("No se encontraron criptos viables.")
+        return []
 
-    df = pd.DataFrame(crypto_data)
-    df = df.sort_values(by='score', ascending=False)
-    selected_symbols = df['symbol'].head(top_n).tolist()
-    
+    # Ordenar por score de mayor a menor y seleccionar las top_n
+    df_data = pd.DataFrame(crypto_data)
+    df_sorted = df_data.sort_values(by='score', ascending=False)
+    selected_symbols = df_sorted['symbol'].head(top_n).tolist()
+
     logging.info(f"Símbolos analizados: {len(crypto_data)}, seleccionados: {len(selected_symbols)}")
     return selected_symbols
+
 
 if __name__ == "__main__":
     selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=200)
