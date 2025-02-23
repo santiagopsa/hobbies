@@ -4,8 +4,9 @@ import ccxt
 import os
 import requests
 import numpy as np
-from inversion_binance import demo_trading, choose_best_cryptos
+from inversion_binance import demo_trading
 from dotenv import load_dotenv
+from elegir_cripto import choose_best_cryptos
 
 load_dotenv()
 
