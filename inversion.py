@@ -165,10 +165,10 @@ def main_loop():
         high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=SYMBOLS_TO_MONITOR)
         
         # Depuración: Mostrar cuántos símbolos vienen de cada fuente
-        print(f"DEBUG: Símbolos en portafolio: {len(portfolio_symbols)}")
+        #print(f"DEBUG: Símbolos en portafolio: {len(portfolio_symbols)}")
         print(f"DEBUG: Símbolos de alto volumen pedidos: {SYMBOLS_TO_MONITOR}, obtenidos: {len(high_volume_symbols)}")
         
-        symbols = list(set(portfolio_symbols + high_volume_symbols))
+        symbols = list(set(high_volume_symbols))
         print(f"🔍 Monitoreando {len(symbols)} símbolos a las {datetime.datetime.now()}")
         execute_now = False
         
