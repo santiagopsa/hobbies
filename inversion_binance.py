@@ -42,12 +42,11 @@ logging.basicConfig(
 )
 
 # Constantes
-MAX_DAILY_BUYS = 10
+MAX_DAILY_BUYS = 5
 MIN_NOTIONAL = 10
-RSI_THRESHOLD = 60
-ADX_THRESHOLD = 35
-VOLUME_GROWTH_THRESHOLD = 1.5
-MIN_DAILY_VOLUME = 1000000
+RSI_THRESHOLD = 65  # Relajado a 65
+ADX_THRESHOLD = 25  # Ajustado a 25
+VOLUME_GROWTH_THRESHOLD = 1.0  # Ajustado a 1.0
 
 # Cache de decisiones
 decision_cache = {}
@@ -178,7 +177,7 @@ def gpt_decision_buy(prepared_text):
     {{"accion": "comprar", "confianza": 85, "explicacion": "RSI bajo y volumen creciendo"}}
     No incluyas texto adicional fuera del JSON, ni etiquetas como ```json```.
     Criterios:
-    - Comprar si hay señales de crecimiento (RSI < 60, ADX > 35, volumen creciendo, divergencias alcistas).
+    - Comprar si hay señales de crecimiento (RSI < 65, ADX > 25, volumen creciendo, divergencias alcistas).
     - Mantener si hay sobrecompra (RSI > 70) o señales débiles.
     """
     max_retries = 2
@@ -463,7 +462,7 @@ def demo_trading():
         logging.warning("Saldo insuficiente en USDT.")
         return
 
-    reserve = 0.30 * usdt_balance
+    reserve = 0.10 * usdt_balance
     available_for_trading = usdt_balance - reserve
 
     daily_buys = get_daily_buys()
@@ -472,23 +471,19 @@ def demo_trading():
         return
 
     budget_per_trade = available_for_trading / (MAX_DAILY_BUYS - daily_buys)
-    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=100)
+    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=100)  # Ajustado a 100
     data_by_symbol = {}
 
-    # Obtener el saldo actual para verificar posiciones abiertas
     balance = exchange.fetch_balance()['free']
 
     for symbol in selected_cryptos:
-        # Extraer el símbolo base (por ejemplo, "BTC" de "BTC/USDT")
         base_asset = symbol.split('/')[0]
-        
-        # Verificar si ya tienes una posición abierta en esta moneda
         if base_asset in balance and balance[base_asset] > 0:
             logging.info(f"Se omite {symbol} porque ya tienes una posición abierta.")
             continue
 
         daily_volume = fetch_volume(symbol)
-        if daily_volume is None or daily_volume < MIN_DAILY_VOLUME:
+        if daily_volume is None or daily_volume < 1000000:  # Ajustado a 1M
             logging.info(f"Se omite {symbol} por volumen insuficiente: {daily_volume}")
             continue
 
@@ -530,10 +525,11 @@ def demo_trading():
             "macd_signal": macd_signal
         }
         
+        # Filtro cuantitativo ajustado
         if (rsi is None or rsi >= RSI_THRESHOLD) or \
            (adx is None or adx < ADX_THRESHOLD) or \
            (relative_volume is None or relative_volume < VOLUME_GROWTH_THRESHOLD) or \
-           (macd <= macd_signal):
+           (macd <= macd_signal and not (macd > macd_signal and macd_signal > 0)):
             logging.info(f"Se omite {symbol} por no cumplir filtros cuantitativos: RSI={rsi}, ADX={adx}, Volumen Relativo={relative_volume}, MACD={macd} vs Signal={macd_signal}")
             continue
         
