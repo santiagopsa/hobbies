@@ -180,7 +180,7 @@ def main_loop():
                 break
         
         if execute_now or current_time >= next_execution_time:
-            run_trading()
+            run_trading(high_volume_symbols)
             next_execution_time = current_time + EXECUTION_INTERVAL
             print(f"⏳ Próxima ejecución programada a las {datetime.datetime.fromtimestamp(next_execution_time)}")
         else:

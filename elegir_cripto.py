@@ -6,7 +6,6 @@ from ta.momentum import RSIIndicator
 from dotenv import load_dotenv
 import os
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configurar logging a nivel DEBUG para ver todos los pasos
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -109,17 +108,14 @@ def choose_best_cryptos(base_currency="USDT", top_n=100):
     symbols_to_process = symbols[:max_symbols_to_analyze]
     logging.info(f"Analizando hasta {max_symbols_to_analyze} de {len(symbols)} símbolos disponibles")
 
-    # Usar ThreadPoolExecutor para procesar los símbolos en paralelo
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        future_to_symbol = {executor.submit(process_symbol, symbol): symbol for symbol in symbols_to_process}
-        processed_count = 0
-        for future in as_completed(future_to_symbol):
-            result = future.result()
-            processed_count += 1
-            if result:
-                crypto_data.append(result)
-            logging.info(f"Progreso: {processed_count} símbolos procesados")
-
+    processed_count = 0
+    for symbol in symbols_to_process:
+        result = process_symbol(symbol)
+        processed_count += 1
+        if result:
+            crypto_data.append(result)
+        logging.info(f"Progreso: {processed_count} símbolos procesados")
+    
     if not crypto_data:
         logging.error("No se encontraron criptos viables. Devolviendo lista vacía.")
         return []

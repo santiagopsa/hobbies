@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from ta.trend import MACD
 import pytz
-
+from elegir_cripto import choose_best_cryptos
 # Configuración e Inicialización
 load_dotenv()
 GPT_MODEL = "gpt-4o-mini"
@@ -495,22 +495,7 @@ def get_cached_decision(symbol, current_indicators):
                 return cached_decision
     return None
 
-def choose_best_cryptos(base_currency="USDT", top_n=100):
-    try:
-        markets = exchange.load_markets()
-        symbols = [s for s in markets.keys() if s.endswith(f"/{base_currency}")]
-        tickers = exchange.fetch_tickers(symbols)
-        sorted_tickers = sorted(
-            [(s, t['quoteVolume']) for s, t in tickers.items() if 'quoteVolume' in t and t['quoteVolume'] is not None],
-            key=lambda x: x[1],
-            reverse=True
-        )
-        return [s for s, _ in sorted_tickers[:top_n]]
-    except Exception as e:
-        logging.error(f"Error al elegir criptos: {e}")
-        return []
-
-def demo_trading():
+def demo_trading(high_volume_symbols=None):
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
     if usdt_balance < MIN_NOTIONAL:
         logging.warning("Saldo insuficiente en USDT.")
@@ -525,7 +510,7 @@ def demo_trading():
         return
 
     budget_per_trade = available_for_trading / (MAX_DAILY_BUYS - daily_buys)
-    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=100)
+    selected_cryptos = high_volume_symbols
     data_by_symbol = {}
 
     balance = exchange.fetch_balance()['free']
@@ -631,4 +616,5 @@ def demo_trading():
     logging.info("Trading ejecutado correctamente")
 
 if __name__ == "__main__":
-    demo_trading()
+    high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=100)
+    demo_trading(high_volume_symbols)
