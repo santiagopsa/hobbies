@@ -115,14 +115,29 @@ def choose_best_cryptos(base_currency="USDT", top_n=100):
         logging.error("No se encontraron criptos viables. Devolviendo lista vacía.")
         return []
 
-    # Convertir a DataFrame para ordenar por score
+    # Ordenar por score (de mayor a menor) y seleccionar los top_n
     df_data = pd.DataFrame(crypto_data)
     df_sorted = df_data.sort_values(by='score', ascending=False)
     selected_symbols = df_sorted['symbol'].head(top_n).tolist()
-    
-    logging.info(f"Total de criptos analizadas: {len(crypto_data)}; Criptos seleccionadas: {len(selected_symbols)}")
-    logging.info(f"Lista final de criptos seleccionadas: {selected_symbols}")
-    return selected_symbols
+
+    # Asegurar que cada símbolo tenga el formato "BASE/QUOTE"
+    formatted_symbols = []
+    for sym in selected_symbols:
+        if "/" not in sym:
+            # Si el símbolo termina en base_currency (por ejemplo "USDT"),
+            # se inserta la barra antes del base_currency.
+            if sym.endswith(base_currency):
+                formatted = sym[:-len(base_currency)] + "/" + base_currency
+                logging.debug(f"Formateando símbolo: {sym} -> {formatted}")
+                formatted_symbols.append(formatted)
+            else:
+                formatted_symbols.append(sym)
+        else:
+            formatted_symbols.append(sym)
+
+    logging.info(f"Total de criptos analizadas: {len(crypto_data)}; Criptos seleccionadas: {len(formatted_symbols)}")
+    logging.info(f"Lista final de criptos seleccionadas: {formatted_symbols}")
+    return formatted_symbols
 
 if __name__ == "__main__":
     selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=100)
