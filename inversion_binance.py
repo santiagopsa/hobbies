@@ -509,7 +509,7 @@ def demo_trading(high_volume_symbols=None):
         logging.info("Límite diario de compras alcanzado.")
         return
     if high_volume_symbols is None:
-        choose_best_cryptos(base_currency="USDT", top_n=SYMBOLS_TO_MONITOR)
+        choose_best_cryptos(base_currency="USDT", top_n=100)
 
     budget_per_trade = available_for_trading / (MAX_DAILY_BUYS - daily_buys)
     selected_cryptos = high_volume_symbols
