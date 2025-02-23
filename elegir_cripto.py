@@ -7,8 +7,8 @@ from dotenv import load_dotenv
 import os
 import logging
 
-# Configurar logging a nivel DEBUG para ver todos los pasos
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
+# Configurar logging a nivel INFO para evitar demasiada salida
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # Cargar variables de entorno
 load_dotenv()
@@ -28,7 +28,7 @@ def fetch_ohlcv_safe(symbol, timeframe='1h', limit=24):
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         if len(df) < 14:
-            logging.warning(f"Datos insuficientes para {symbol}: solo {len(df)} velas")
+            logging.info(f"Datos insuficientes para {symbol}: solo {len(df)} velas")
             return None
         return df
     except Exception as e:
@@ -53,40 +53,26 @@ def get_top_symbols_by_volume(base_currency="USDT", min_volume=10000):
         
         sorted_symbols = sorted(volumes, key=lambda x: x['volume'], reverse=True)
         logging.info(f"Símbolos con volumen > {min_volume}: {len(sorted_symbols)}")
-        # Mostrar cada símbolo con su volumen
-        for item in sorted_symbols:
-            logging.debug(f"Símbolo: {item['symbol']} - Volumen: {item['volume']}")
         return [item['symbol'] for item in sorted_symbols]
     except Exception as e:
         logging.error(f"Error al obtener símbolos por volumen: {e}")
         return []
 
 def process_symbol(symbol):
-    """Procesa un símbolo: obtiene datos OHLCV, calcula indicadores y retorna un diccionario con los resultados."""
-    logging.debug(f"Procesando símbolo: {symbol}")
+    """
+    Procesa un símbolo: obtiene datos OHLCV, calcula indicadores y retorna un diccionario con los resultados.
+    """
     df = fetch_ohlcv_safe(symbol, timeframe='1h', limit=24)
     if df is None or df.empty:
-        logging.debug(f"Descartado {symbol} por falta de datos OHLCV.")
         return None
 
-    # Calcular cambio porcentual en las últimas 24 horas
     pct_change = (df['close'].iloc[-1] - df['close'].iloc[0]) / df['close'].iloc[0] * 100
-    logging.debug(f"{symbol} - Cambio porcentual: {pct_change:.2f}%")
-
-    # Calcular volatilidad y volumen promedio
     volatility = ((df['high'] - df['low']) / df['close']).mean() * 100
     avg_volume = (df['volume'] * df['close']).mean()
-    logging.debug(f"{symbol} - Volatilidad: {volatility:.2f}%, Volumen promedio: {avg_volume:.2f}")
-
-    # Calcular RSI
     rsi = RSIIndicator(df['close'], window=14).rsi()
     rsi_value = rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50
-    logging.debug(f"{symbol} - RSI: {rsi_value:.2f}")
-
-    # Calcular score compuesto
     score = avg_volume * volatility * (1 + pct_change / 100)
-    logging.debug(f"{symbol} - Score calculado: {score:.2f}")
-
+    
     return {
         'symbol': symbol,
         'volatility': volatility,
@@ -106,21 +92,23 @@ def choose_best_cryptos(base_currency="USDT", top_n=100):
     crypto_data = []
     max_symbols_to_analyze = min(600, len(symbols))
     symbols_to_process = symbols[:max_symbols_to_analyze]
-    logging.info(f"Analizando hasta {max_symbols_to_analyze} de {len(symbols)} símbolos disponibles")
+    total_symbols = len(symbols_to_process)
+    logging.info(f"Analizando {total_symbols} de {len(symbols)} símbolos disponibles")
 
     processed_count = 0
     for symbol in symbols_to_process:
-        result = process_symbol(symbol)
         processed_count += 1
+        result = process_symbol(symbol)
         if result:
             crypto_data.append(result)
-        logging.info(f"Progreso: {processed_count} símbolos procesados")
-    
+        # Imprimir avance aproximado (se actualiza en la misma línea)
+        print(f"Revisando {processed_count} de {total_symbols} monedas...", end="\r")
+    print("")  # Nueva línea después de la impresión de avance
+
     if not crypto_data:
         logging.error("No se encontraron criptos viables. Devolviendo lista vacía.")
         return []
 
-    # Ordenar por score (de mayor a menor) y seleccionar los top_n
     df_data = pd.DataFrame(crypto_data)
     df_sorted = df_data.sort_values(by='score', ascending=False)
     selected_symbols = df_sorted['symbol'].head(top_n).tolist()
@@ -131,7 +119,6 @@ def choose_best_cryptos(base_currency="USDT", top_n=100):
         if "/" not in sym:
             if sym.endswith(base_currency):
                 formatted = sym[:-len(base_currency)] + "/" + base_currency
-                logging.debug(f"Formateando símbolo: {sym} -> {formatted}")
                 formatted_symbols.append(formatted)
             else:
                 formatted_symbols.append(sym)
