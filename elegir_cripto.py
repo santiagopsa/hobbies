@@ -19,7 +19,7 @@ exchange = ccxt.binance({
     'options': {'defaultType': 'spot'}
 })
 
-def choose_best_cryptos_fast(base_currency="USDT", top_n=100, min_volume=10000):
+def choose_best_cryptos(base_currency="USDT", top_n=100, min_volume=10000):
     logging.info("Iniciando elección de criptomonedas (versión optimizada).")
     
     # Cargar todos los mercados y filtrar los símbolos que cumplen los criterios
