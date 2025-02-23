@@ -5,7 +5,9 @@ hobbies/
 *.pyc
 __pycache__/
 env/
-
+newenv/
+venv/
+ENV/
 # Ignorar configuraciones de IDEs
 .vscode/
 .idea/
