@@ -96,6 +96,6 @@ def choose_best_cryptos(base_currency="USDT", top_n=100, min_volume=10000):
     return formatted_symbols
 
 if __name__ == "__main__":
-    selected_cryptos = choose_best_cryptos_fast(base_currency="USDT", top_n=100)
+    selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=100)
     print(f"Top 100 criptos seleccionadas: {len(selected_cryptos)} símbolos")
-    print(selected_cryptos)
+

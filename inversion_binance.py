@@ -496,15 +496,18 @@ def get_cached_decision(symbol, current_indicators):
     return None
 
 def demo_trading(high_volume_symbols=None):
+    print("Iniciando trading...")
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
+    print(f"Saldo USDT disponible: {usdt_balance}")
     if usdt_balance < MIN_NOTIONAL:
         logging.warning("Saldo insuficiente en USDT.")
         return
 
-    reserve = 0.10 * usdt_balance
+    reserve = 50  # Reserva para comisiones y posibles pérdidas
     available_for_trading = usdt_balance - reserve
-
+    print(f"Disponible para trading: {available_for_trading}, se deja una reserva de {reserve}")
     daily_buys = get_daily_buys()
+    print(f"Compras diarias realizadas: {daily_buys}")
     if daily_buys >= MAX_DAILY_BUYS:
         logging.info("Límite diario de compras alcanzado.")
         return
@@ -514,10 +517,11 @@ def demo_trading(high_volume_symbols=None):
     budget_per_trade = available_for_trading / (MAX_DAILY_BUYS - daily_buys)
     selected_cryptos = high_volume_symbols
     data_by_symbol = {}
-
+    print(f"Presupuesto por operación: {budget_per_trade}")
     balance = exchange.fetch_balance()['free']
-
+    print(f"Balance actual: {balance}")
     for symbol in selected_cryptos:
+        print(f"Procesando {symbol}...")
         base_asset = symbol.split('/')[0]
         if base_asset in balance and balance[base_asset] > 0:
             logging.info(f"Se omite {symbol} porque ya tienes una posición abierta.")
