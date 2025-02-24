@@ -14,6 +14,7 @@ from openai import OpenAI
 import pytz
 import pandas_ta as ta  # Nueva librería reemplazando ta-lib
 from elegir_cripto import choose_best_cryptos
+from scipy.stats import linregress
 
 # Configuración e Inicialización
 load_dotenv()
@@ -41,7 +42,14 @@ def initialize_db():
             bb_position TEXT,
             confidence REAL,
             has_macd_crossover INTEGER,  -- 1 si hay cruce alcista reciente, 0 si no
-            candles_since_crossover INTEGER  -- Número de velas desde el cruce
+            candles_since_crossover INTEGER,  -- Número de velas desde el cruce
+            volume_trend TEXT,  -- Nueva columna para tendencia de volumen
+            price_trend TEXT,   -- Nueva columna para tendencia de precio
+            short_volume_trend TEXT,  -- Nueva columna para tendencia corta de volumen
+            support_level REAL,  -- Nueva columna para nivel de soporte
+            spread REAL,        -- Nueva columna para spread del libro
+            imbalance REAL,     -- Nueva columna para imbalance del libro
+            depth REAL          -- Nueva columna para profundidad del libro
         )
     ''')
     conn.commit()
@@ -70,13 +78,32 @@ logging.basicConfig(
 # Constantes
 MAX_DAILY_BUYS = 10
 MIN_NOTIONAL = 10
-RSI_THRESHOLD = 65
-ADX_THRESHOLD = 25
-VOLUME_GROWTH_THRESHOLD = 1.0
+RSI_THRESHOLD = 30
+ADX_THRESHOLD = 20
+VOLUME_GROWTH_THRESHOLD = 0.8
 
 # Cache de decisiones
 decision_cache = {}
 CACHE_EXPIRATION = 1800  # 30 minutos
+
+def detect_support_level(price_series, window=5):
+    if len(price_series) < window:
+        return None
+    recent_prices = price_series[-window:]
+    min_price = recent_prices.min()
+    return min_price if min_price < price_series[-1] * 0.99 else None  # Si el precio actual está cerca de un mínimo
+
+def calculate_short_volume_trend(volume_series, window=3):
+    if len(volume_series) < window:
+        return "insufficient_data"
+    last_volume = volume_series[-1]
+    avg_volume = volume_series[-window:].mean()
+    if last_volume > avg_volume * 1.1:  # Volumen 10% superior al promedio
+        return "increasing"
+    elif last_volume < avg_volume * 0.9:  # Volumen 10% inferior al promedio
+        return "decreasing"
+    else:
+        return "stable"
 
 # book data
 def fetch_order_book_data(symbol, limit=10):
@@ -208,6 +235,130 @@ def has_recent_macd_crossover(macd_series, signal_series, lookback=5):
             return True, abs(i)
     return False, None
 
+# Funcion para enteder por que se ganó o se perdió en un trade
+def analyze_trade_outcome(trade_id):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        
+        # Consulta para obtener datos de compra y venta por trade_id
+        cursor.execute("""
+            SELECT t1.*, t2.*
+            FROM transactions_new t1
+            LEFT JOIN transactions_new t2 ON t1.trade_id = t2.trade_id AND t2.action = 'sell'
+            WHERE t1.trade_id = ? AND t1.action = 'buy'
+        """, (trade_id,))
+        trade_data = cursor.fetchone()
+        
+        if not trade_data:
+            logging.warning(f"No se encontraron datos para el trade_id: {trade_id}")
+            return
+
+        # Desempaquetar los datos (ajusta los índices según la consulta)
+        buy_data = {
+            'symbol': trade_data[1],  # symbol
+            'buy_price': trade_data[3],  # price
+            'amount': trade_data[4],  # amount
+            'timestamp': trade_data[5],  # timestamp
+            'rsi': trade_data[7],  # rsi
+            'adx': trade_data[8],  # adx
+            'atr': trade_data[9],  # atr
+            'relative_volume': trade_data[10],  # relative_volume
+            'divergence': trade_data[11],  # divergence
+            'bb_position': trade_data[12],  # bb_position
+            'confidence': trade_data[13],  # confidence
+            'has_macd_crossover': trade_data[14],  # has_macd_crossover
+            'candles_since_crossover': trade_data[15],  # candles_since_crossover
+            'volume_trend': trade_data[16],  # volume_trend
+            'price_trend': trade_data[17],  # price_trend
+            'short_volume_trend': trade_data[18],  # short_volume_trend
+            'support_level': trade_data[19],  # support_level
+            'spread': trade_data[20],  # spread
+            'imbalance': trade_data[21],  # imbalance
+            'depth': trade_data[22]  # depth
+        }
+
+        sell_data = {
+            'sell_price': trade_data[23] if trade_data[23] else None,  # price de la venta (puede ser None si no hay venta)
+            'sell_timestamp': trade_data[25] if trade_data[25] else None,  # timestamp de la venta
+            'rsi_sell': trade_data[28],  # rsi de la venta
+            'adx_sell': trade_data[29],  # adx de la venta
+            'atr_sell': trade_data[30]  # atr de la venta
+        }
+
+        # Calcular ganancia/pérdida
+        profit_loss = (sell_data['sell_price'] - buy_data['buy_price']) * buy_data['amount'] if sell_data['sell_price'] else 0
+        is_profitable = profit_loss > 0
+
+        # Preparar texto para GPT
+        gpt_prompt = f"""
+        Analiza los siguientes datos de una transacción de criptomonedas para determinar por qué tuvo éxito (ganancia) o fracaso (pérdida). Responde SOLO con un JSON válido sin etiquetas '''json''' ni antes ni despues, como este:
+        {{"resultado": "éxito", "razon": "La tendencia de volumen creciente y el cruce alcista de MACD indicaron un movimiento alcista sostenido.", "confianza": 85}}
+        o
+        {{"resultado": "fracaso", "razon": "El volumen decreciente y RSI alto sugirieron sobrecompra, resultando en una caída del precio.", "confianza": 75}}
+
+        Datos de compra:
+        - Símbolo: {buy_data['symbol']}
+        - Precio de compra: {buy_data['buy_price']}
+        - Cantidad: {buy_data['amount']}
+        - Timestamp de compra: {buy_data['timestamp']}
+        - RSI: {buy_data['rsi']}
+        - ADX: {buy_data['adx']}
+        - ATR: {buy_data['atr']}
+        - Volumen relativo: {buy_data['relative_volume']}
+        - Divergencia: {buy_data['divergence']}
+        - Posición BB: {buy_data['bb_position']}
+        - Confianza: {buy_data['confidence']}
+        - Cruce MACD: {'Sí' if buy_data['has_macd_crossover'] else 'No'}
+        - Velas desde cruce MACD: {buy_data['candles_since_crossover']}
+        - Tendencia de volumen: {buy_data['volume_trend']}
+        - Tendencia de precio: {buy_data['price_trend']}
+        - Tendencia de volumen corto: {buy_data['short_volume_trend']}
+        - Nivel de soporte: {buy_data['support_level']}
+        - Spread: {buy_data['spread']}
+        - Imbalance: {buy_data['imbalance']}
+        - Profundidad: {buy_data['depth']}
+
+        Datos de venta (si aplica):
+        - Precio de venta: {sell_data['sell_price']}
+        - Timestamp de venta: {sell_data['sell_timestamp']}
+        - RSI venta: {sell_data['rsi_sell']}
+        - ADX venta: {sell_data['adx_sell']}
+        - ATR venta: {sell_data['atr_sell']}
+
+        Ganancia/Pérdida: {profit_loss:.2f} USDT
+        """
+
+        # Llamada a GPT
+        response = client.chat.completions.create(
+            model=GPT_MODEL,
+            messages=[{"role": "user", "content": gpt_prompt}],
+            temperature=0
+        )
+        raw_response = response.choices[0].message.content.strip()
+        outcome = json.loads(raw_response)
+        
+        resultado = outcome.get("resultado", "desconocido").lower()
+        razon = outcome.get("razon", "Sin análisis disponible")
+        confianza = outcome.get("confianza", 50)
+
+        # Enviar mensaje a Telegram
+        telegram_message = f"📊 *Análisis de Resultado de Transacción* para `{buy_data['symbol']}` (ID: {trade_id})\n" \
+                          f"Resultado: {'Éxito' if is_profitable else 'Fracaso'}\n" \
+                          f"Ganancia/Pérdida: {profit_loss:.2f} USDT\n" \
+                          f"Razón: {razon}\n" \
+                          f"Confianza: {confianza}%\n" \
+                          f"Compra: {buy_data['timestamp']} a {buy_data['buy_price']} USDT\n" \
+                          f"Venta: {sell_data['sell_timestamp']} a {sell_data['sell_price']} USDT (si aplica)"
+        send_telegram_message(telegram_message)
+
+        logging.info(f"Análisis de transacción {trade_id}: {resultado} - {razon} (Confianza: {confianza}%)")
+
+    except Exception as e:
+        logging.error(f"Error al analizar el resultado de la transacción {trade_id}: {e}")
+    finally:
+        conn.close()
+
 # Funciones de GPT
 def gpt_prepare_data(data_by_timeframe, additional_data):
     combined_data = ""
@@ -225,6 +376,13 @@ def gpt_prepare_data(data_by_timeframe, additional_data):
     - Precio actual: {additional_data.get('current_price', 'No disponible')}
     - Cruce alcista reciente de MACD: {additional_data.get('macd_crossover', 'No disponible')}
     - Velas desde el cruce: {additional_data.get('candles_since_crossover', 'No disponible')}
+    - Spread: {additional_data.get('spread', 'No disponible')}
+    - Imbalance (bids/asks): {additional_data.get('imbalance', 'No disponible')}
+    - Profundidad del libro: {additional_data.get('depth', 'No disponible')}
+    - Tendencia de volumen: {additional_data.get('volume_trend', 'No disponible')}
+    - Tendencia de precio: {additional_data.get('price_trend', 'No disponible')}
+    - Tendencia de volumen corto: {additional_data.get('short_volume_trend', 'No disponible')}
+    - Nivel de soporte: {additional_data.get('support_level', 'No disponible')}
     """
     return prompt
 
@@ -233,11 +391,12 @@ def gpt_decision_buy(prepared_text):
     Eres un experto en trading de criptomonedas. Basándote en los datos:
     {prepared_text}
     Decide si "comprar" o "mantener". Responde SOLO con un JSON válido sin etiquetas '''json''' ni antes ni despues, como este:
-    {{"accion": "comprar", "confianza": 85, "explicacion": "Cruce alcista de MACD reciente y RSI bajo"}}
+    {{"accion": "comprar", "confianza": 85, "explicacion": "Cruce alcista de MACD reciente, RSI bajo, y tendencia de volumen creciente indican potencial de subida desde soporte"}}
     Criterios:
-    - Prioriza los cruces alcistas recientes de MACD como una señal fuerte de compra, especialmente si están acompañados de RSI < 65, ADX > 25, y volumen relativo > 1.0.
-    - Comprar si hay señales de crecimiento combinadas con el cruce de MACD.
-    - Mantener si no hay cruce alcista reciente o si hay señales de sobrecompra (RSI > 70).
+    - Prioriza los cruces alcistas recientes de MACD como una señal fuerte de compra, especialmente si están acompañados de RSI <= 30, ADX > 20, volumen relativo > 0.8, y una tendencia de volumen o precio 'increasing'.
+    - Considera comprar si hay señales de crecimiento (tendencia de volumen o precio creciente, volumen relativo alto, o short volume trend 'increasing') combinadas con un nivel de soporte cercano (support_level cerca del precio actual) y un imbalance > 1.2.
+    - Mantener si no hay cruce alcista reciente, RSI > 70, o si las tendencias de volumen y precio son 'decreasing' o 'stable' sin soporte claro.
+    - Evalúa la profundidad del libro (>10000) y el spread (<0.5% del precio) para asegurar liquidez.
     """
     max_retries = 2
     for attempt in range(max_retries + 1):
@@ -285,9 +444,9 @@ def execute_order_buy(symbol, amount, indicators, confidence):
     try:
         order = exchange.create_market_buy_order(symbol, amount)
         price = order.get("price", fetch_price(symbol))
-        # Usa el valor real ejecutado si está disponible
         executed_amount = order.get("filled", amount)
         if price is None:
+            logging.error(f"No se pudo obtener precio para {symbol} después de la orden")
             return None
         timestamp = datetime.now(timezone.utc).isoformat()
         trade_id = f"{symbol}_{timestamp.replace(':', '-')}"
@@ -298,24 +457,27 @@ def execute_order_buy(symbol, amount, indicators, confidence):
             INSERT INTO transactions_new (
                 symbol, action, price, amount, timestamp, trade_id, rsi, adx, atr, 
                 relative_volume, divergence, bb_position, confidence, has_macd_crossover, 
-                candles_since_crossover, spread, imbalance, depth
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                candles_since_crossover, volume_trend, price_trend, short_volume_trend, 
+                support_level, spread, imbalance, depth
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             symbol, "buy", price, executed_amount, timestamp, trade_id,
             indicators.get('rsi'), indicators.get('adx'), indicators.get('atr'),
             indicators.get('relative_volume'), indicators.get('divergence'), indicators.get('bb_position'), 
             confidence, 1 if indicators.get('has_macd_crossover') else 0, 
             indicators.get('candles_since_crossover'),
-            indicators.get('spread'), indicators.get('imbalance'), indicators.get('depth')
+            indicators.get('volume_trend'), indicators.get('price_trend'), indicators.get('short_volume_trend'),
+            indicators.get('support_level'), indicators.get('spread'), indicators.get('imbalance'), 
+            indicators.get('depth')
         ))
         conn.commit()
         conn.close()
-        # Retorna la cantidad efectivamente ejecutada
+        
+        logging.info(f"Compra ejecutada: {symbol} a {price} por {executed_amount} (ID: {trade_id})")
         return {"price": price, "filled": executed_amount, "trade_id": trade_id, "indicators": indicators}
     except Exception as e:
         logging.error(f"Error al ejecutar orden de compra para {symbol}: {e}")
         return None
-
 
 def sell_symbol(symbol, amount, trade_id):
     try:
@@ -448,24 +610,27 @@ def generate_profit_loss_table():
     
     cursor.execute("""
         SELECT symbol, action, price, amount, timestamp, trade_id, rsi, adx, atr, 
-               relative_volume, divergence, bb_position, confidence 
+               relative_volume, divergence, bb_position, confidence, has_macd_crossover, 
+               candles_since_crossover, volume_trend, price_trend, short_volume_trend, 
+               support_level, spread, imbalance, depth
         FROM transactions_new 
         WHERE trade_id IS NOT NULL 
         ORDER BY trade_id, timestamp
     """)
     transactions = cursor.fetchall()
-    conn.close()
 
     trades = {}
     for row in transactions:
-        symbol, action, price, amount, timestamp, trade_id, rsi, adx, atr, rel_vol, div, bb_pos, conf = row
+        symbol, action, price, amount, timestamp, trade_id, rsi, adx, atr, rel_vol, div, bb_pos, conf, has_macd, candles, vol_trend, price_trend, short_vol_trend, support, spread, imbalance, depth = row
         if trade_id not in trades:
             trades[trade_id] = {"buy": None, "sell": None}
         if action == "buy":
             trades[trade_id]["buy"] = {
                 "price": price, "amount": amount, "timestamp": timestamp, "rsi": rsi, "adx": adx, 
                 "atr": atr, "relative_volume": rel_vol, "divergence": div, "bb_position": bb_pos, 
-                "confidence": conf
+                "confidence": conf, "has_macd_crossover": has_macd, "candles_since_crossover": candles,
+                "volume_trend": vol_trend, "price_trend": price_trend, "short_volume_trend": short_vol_trend,
+                "support_level": support, "spread": spread, "imbalance": imbalance, "depth": depth
             }
         elif action == "sell":
             trades[trade_id]["sell"] = {
@@ -505,12 +670,24 @@ def generate_profit_loss_table():
                 "divergence_buy": buy_data["divergence"],
                 "bb_position_buy": buy_data["bb_position"],
                 "confidence": buy_data["confidence"],
+                "has_macd_crossover_buy": buy_data["has_macd_crossover"],
+                "candles_since_crossover_buy": buy_data["candles_since_crossover"],
+                "volume_trend_buy": buy_data["volume_trend"],
+                "price_trend_buy": buy_data["price_trend"],
+                "short_volume_trend_buy": buy_data["short_volume_trend"],
+                "support_level_buy": buy_data["support_level"],
+                "spread_buy": buy_data["spread"],
+                "imbalance_buy": buy_data["imbalance"],
+                "depth_buy": buy_data["depth"],
                 "rsi_sell": sell_data["rsi"],
                 "adx_sell": sell_data["adx"],
                 "atr_sell": sell_data["atr"],
                 "trailing_percent": trailing_percent,
                 "trade_duration": trade_duration
             })
+
+            # Llamar a analyze_trade_outcome para cada trade completado
+            analyze_trade_outcome(trade_id)
 
     if not completed_trades:
         logging.info("No hay operaciones completadas para mostrar.")
@@ -520,7 +697,9 @@ def generate_profit_loss_table():
     df = df[[
         "trade_id", "symbol", "buy_price", "sell_price", "amount", "profit_loss", "profit_percent",
         "buy_time", "sell_time", "rsi_buy", "adx_buy", "atr_buy", "relative_volume_buy", 
-        "divergence_buy", "bb_position_buy", "confidence", "rsi_sell", "adx_sell", "atr_sell",
+        "divergence_buy", "bb_position_buy", "confidence", "has_macd_crossover_buy", "candles_since_crossover_buy",
+        "volume_trend_buy", "price_trend_buy", "short_volume_trend_buy", "support_level_buy", 
+        "spread_buy", "imbalance_buy", "depth_buy", "rsi_sell", "adx_sell", "atr_sell",
         "trailing_percent", "trade_duration"
     ]]
     
@@ -614,17 +793,63 @@ def demo_trading(high_volume_symbols=None):
         if current_price is None:
             logging.warning(f"Se omite {symbol} por no obtener precio")
             continue
-        if order_book_data['spread'] > 0.005 * current_price:  # Filtro: spread < 0.5% del precio
-            logging.info(f"Se omite {symbol} por spread alto: {order_book_data['spread']}")
+        try:
+            current_price = float(current_price)
+            spread = float(order_book_data['spread']) if order_book_data['spread'] is not None else float('inf')
+            imbalance = float(order_book_data['imbalance']) if order_book_data['imbalance'] is not None else 0
+            depth = float(order_book_data['depth'])
+        except (ValueError, TypeError) as e:
+            logging.error(f"Error al convertir datos numéricos para {symbol}: {e}")
             continue
-        if order_book_data['imbalance'] < 1.5:  # Filtro: más presión compradora (bids > 1.5 * asks)
-            logging.info(f"Se omite {symbol} por imbalance bajo: {order_book_data['imbalance']}")
+
+        if spread > 0.005 * current_price:  # Filtro: spread < 0.5% del precio
+            logging.info(f"Se omite {symbol} por spread alto: {spread}")
+            continue
+        if imbalance < 1.2:  # Filtro ajustado: más presión compradora
+            logging.info(f"Se omite {symbol} por imbalance bajo: {imbalance}")
             continue
 
         data, volume_series, price_series = fetch_and_prepare_data(symbol)
         if not data or volume_series is None or price_series is None:
             logging.warning(f"Se omite {symbol} por datos insuficientes")
             continue
+
+        # Detectar soporte potencial
+        support_level = detect_support_level(price_series)
+        if support_level is None or current_price > support_level * 1.02:  # Si no estamos cerca de soporte (<2% arriba)
+            logging.info(f"Se omite {symbol} por no estar cerca de soporte: Precio={current_price}, Soporte={support_level}")
+            continue
+
+        # Calcular tendencias cortas
+        short_volume_trend = calculate_short_volume_trend(volume_series)
+        if short_volume_trend == "decreasing":
+            logging.info(f"Se omite {symbol} por tendencia de volumen decreciente a corto plazo")
+            continue
+
+        # Calcular tendencias largas
+        if len(volume_series) >= 10:
+            last_10_volume = volume_series[-10:]
+            slope_volume, _, _, _, _ = linregress(range(10), last_10_volume)
+            if slope_volume > 0.01:
+                volume_trend = "increasing"
+            elif slope_volume < -0.01:
+                volume_trend = "decreasing"
+            else:
+                volume_trend = "stable"
+        else:
+            volume_trend = "insufficient data"
+
+        if len(price_series) >= 10:
+            last_10_price = price_series[-10:]
+            slope_price, _, _, _, _ = linregress(range(10), last_10_price)
+            if slope_price > 0.01:
+                price_trend = "increasing"
+            elif slope_price < -0.01:
+                price_trend = "decreasing"
+            else:
+                price_trend = "stable"
+        else:
+            price_trend = "insufficient data"
 
         rsi = data['1h']['RSI'].iloc[-1] if not pd.isna(data['1h']['RSI'].iloc[-1]) else None
         adx = calculate_adx(data['1h'])
@@ -648,9 +873,13 @@ def demo_trading(high_volume_symbols=None):
             "momentum_divergences": divergence,
             "macd_crossover": "Sí" if has_crossover else "No",
             "candles_since_crossover": candles_since if has_crossover else "N/A",
-            "spread": order_book_data['spread'],
-            "imbalance": order_book_data['imbalance'],
-            "depth": order_book_data['depth']
+            "spread": spread,
+            "imbalance": imbalance,
+            "depth": depth,
+            "volume_trend": volume_trend,
+            "price_trend": price_trend,
+            "short_volume_trend": short_volume_trend,
+            "support_level": support_level
         }
         indicators = {
             "rsi": rsi,
@@ -663,15 +892,16 @@ def demo_trading(high_volume_symbols=None):
             "macd_signal": macd_signal,
             "has_macd_crossover": has_crossover,
             "candles_since_crossover": candles_since,
-            "spread": order_book_data['spread'],
-            "imbalance": order_book_data['imbalance'],
-            "depth": order_book_data['depth']
+            "spread": spread,
+            "imbalance": imbalance,
+            "depth": depth,
+            "volume_trend": volume_trend,
+            "price_trend": price_trend,
+            "short_volume_trend": short_volume_trend,
+            "support_level": support_level
         }
 
-        if (rsi is None or rsi >= RSI_THRESHOLD) or \
-           (adx is None or adx < ADX_THRESHOLD) or \
-           (relative_volume is None or relative_volume < VOLUME_GROWTH_THRESHOLD) or \
-           (not has_crossover and macd <= macd_signal and not (macd > macd_signal and macd_signal > 0)):
+        if (rsi is None or rsi >= 30) or (adx is None or adx < 20) or (relative_volume is None or relative_volume < 0.8) or (not has_crossover and macd <= macd_signal and not (macd > macd_signal and macd_signal > 0)):
             logging.info(f"Se omite {symbol} por no cumplir filtros cuantitativos: RSI={rsi}, ADX={adx}, Volumen Relativo={relative_volume}, MACD={macd} vs Signal={macd_signal}, Cruce MACD={'Sí' if has_crossover else 'No'}")
             continue
 
@@ -685,15 +915,16 @@ def demo_trading(high_volume_symbols=None):
         if current_price is None:
             logging.warning(f"No se pudo obtener precio actual para {symbol}, omitiendo compra")
             continue
+        current_price = float(current_price)
 
         cached_decision = get_cached_decision(symbol, indicators)
         if cached_decision:
             action, confidence, explanation = cached_decision
         else:
-            if indicators['rsi'] is not None and indicators['rsi'] < 30 and indicators['adx'] is not None and indicators['adx'] > 35:
+            if indicators['rsi'] is not None and indicators['rsi'] <= 30 and indicators['adx'] is not None and indicators['adx'] > 25:  # Ajustamos ADX para más precisión
                 action = "comprar"
                 confidence = 90
-                explanation = "RSI muy bajo y ADX alto"
+                explanation = "RSI bajo y ADX alto indican potencial de rebote desde soporte"
             else:
                 prepared_text = gpt_prepare_data(data, additional_data)
                 action, confidence, explanation = gpt_decision_buy(prepared_text)

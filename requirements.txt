@@ -7,3 +7,4 @@ gunicorn
 requests
 ta
 python-dotenv
+pandas_ta
