@@ -68,7 +68,7 @@ logging.basicConfig(
 )
 
 # Constantes
-MAX_DAILY_BUYS = 5
+MAX_DAILY_BUYS = 10
 MIN_NOTIONAL = 10
 RSI_THRESHOLD = 65
 ADX_THRESHOLD = 25
