@@ -78,6 +78,28 @@ VOLUME_GROWTH_THRESHOLD = 1.0
 decision_cache = {}
 CACHE_EXPIRATION = 1800  # 30 minutos
 
+# book data
+def fetch_order_book_data(symbol, limit=10):
+    try:
+        order_book = exchange.fetch_order_book(symbol, limit=limit)
+        bids = order_book['bids']
+        asks = order_book['asks']
+        spread = asks[0][0] - bids[0][0] if bids and asks else None
+        bid_volume = sum([volume for _, volume in bids])
+        ask_volume = sum([volume for _, volume in asks])
+        imbalance = bid_volume / ask_volume if ask_volume > 0 else None
+        depth = bid_volume + ask_volume  # Profundidad total
+        return {
+            'spread': spread,
+            'bid_volume': bid_volume,
+            'ask_volume': ask_volume,
+            'imbalance': imbalance,
+            'depth': depth
+        }
+    except Exception as e:
+        logging.error(f"Error al obtener order book para {symbol}: {e}")
+        return None
+    
 # Funciones Utilitarias
 def send_telegram_message(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -264,7 +286,6 @@ def execute_order_buy(symbol, amount, indicators, confidence):
         order = exchange.create_market_buy_order(symbol, amount)
         price = order.get("price", fetch_price(symbol))
         if price is None:
-            logging.error(f"No se pudo obtener precio para {symbol} después de la orden")
             return None
         timestamp = datetime.now(timezone.utc).isoformat()
         trade_id = f"{symbol}_{timestamp.replace(':', '-')}"
@@ -274,23 +295,21 @@ def execute_order_buy(symbol, amount, indicators, confidence):
         cursor.execute('''
             INSERT INTO transactions_new (
                 symbol, action, price, amount, timestamp, trade_id, rsi, adx, atr, 
-                relative_volume, divergence, bb_position, confidence, has_macd_crossover, candles_since_crossover
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                relative_volume, divergence, bb_position, confidence, has_macd_crossover, 
+                candles_since_crossover, spread, imbalance, depth
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             symbol, "buy", price, amount, timestamp, trade_id,
             indicators.get('rsi'), indicators.get('adx'), indicators.get('atr'),
             indicators.get('relative_volume'), indicators.get('divergence'), indicators.get('bb_position'), 
-            confidence, 
-            1 if indicators.get('has_macd_crossover') else 0,  # Convertir booleano a 1/0
-            indicators.get('candles_since_crossover')
+            confidence, 1 if indicators.get('has_macd_crossover') else 0, 
+            indicators.get('candles_since_crossover'),
+            indicators.get('spread'), indicators.get('imbalance'), indicators.get('depth')
         ))
         conn.commit()
         conn.close()
-        
-        logging.info(f"Compra ejecutada: {symbol} a {price} por {amount} (ID: {trade_id})")
         return {"price": price, "filled": amount, "trade_id": trade_id, "indicators": indicators}
     except Exception as e:
-        logging.error(f"Error al comprar {symbol}: {e}")
         return None
 
 def sell_symbol(symbol, amount, trade_id):
@@ -501,6 +520,27 @@ def get_cached_decision(symbol, current_indicators):
                 return cached_decision
     return None
 
+def fetch_order_book_data(symbol, limit=10):
+    try:
+        order_book = exchange.fetch_order_book(symbol, limit=limit)
+        bids = order_book['bids']
+        asks = order_book['asks']
+        spread = asks[0][0] - bids[0][0] if bids and asks else None
+        bid_volume = sum([volume for _, volume in bids])
+        ask_volume = sum([volume for _, volume in asks])
+        imbalance = bid_volume / ask_volume if ask_volume > 0 else None
+        depth = bid_volume + ask_volume
+        return {
+            'spread': spread,
+            'bid_volume': bid_volume,
+            'ask_volume': ask_volume,
+            'imbalance': imbalance,
+            'depth': depth
+        }
+    except Exception as e:
+        logging.error(f"Error al obtener order book para {symbol}: {e}")
+        return None
+
 def demo_trading(high_volume_symbols=None):
     print("Iniciando trading...")
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
@@ -526,6 +566,7 @@ def demo_trading(high_volume_symbols=None):
     print(f"Presupuesto por operación: {budget_per_trade}")
     balance = exchange.fetch_balance()['free']
     print(f"Balance actual: {balance}")
+
     for symbol in selected_cryptos:
         print(f"Procesando {symbol}...")
         base_asset = symbol.split('/')[0]
@@ -538,14 +579,28 @@ def demo_trading(high_volume_symbols=None):
             logging.info(f"Se omite {symbol} por volumen insuficiente: {daily_volume}")
             continue
 
+        # Obtener datos del libro de órdenes
+        order_book_data = fetch_order_book_data(symbol)
+        if not order_book_data:
+            logging.warning(f"Se omite {symbol} por fallo en datos del libro de órdenes")
+            continue
+        if order_book_data['depth'] < 10000:  # Filtro: profundidad mínima en USDT
+            logging.info(f"Se omite {symbol} por profundidad insuficiente: {order_book_data['depth']}")
+            continue
+        current_price = fetch_price(symbol)
+        if current_price is None:
+            logging.warning(f"Se omite {symbol} por no obtener precio")
+            continue
+        if order_book_data['spread'] > 0.005 * current_price:  # Filtro: spread < 0.5% del precio
+            logging.info(f"Se omite {symbol} por spread alto: {order_book_data['spread']}")
+            continue
+        if order_book_data['imbalance'] < 1.5:  # Filtro: más presión compradora (bids > 1.5 * asks)
+            logging.info(f"Se omite {symbol} por imbalance bajo: {order_book_data['imbalance']}")
+            continue
+
         data, volume_series, price_series = fetch_and_prepare_data(symbol)
         if not data or volume_series is None or price_series is None:
             logging.warning(f"Se omite {symbol} por datos insuficientes")
-            continue
-
-        current_price = fetch_price(symbol)
-        if current_price is None:
-            logging.warning(f"No se pudo obtener precio para {symbol}")
             continue
 
         rsi = data['1h']['RSI'].iloc[-1] if not pd.isna(data['1h']['RSI'].iloc[-1]) else None
@@ -569,7 +624,10 @@ def demo_trading(high_volume_symbols=None):
             "relative_volume": relative_volume if relative_volume is not None else "No disponible",
             "momentum_divergences": divergence,
             "macd_crossover": "Sí" if has_crossover else "No",
-            "candles_since_crossover": candles_since if has_crossover else "N/A"
+            "candles_since_crossover": candles_since if has_crossover else "N/A",
+            "spread": order_book_data['spread'],
+            "imbalance": order_book_data['imbalance'],
+            "depth": order_book_data['depth']
         }
         indicators = {
             "rsi": rsi,
@@ -581,7 +639,10 @@ def demo_trading(high_volume_symbols=None):
             "macd": macd,
             "macd_signal": macd_signal,
             "has_macd_crossover": has_crossover,
-            "candles_since_crossover": candles_since
+            "candles_since_crossover": candles_since,
+            "spread": order_book_data['spread'],
+            "imbalance": order_book_data['imbalance'],
+            "depth": order_book_data['depth']
         }
 
         if (rsi is None or rsi >= RSI_THRESHOLD) or \
