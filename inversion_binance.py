@@ -285,6 +285,8 @@ def execute_order_buy(symbol, amount, indicators, confidence):
     try:
         order = exchange.create_market_buy_order(symbol, amount)
         price = order.get("price", fetch_price(symbol))
+        # Usa el valor real ejecutado si está disponible
+        executed_amount = order.get("filled", amount)
         if price is None:
             return None
         timestamp = datetime.now(timezone.utc).isoformat()
@@ -299,7 +301,7 @@ def execute_order_buy(symbol, amount, indicators, confidence):
                 candles_since_crossover, spread, imbalance, depth
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
-            symbol, "buy", price, amount, timestamp, trade_id,
+            symbol, "buy", price, executed_amount, timestamp, trade_id,
             indicators.get('rsi'), indicators.get('adx'), indicators.get('atr'),
             indicators.get('relative_volume'), indicators.get('divergence'), indicators.get('bb_position'), 
             confidence, 1 if indicators.get('has_macd_crossover') else 0, 
@@ -308,12 +310,30 @@ def execute_order_buy(symbol, amount, indicators, confidence):
         ))
         conn.commit()
         conn.close()
-        return {"price": price, "filled": amount, "trade_id": trade_id, "indicators": indicators}
+        # Retorna la cantidad efectivamente ejecutada
+        return {"price": price, "filled": executed_amount, "trade_id": trade_id, "indicators": indicators}
     except Exception as e:
+        logging.error(f"Error al ejecutar orden de compra para {symbol}: {e}")
         return None
+
 
 def sell_symbol(symbol, amount, trade_id):
     try:
+        # Extraer el activo base (por ejemplo, "RAY" de "RAY/USDT")
+        base_asset = symbol.split('/')[0]
+        # Consultar el saldo disponible para el activo base
+        balance_info = exchange.fetch_balance()
+        available = balance_info['free'].get(base_asset, 0)
+        if available < amount:
+            logging.warning(f"Balance insuficiente para {symbol}: se intenta vender {amount} pero disponible es {available}. Ajustando cantidad.")
+            amount = available
+            # Si es posible, redondear a la precisión requerida (si ccxt lo soporta)
+            try:
+                amount = float(exchange.amount_to_precision(symbol, amount))
+            except Exception as ex:
+                logging.warning(f"No se pudo redondear la cantidad para {symbol}: {ex}")
+
+        # Intentar obtener datos para análisis
         data, volume_series, price_series = fetch_and_prepare_data(symbol)
         if data is None:
             logging.error(f"No se pudieron obtener datos para vender {symbol}")
@@ -331,12 +351,14 @@ def sell_symbol(symbol, amount, trade_id):
             conn.close()
             return
         
+        # Si se tienen datos, se procede con el análisis adicional (opcional)
         price = fetch_price(symbol)
         timestamp = datetime.now(timezone.utc).isoformat()
         rsi = data['1h']['RSI'].iloc[-1] if not pd.isna(data['1h']['RSI'].iloc[-1]) else None
         adx = calculate_adx(data['1h'])
         atr = data['1h']['ATR'].iloc[-1] if not pd.isna(data['1h']['ATR'].iloc[-1]) else None
-        
+
+        # Ejecutar la orden de venta con el monto ajustado
         order = exchange.create_market_sell_order(symbol, amount)
         sell_price = order.get("price", price)
         conn = sqlite3.connect(DB_NAME)
@@ -352,6 +374,7 @@ def sell_symbol(symbol, amount, trade_id):
         send_telegram_message(f"✅ *Venta Ejecutada* para `{symbol}`\nPrecio: `{sell_price}`\nCantidad: `{amount}`")
     except Exception as e:
         logging.error(f"Error al vender {symbol}: {e}")
+
 
 def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, entry_indicators):
     def trailing_logic():
