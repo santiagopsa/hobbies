@@ -313,7 +313,9 @@ def on_error(ws, error):
 
 def on_close(ws, close_status_code, close_msg):
     log_queue.put((logging.WARNING, f"WebSocket cerrado: {close_status_code} - {close_msg}. Reconectando..."))
+    ws.keep_running = False  # Esto le indica a run_forever que debe finalizar
     time.sleep(2)
+
 
 def on_open(ws):
     log_queue.put((logging.INFO, "Conexión WebSocket abierta"))
@@ -321,18 +323,23 @@ def on_open(ws):
 def start_websocket():
     url = "wss://stream.binance.com:9443/ws/!ticker@arr"
     while True:
+        ws = websocket.WebSocketApp(
+            url,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close
+        )
         try:
-            ws = websocket.WebSocketApp(
-                url,
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
-            )
             ws.run_forever()
         except Exception as e:
             log_queue.put((logging.ERROR, f"Excepción en WebSocket: {e}. Reintentando en 5 segundos..."))
             time.sleep(5)
+        finally:
+            ws.close()
+            del ws
+            time.sleep(5)
+
 
 def start_ws_thread():
     threading.Thread(target=start_websocket, daemon=True).start()
