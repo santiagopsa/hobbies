@@ -208,7 +208,7 @@ def gpt_decision_buy(prepared_text):
     prompt = f"""
     Eres un experto en trading de criptomonedas. Basándote en los datos:
     {prepared_text}
-    Decide si "comprar" o "mantener". Responde SOLO con un JSON válido como este:
+    Decide si "comprar" o "mantener". Responde SOLO con un JSON válido sin etiquetas '''json''' ni antes ni despues, como este:
     {{"accion": "comprar", "confianza": 85, "explicacion": "Cruce alcista de MACD reciente y RSI bajo"}}
     Criterios:
     - Prioriza los cruces alcistas recientes de MACD como una señal fuerte de compra, especialmente si están acompañados de RSI < 65, ADX > 25, y volumen relativo > 1.0.
