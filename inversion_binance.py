@@ -11,9 +11,10 @@ import threading
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from openai import OpenAI
-from ta.trend import MACD
 import pytz
+import pandas_ta as ta  # Nueva librería reemplazando ta-lib
 from elegir_cripto import choose_best_cryptos
+
 # Configuración e Inicialización
 load_dotenv()
 GPT_MODEL = "gpt-4o-mini"
@@ -119,14 +120,15 @@ def fetch_and_prepare_data(symbol):
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
-            df['RSI'] = pd.Series(np.nan_to_num(pd.Series([talib.RSI(df['close'].values, timeperiod=14)]).iloc[0]))
-            df['ATR'] = pd.Series(np.nan_to_num(pd.Series([talib.ATR(df['high'].values, df['low'].values, df['close'].values, timeperiod=14)]).iloc[0]))
-            bb_upper, bb_middle, bb_lower = talib.BBANDS(df['close'], timeperiod=20, nbdevup=2, nbdevdn=2)
-            df['BB_upper'] = bb_upper
-            df['BB_lower'] = bb_lower
-            macd = MACD(df['close'], window_slow=26, window_fast=12, window_sign=9)
-            df['MACD'] = macd.macd()
-            df['MACD_signal'] = macd.macd_signal()
+            # Reemplazo de ta-lib con pandas_ta
+            df['RSI'] = ta.rsi(df['close'], length=14)
+            df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+            bb = ta.bbands(df['close'], length=20, std=2)  # Bollinger Bands
+            df['BB_upper'] = bb['BBU_20_2.0']
+            df['BB_lower'] = bb['BBL_20_2.0']
+            macd = ta.macd(df['close'], fast=12, slow=26, signal=9)  # MACD
+            df['MACD'] = macd['MACD_12_26_9']
+            df['MACD_signal'] = macd['MACDs_12_26_9']
             data[tf] = df
         volume_series = data['1h']['volume']
         price_series = data['1h']['close']
@@ -140,8 +142,8 @@ def fetch_and_prepare_data(symbol):
 
 def calculate_adx(df):
     try:
-        adx = talib.ADX(df['high'], df['low'], df['close'], timeperiod=14)
-        return adx.iloc[-1] if not pd.isna(adx.iloc[-1]) else None
+        adx = ta.adx(df['high'], df['low'], df['close'], length=14)
+        return adx['ADX_14'].iloc[-1] if not pd.isna(adx['ADX_14'].iloc[-1]) else None
     except Exception as e:
         logging.error(f"Error al calcular ADX: {e}")
         return None
@@ -175,9 +177,6 @@ def get_bb_position(price, bb_upper, bb_lower):
         return "between"
 
 def has_recent_macd_crossover(macd_series, signal_series, lookback=5):
-    """
-    Verifica si ha habido un cruce alcista de MACD en las últimas 'lookback' velas.
-    """
     for i in range(-1, -lookback-1, -1):
         if i < -len(macd_series):
             break
@@ -512,7 +511,7 @@ def demo_trading(high_volume_symbols=None):
         logging.info("Límite diario de compras alcanzado.")
         return
     if high_volume_symbols is None:
-        high_volume_symbols=choose_best_cryptos(base_currency="USDT", top_n=100)
+        high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=100)
 
     budget_per_trade = available_for_trading / (MAX_DAILY_BUYS - daily_buys)
     selected_cryptos = high_volume_symbols

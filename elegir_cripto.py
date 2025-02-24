@@ -3,6 +3,7 @@ import pandas as pd
 import os
 import logging
 from dotenv import load_dotenv
+import time
 
 # Configurar logging a nivel INFO
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -19,11 +20,25 @@ exchange = ccxt.binance({
     'options': {'defaultType': 'spot'}
 })
 
+markets_cache = None
+markets_cache_timestamp = None
+CACHE_DURATION = 3600  # 1 hora en segundos
+
+def get_markets():
+    global markets_cache, markets_cache_timestamp
+    current_time = time.time()
+    if markets_cache is None or (markets_cache_timestamp and current_time - markets_cache_timestamp > CACHE_DURATION):
+        logging.info("Actualizando caché de mercados...")
+        markets_cache = exchange.load_markets()
+        markets_cache_timestamp = current_time
+    return markets_cache
+
 def choose_best_cryptos(base_currency="USDT", top_n=100, min_volume=10000):
+    start_time = time.time()
     logging.info("Iniciando elección de criptomonedas (versión optimizada).")
     
     # Cargar todos los mercados y filtrar los símbolos que cumplen los criterios
-    markets = exchange.load_markets()
+    markets = get_markets()
     valid_symbols = [
         symbol for symbol, market in markets.items()
         if market['quote'] == base_currency and market['type'] == 'spot' and market['active']
@@ -42,8 +57,8 @@ def choose_best_cryptos(base_currency="USDT", top_n=100, min_volume=10000):
         # Filtrar por volumen mínimo
         try:
             quote_volume = float(ticker.get('quoteVolume', 0))
-        except Exception as e:
-            logging.error(f"Error al parsear quoteVolume para {symbol}: {e}")
+        except ValueError as e:
+            logging.error(f"Volumen no convertible para {symbol}: {ticker.get('quoteVolume')}, error: {e}")
             continue
         
         if quote_volume < min_volume:
@@ -93,9 +108,9 @@ def choose_best_cryptos(base_currency="USDT", top_n=100, min_volume=10000):
     
     logging.info(f"Total de criptos analizadas: {len(crypto_data)}; Criptos seleccionadas: {len(formatted_symbols)}")
     logging.info(f"Lista final de criptos seleccionadas: {formatted_symbols}")
+    logging.info(f"Tiempo de ejecución: {time.time() - start_time:.2f}s")
     return formatted_symbols
 
 if __name__ == "__main__":
     selected_cryptos = choose_best_cryptos(base_currency="USDT", top_n=100)
     print(f"Top 100 criptos seleccionadas: {len(selected_cryptos)} símbolos")
-
