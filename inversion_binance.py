@@ -39,7 +39,9 @@ def initialize_db():
             relative_volume REAL,
             divergence TEXT,
             bb_position TEXT,
-            confidence REAL
+            confidence REAL,
+            has_macd_crossover INTEGER,  -- 1 si hay cruce alcista reciente, 0 si no
+            candles_since_crossover INTEGER  -- Número de velas desde el cruce
         )
     ''')
     conn.commit()
@@ -270,12 +272,17 @@ def execute_order_buy(symbol, amount, indicators, confidence):
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO transactions_new (symbol, action, price, amount, timestamp, trade_id, rsi, adx, atr, relative_volume, divergence, bb_position, confidence)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO transactions_new (
+                symbol, action, price, amount, timestamp, trade_id, rsi, adx, atr, 
+                relative_volume, divergence, bb_position, confidence, has_macd_crossover, candles_since_crossover
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             symbol, "buy", price, amount, timestamp, trade_id,
             indicators.get('rsi'), indicators.get('adx'), indicators.get('atr'),
-            indicators.get('relative_volume'), indicators.get('divergence'), indicators.get('bb_position'), confidence
+            indicators.get('relative_volume'), indicators.get('divergence'), indicators.get('bb_position'), 
+            confidence, 
+            1 if indicators.get('has_macd_crossover') else 0,  # Convertir booleano a 1/0
+            indicators.get('candles_since_crossover')
         ))
         conn.commit()
         conn.close()
