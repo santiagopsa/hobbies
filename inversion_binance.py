@@ -78,8 +78,8 @@ logging.basicConfig(
 # Constantes
 MAX_DAILY_BUYS = 10
 MIN_NOTIONAL = 10
-RSI_THRESHOLD = 30
-ADX_THRESHOLD = 20
+RSI_THRESHOLD = 40
+ADX_THRESHOLD = 15
 VOLUME_GROWTH_THRESHOLD = 0.8
 
 # Cache de decisiones
@@ -744,12 +744,12 @@ def fetch_order_book_data(symbol, limit=10):
         return None
 
 def demo_trading(high_volume_symbols=None):
-    print("Iniciando trading...")
+    print("Iniciando trading en segundo plano...")
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
     print(f"Saldo USDT disponible: {usdt_balance}")
     if usdt_balance < MIN_NOTIONAL:
         logging.warning("Saldo insuficiente en USDT.")
-        return
+        return False
 
     reserve = 50  # Reserva para comisiones y posibles pérdidas
     available_for_trading = usdt_balance - reserve
@@ -758,7 +758,7 @@ def demo_trading(high_volume_symbols=None):
     print(f"Compras diarias realizadas: {daily_buys}")
     if daily_buys >= MAX_DAILY_BUYS:
         logging.info("Límite diario de compras alcanzado.")
-        return
+        return False
     if high_volume_symbols is None:
         high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=100)
 
@@ -777,7 +777,7 @@ def demo_trading(high_volume_symbols=None):
             continue
 
         daily_volume = fetch_volume(symbol)
-        if daily_volume is None or daily_volume < 1000000:
+        if daily_volume is None or daily_volume < 500000:  # Lowered from 1000000
             logging.info(f"Se omite {symbol} por volumen insuficiente: {daily_volume}")
             continue
 
@@ -786,7 +786,7 @@ def demo_trading(high_volume_symbols=None):
         if not order_book_data:
             logging.warning(f"Se omite {symbol} por fallo en datos del libro de órdenes")
             continue
-        if order_book_data['depth'] < 10000:  # Filtro: profundidad mínima en USDT
+        if order_book_data['depth'] < 5000:  # Lowered from 10000
             logging.info(f"Se omite {symbol} por profundidad insuficiente: {order_book_data['depth']}")
             continue
         current_price = fetch_price(symbol)
@@ -802,10 +802,10 @@ def demo_trading(high_volume_symbols=None):
             logging.error(f"Error al convertir datos numéricos para {symbol}: {e}")
             continue
 
-        if spread > 0.005 * current_price:  # Filtro: spread < 0.5% del precio
+        if spread > 0.005 * current_price:  # Keeping spread filter unchanged
             logging.info(f"Se omite {symbol} por spread alto: {spread}")
             continue
-        if imbalance < 1.2:  # Filtro ajustado: más presión compradora
+        if imbalance < 1.2:  # Keeping imbalance filter unchanged
             logging.info(f"Se omite {symbol} por imbalance bajo: {imbalance}")
             continue
 
@@ -820,7 +820,7 @@ def demo_trading(high_volume_symbols=None):
             logging.info(f"Se omite {symbol} por no estar cerca de soporte: Precio={current_price}, Soporte={support_level}")
             continue
 
-        # Calcular tendencias cortas
+        # Calcular tendencias cortas (short-term momentum)
         short_volume_trend = calculate_short_volume_trend(volume_series)
         if short_volume_trend == "decreasing":
             logging.info(f"Se omite {symbol} por tendencia de volumen decreciente a corto plazo")
@@ -851,6 +851,13 @@ def demo_trading(high_volume_symbols=None):
         else:
             price_trend = "insufficient data"
 
+        # Short-term momentum check: prioritize increasing price or volume in the last 1-hour
+        short_price_trend = price_trend
+        short_volume_trend_1h = calculate_short_volume_trend(volume_series, window=1)  # 1-hour window for short-term momentum
+        if short_price_trend != "increasing" and short_volume_trend_1h != "increasing":
+            logging.info(f"Se omite {symbol} por falta de momentum a corto plazo: Precio={short_price_trend}, Volumen={short_volume_trend_1h}")
+            continue
+
         rsi = data['1h']['RSI'].iloc[-1] if not pd.isna(data['1h']['RSI'].iloc[-1]) else None
         adx = calculate_adx(data['1h'])
         atr = data['1h']['ATR'].iloc[-1] if not pd.isna(data['1h']['ATR'].iloc[-1]) else None
@@ -879,7 +886,9 @@ def demo_trading(high_volume_symbols=None):
             "volume_trend": volume_trend,
             "price_trend": price_trend,
             "short_volume_trend": short_volume_trend,
-            "support_level": support_level
+            "support_level": support_level,
+            "short_price_trend": short_price_trend,
+            "short_volume_trend_1h": short_volume_trend_1h
         }
         indicators = {
             "rsi": rsi,
@@ -898,7 +907,9 @@ def demo_trading(high_volume_symbols=None):
             "volume_trend": volume_trend,
             "price_trend": price_trend,
             "short_volume_trend": short_volume_trend,
-            "support_level": support_level
+            "support_level": support_level,
+            "short_price_trend": short_price_trend,
+            "short_volume_trend_1h": short_volume_trend_1h
         }
 
         if (rsi is None or rsi >= 30) or (adx is None or adx < 20) or (relative_volume is None or relative_volume < 0.8) or (not has_crossover and macd <= macd_signal and not (macd > macd_signal and macd_signal > 0)):
@@ -921,14 +932,9 @@ def demo_trading(high_volume_symbols=None):
         if cached_decision:
             action, confidence, explanation = cached_decision
         else:
-            if indicators['rsi'] is not None and indicators['rsi'] <= 30 and indicators['adx'] is not None and indicators['adx'] > 25:  # Ajustamos ADX para más precisión
-                action = "comprar"
-                confidence = 90
-                explanation = "RSI bajo y ADX alto indican potencial de rebote desde soporte"
-            else:
-                prepared_text = gpt_prepare_data(data, additional_data)
-                action, confidence, explanation = gpt_decision_buy(prepared_text)
-                decision_cache[symbol] = (time.time(), (action, confidence, explanation), indicators.copy())
+            prepared_text = gpt_prepare_data(data, additional_data)
+            action, confidence, explanation = gpt_decision_buy(prepared_text)
+            decision_cache[symbol] = (time.time(), (action, confidence, explanation), indicators.copy())
 
         if action == "comprar" and confidence >= 70:
             amount = budget_per_trade / current_price
@@ -939,8 +945,8 @@ def demo_trading(high_volume_symbols=None):
                     send_telegram_message(f"✅ *Compra* `{symbol}`\nConfianza: `{confidence}%`\nExplicación: `{explanation}`")
                     dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], order['indicators'])
 
-    generate_profit_loss_table()
-    logging.info("Trading ejecutado correctamente")
+    logging.info("Trading ejecutado correctamente en segundo plano")
+    return True  # Indicate successful execution
 
 if __name__ == "__main__":
     high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=100)

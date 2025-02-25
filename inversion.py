@@ -4,6 +4,7 @@ import ccxt
 import os
 import requests
 import numpy as np
+import threading
 from inversion_binance import demo_trading
 from dotenv import load_dotenv
 from elegir_cripto import choose_best_cryptos
@@ -147,12 +148,17 @@ def should_execute_trading(symbol):
     return execute
 
 def run_trading(high_volume_symbols=None):
-    print(f"🏁 Ejecutando demo_trading a las {datetime.datetime.now()}")
+    print(f"🏁 Ejecutando demo_trading en segundo plano a las {datetime.datetime.now()}")
     try:
-        demo_trading()
-        print("✅ Trading ejecutado correctamente.")
+        # Run demo_trading in a separate thread to avoid blocking
+        thread = threading.Thread(target=demo_trading, args=(high_volume_symbols,))
+        thread.daemon = True  # Ensure the thread doesn’t prevent the main program from exiting
+        thread.start()
+        print("✅ Trading iniciado en segundo plano.")
+        return True
     except Exception as e:
-        print(f"❌ Error al ejecutar demo_trading: {e}")
+        print(f"❌ Error al iniciar demo_trading: {e}")
+        return False
 
 def main_loop():
     global next_execution_time
