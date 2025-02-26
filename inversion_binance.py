@@ -89,12 +89,14 @@ CACHE_EXPIRATION = 300  # Reducido a 5 minutos para volatilidad
 def detect_support_level(data, price_series, window=15):
     """
     Detecta un nivel de soporte usando precios históricos y ajusta con ATR para volatilidad.
+    
     Args:
-        data: Diccionario con DataFrames de '1h', '4h', '1d' (de fetch_and_prepare_data)
-        price_series: Serie de precios de cierre ('close') para análisis
-        window: Ventana para detectar el mínimo (default 15)
+        data: Diccionario con DataFrames de '1h', '4h', '1d' (resultado de fetch_and_prepare_data).
+        price_series: Serie de precios de cierre ('close') para análisis.
+        window: Ventana para detectar el mínimo (por defecto 15).
+        
     Returns:
-        float o None si no se detecta soporte
+        float o None si no se detecta soporte.
     """
     if len(price_series) < window:
         logging.warning(f"Series too short for {price_series.name}: {len(price_series)} < {window}")
@@ -104,9 +106,9 @@ def detect_support_level(data, price_series, window=15):
     min_price = recent_prices.min()
     current_price = price_series.iloc[-1]
 
-    # Priorizar timeframes con datos suficientes, empezar por 1h
+    # Se intentará calcular ATR usando diferentes timeframes (priorizando 1h, luego 4h, luego 1d)
     timeframes = ['1h', '4h', '1d']
-    atr = 0  # Default if no valid data, but we’ll try to find valid data
+    atr = 0  # Valor por defecto en caso de fallo
     used_timeframe = None
 
     for tf in timeframes:
@@ -115,23 +117,19 @@ def detect_support_level(data, price_series, window=15):
             continue
 
         df = data[tf]
-        if len(df) < 14:  # ATR necesita al menos 14 velas
+        if len(df) < 14:  # ATR requiere al menos 14 velas
             logging.warning(f"Datos insuficientes para ATR en {price_series.name} ({tf}): {len(df)} < 14, intentando siguiente timeframe")
             continue
 
         try:
-            # Validar que las series son numéricas, no contienen NaN/None, y no tienen gaps
+            # Validar que las series son numéricas y no contienen NaN
             for col in ['high', 'low', 'close']:
                 if not pd.api.types.is_numeric_dtype(df[col]) or df[col].isna().any():
                     logging.warning(f"Datos inválidos en {col} para {price_series.name} en {tf}: tipo={df[col].dtype}, NaN={df[col].isna().sum()}")
                     atr = 0
                     break
-                if df[col].isna().any() or df[col].empty:
-                    logging.warning(f"Gaps o valores NaN en {col} para {price_series.name} en {tf}: {df[col].isna().sum()}")
-                    atr = 0
-                    break
 
-            # Validar que los índices están completos y monótonos
+            # Asegurar índices ordenados y sin duplicados
             if not df.index.is_monotonic_increasing:
                 logging.warning(f"Índices no monótonos para {price_series.name} en {tf}, ordenando")
                 df = df.sort_index()
@@ -154,43 +152,47 @@ def detect_support_level(data, price_series, window=15):
                     atr = 0
                     break
 
-            # Calcular ATR con validación adicional
+            # Calcular ATR y obtener el último valor no nulo
             atr_series = ta.atr(df['high'], df['low'], df['close'], length=14)
             if atr_series is None or atr_series.isna().all():
                 logging.error(f"ATR no calculado para {price_series.name} en {tf}: {atr_series}")
                 atr = 0
                 continue
-            atr = atr_series.iloc[-1]
 
-            if pd.isna(atr):
-                logging.warning(f"ATR contiene NaN para {price_series.name} en {tf}, intentando siguiente timeframe")
+            atr_valid = atr_series.dropna()
+            if atr_valid.empty:
+                logging.error(f"ATR no calculado para {price_series.name} en {tf} (todos NaN): {atr_series}")
+                atr = 0
                 continue
+
+            atr = atr_valid.iloc[-1]
             used_timeframe = tf
             logging.debug(f"ATR calculado para {price_series.name} en {tf}: {atr}")
-            break  # Usar el primer timeframe válido
+            break  # Usar el primer timeframe válido encontrado
 
         except KeyError as e:
-            logging.error(f"Error de clave al calcular ATR para {price_series.name} en {tf}: {e}. DataFrame columnas={df.columns.tolist()}")
+            logging.error(f"Error de clave al calcular ATR para {price_series.name} en {tf}: {e}. Columnas del DataFrame: {df.columns.tolist()}")
             continue
         except TypeError as e:
             logging.error(f"Error de tipo al calcular ATR para {price_series.name} en {tf}: {e}. Series: close={df['close'].dtype}, high={df['high'].dtype}, low={df['low'].dtype}")
             continue
         except ValueError as e:
-            logging.error(f"Error de valor al calcular ATR para {price_series.name} en {tf}: {e}. Series: close={df['close'].tolist()[:5]}, high={df['high'].tolist()[:5]}, low={df['low'].tolist()[:5]}")
+            logging.error(f"Error de valor al calcular ATR para {price_series.name} en {tf}: {e}. Ejemplos: close={df['close'].tolist()[:5]}, high={df['high'].tolist()[:5]}, low={df['low'].tolist()[:5]}")
             continue
         except Exception as e:
-            logging.error(f"Error inesperado al calcular ATR para {price_series.name} en {tf}: {e}. Series: close={df['close'].tolist()[:5]}, high={df['high'].dtype}, low={df['low'].dtype}, indices={df.index.tolist()[:5]}")
+            logging.error(f"Error inesperado al calcular ATR para {price_series.name} en {tf}: {e}. Ejemplos: close={df['close'].tolist()[:5]}, high={df['high'].dtype}, low={df['low'].dtype}, índices={df.index.tolist()[:5]}")
             continue
 
     if atr == 0 and not used_timeframe:
         logging.warning(f"No se pudo calcular ATR para {price_series.name} en ningún timeframe, usando umbral predeterminado de 2%")
-    
-    # Calcular umbral dinámico basado en ATR (cappado en 5% para limitar riesgo)
-    threshold = 1 + (atr / current_price) if atr > 0 and current_price > 0 else 1.02  # Default 2% si ATR no disponible
+
+    # Calcular umbral dinámico basado en ATR (capped en 5% para limitar riesgo)
+    threshold = 1 + (atr / current_price) if atr > 0 and current_price > 0 else 1.02  # Por defecto 2% si ATR no está disponible
     threshold = min(threshold, 1.05)  # Límite máximo del 5%
 
-    logging.debug(f"Umbral de soporte para {price_series.name}: Precio actual={current_price}, Soporte={min_price}, Umbral={threshold:.3f}, Timeframe usado={used_timeframe}")
+    logging.debug(f"Umbral de soporte para {price_series.name}: Precio actual={current_price}, Mínimo reciente={min_price}, Umbral={threshold:.3f}, Timeframe usado={used_timeframe}")
     return min_price if min_price < current_price * threshold else None
+
 
 def calculate_short_volume_trend(volume_series, window=3):
     if len(volume_series) < window:
