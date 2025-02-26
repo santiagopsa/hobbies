@@ -409,7 +409,7 @@ def fetch_and_prepare_data(symbol):
                 logging.error(f"Error final al obtener datos de {symbol}: {e}. Última respuesta OHLCV: {last_ohlcv[:2] if last_ohlcv else 'None'}")
                 return None, None
             time.sleep(2 ** attempt)
-
+            
 def calculate_adx(df):
     try:
         adx = ta.adx(df['high'], df['low'], df['close'], length=14)
