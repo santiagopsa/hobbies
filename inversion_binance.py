@@ -86,13 +86,15 @@ VOLUME_GROWTH_THRESHOLD = 0.8
 decision_cache = {}
 CACHE_EXPIRATION = 300  # Reducido a 5 minutos para volatilidad
 
-def detect_support_level(price_series, window=15):  # Aumentado de 5 para capturar más históricos
+def detect_support_level(price_series, window=15, threshold=0.98):
     if len(price_series) < window:
         logging.warning(f"Series too short for {price_series.name}: {len(price_series)} < {window}")
         return None
     recent_prices = price_series[-window:]
     min_price = recent_prices.min()
-    return min_price if min_price < price_series.iloc[-1] * 0.95 else None  # Menos estricto
+    # Se considera soporte si el mínimo es menor que el precio actual multiplicado por el umbral
+    return min_price if min_price < price_series.iloc[-1] * threshold else None
+
 
 def calculate_short_volume_trend(volume_series, window=3):
     if len(volume_series) < window:
