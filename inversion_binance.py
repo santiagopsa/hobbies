@@ -156,11 +156,12 @@ def detect_support_level(data, price_series, window=15):
 
             # Calcular ATR con validación adicional
             atr_series = ta.atr(df['high'], df['low'], df['close'], length=14)
-            if atr_series is None or 'ATR' not in atr_series or atr_series['ATR'].isna().all():
+            if atr_series is None or atr_series.isna().all():
                 logging.error(f"ATR no calculado para {price_series.name} en {tf}: {atr_series}")
                 atr = 0
                 continue
-            atr = atr_series['ATR'].iloc[-1]
+            atr = atr_series.iloc[-1]
+
             if pd.isna(atr):
                 logging.warning(f"ATR contiene NaN para {price_series.name} en {tf}, intentando siguiente timeframe")
                 continue
@@ -409,7 +410,7 @@ def fetch_and_prepare_data(symbol):
                 logging.error(f"Error final al obtener datos de {symbol}: {e}. Última respuesta OHLCV: {last_ohlcv[:2] if last_ohlcv else 'None'}")
                 return None, None
             time.sleep(2 ** attempt)
-            
+
 def calculate_adx(df):
     try:
         adx = ta.adx(df['high'], df['low'], df['close'], length=14)
