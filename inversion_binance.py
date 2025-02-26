@@ -86,19 +86,51 @@ VOLUME_GROWTH_THRESHOLD = 0.8
 decision_cache = {}
 CACHE_EXPIRATION = 300  # Reducido a 5 minutos para volatilidad
 
-def detect_support_level(price_series, window=15):
+def detect_support_level(data, price_series, window=15):
+    """
+    Detecta un nivel de soporte usando precios históricos y ajusta con ATR para volatilidad.
+    Args:
+        data: Diccionario con DataFrames de '1h', '4h', '1d' (de fetch_and_prepare_data)
+        price_series: Serie de precios de cierre ('close') para análisis
+        window: Ventana para detectar el mínimo (default 15)
+    Returns:
+        float o None si no se detecta soporte
+    """
     if len(price_series) < window:
         logging.warning(f"Series too short for {price_series.name}: {len(price_series)} < {window}")
         return None
+
     recent_prices = price_series[-window:]
     min_price = recent_prices.min()
     current_price = price_series.iloc[-1]
-    atr = ta.atr(price_series.reindex(price_series.index, method='ffill').to_frame('close').join(
-                 price_series.reindex(price_series.index, method='ffill').to_frame('high')).join(
-                 price_series.reindex(price_series.index, method='ffill').to_frame('low')),
-                 length=14)['ATR'].iloc[-1] if len(price_series) >= 14 else 0
-    threshold = 1 + (atr / current_price) if atr > 0 and current_price > 0 else 1.02  # Default 2% if ATR unavailable
-    threshold = min(threshold, 1.05)  # Cap at 5% to limit risk
+
+    # Usar datos de 1h para ATR, si disponible; de lo contrario, 4h o 1d
+    timeframe = '1h'
+    if timeframe not in data or data[timeframe].empty:
+        timeframe = '4h'
+        if timeframe not in data or data[timeframe].empty:
+            timeframe = '1d'
+            if '1d' not in data or data['1d'].empty:
+                logging.warning(f"No hay datos OHLC válidos para {price_series.name} en ningún timeframe")
+                return None
+
+    df = data[timeframe]
+    if len(df) < 14:  # ATR necesita al menos 14 velas
+        logging.warning(f"Datos insuficientes para ATR en {price_series.name} ({timeframe}): {len(df)} < 14")
+        atr = 0
+    else:
+        try:
+            atr = ta.atr(df['high'], df['low'], df['close'], length=14)['ATR'].iloc[-1]
+            logging.debug(f"ATR calculado para {price_series.name} en {timeframe}: {atr}")
+        except Exception as e:
+            logging.error(f"Error al calcular ATR para {price_series.name} en {timeframe}: {e}")
+            atr = 0
+
+    # Calcular umbral dinámico basado en ATR (cappado en 5% para limitar riesgo)
+    threshold = 1 + (atr / current_price) if atr > 0 and current_price > 0 else 1.02  # Default 2% si ATR no disponible
+    threshold = min(threshold, 1.05)  # Límite máximo del 5%
+
+    logging.debug(f"Umbral de soporte para {price_series.name}: Precio actual={current_price}, Soporte={min_price}, Umbral={threshold:.3f}")
     return min_price if min_price < current_price * threshold else None
 
 
@@ -598,7 +630,7 @@ def demo_trading(high_volume_symbols=None):
             continue
 
         # Detectar soporte potencial
-        support_level = detect_support_level(price_series)
+        support_level = detect_support_level(data, price_series)
         if support_level is None:
             logging.warning(f"No se detectó nivel de soporte para {symbol}, omitiendo.")
             continue
