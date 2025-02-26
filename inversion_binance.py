@@ -164,45 +164,74 @@ def fetch_and_prepare_data(symbol):
         try:
             timeframes = ['1h', '4h', '1d']
             data = {}
+            logging.debug(f"Inicio de fetch_and_prepare_data para {symbol}, intento {attempt + 1}/{max_retries}")
+
             for tf in timeframes:
+                logging.debug(f"Iniciando fetch_ohlcv para {symbol} en timeframe {tf}")
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=20)  # Mantener limit=20 para balance memoria
+                logging.debug(f"Respuesta cruda de fetch_ohlcv para {symbol} en {tf}: {ohlcv[:2] if ohlcv else 'None'}")
+
+                if ohlcv is None:
+                    logging.warning(f"Respuesta None de fetch_ohlcv para {symbol} en {tf}, saltando timeframe")
+                    continue
+                if len(ohlcv) == 0:
+                    logging.warning(f"Lista vacía de fetch_ohlcv para {symbol} en {tf}, saltando timeframe")
+                    continue
+
+                logging.debug(f"Creando DataFrame para {symbol} en {tf} con {len(ohlcv)} velas")
                 try:
-                    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=20)
-                    logging.debug(f"Respuesta OHLCV cruda para {symbol} en {tf}: {ohlcv[:2] if ohlcv else 'None'}")
-                    if ohlcv is None or len(ohlcv) == 0:
-                        logging.warning(f"Datos vacíos o None para {symbol} en {tf}, intentando siguiente timeframe")
-                        continue
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                    df.set_index('timestamp', inplace=True)
-                    if len(df) < 5:
-                        logging.warning(f"Datos insuficientes (<5 velas) para {symbol} en {tf}")
-                        continue
+                    logging.debug(f"DataFrame inicial para {symbol} en {tf}: {df.head(1).to_dict()}")
+                except Exception as e:
+                    logging.error(f"Error al crear DataFrame para {symbol} en {tf}: {e}")
+                    continue
+
+                logging.debug(f"Convirtiendo timestamps para {symbol} en {tf}")
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df.set_index('timestamp', inplace=True)
+                logging.debug(f"DataFrame con timestamps para {symbol} en {tf}: {df.index.tolist()}")
+
+                if len(df) < 5:
+                    logging.warning(f"Datos insuficientes (<5 velas) para {symbol} en {tf}, saltando timeframe")
+                    continue
+
+                logging.debug(f"Calculando indicadores para {symbol} en {tf}")
+                try:
                     df['RSI'] = ta.rsi(df['close'], length=14)
+                    logging.debug(f"RSI calculado para {symbol} en {tf}: {df['RSI'].iloc[-1] if not pd.isna(df['RSI'].iloc[-1]) else 'NaN'}")
                     df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+                    logging.debug(f"ATR calculado para {symbol} en {tf}: {df['ATR'].iloc[-1] if not pd.isna(df['ATR'].iloc[-1]) else 'NaN'}")
                     bb = ta.bbands(df['close'], length=20, std=2)
                     df['BB_upper'] = bb['BBU_20_2.0']
                     df['BB_middle'] = bb['BBM_20_2.0']
                     df['BB_lower'] = bb['BBL_20_2.0']
+                    logging.debug(f"Bollinger Bands para {symbol} en {tf}: Upper={df['BB_upper'].iloc[-1]}, Middle={df['BB_middle'].iloc[-1]}, Lower={df['BB_lower'].iloc[-1]}")
                     macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
                     df['MACD'] = macd['MACD_12_26_9']
                     df['MACD_signal'] = macd['MACDs_12_26_9']
+                    logging.debug(f"MACD para {symbol} en {tf}: MACD={df['MACD'].iloc[-1]}, Signal={df['MACD_signal'].iloc[-1]}")
                     df['ROC'] = ta.roc(df['close'], length=12)
+                    logging.debug(f"ROC calculado para {symbol} en {tf}: {df['ROC'].iloc[-1] if not pd.isna(df['ROC'].iloc[-1]) else 'NaN'}")
                     data[tf] = df
-                except ccxt.NetworkError as e:
-                    logging.error(f"Error de red para {symbol} en {tf}: {e}")
+                except Exception as e:
+                    logging.error(f"Error al calcular indicadores para {symbol} en {tf}: {e}")
                     continue
-                except ccxt.ExchangeError as e:
-                    logging.error(f"Error de intercambio para {symbol} en {tf}: {e}")
-                    continue
+
             if not data:
                 logging.error(f"No se obtuvieron datos válidos para {symbol} en ningún timeframe")
                 return None, None
+
+            logging.debug(f"Seleccionando series para {symbol}: 1h como preferencia")
             volume_series = data['1h']['volume'] if '1h' in data else data.get('4h', data.get('1d', pd.Series())).volume
             price_series = data['1h']['close'] if '1h' in data else data.get('4h', data.get('1d', pd.Series())).close
+
             if volume_series.empty or price_series.empty:
                 logging.warning(f"Datos vacíos para {symbol} después de procesar timeframes")
                 return None, None
+
+            logging.debug(f"Datos finales para {symbol}: Volumen último={volume_series.iloc[-1]}, Precio último={price_series.iloc[-1]}")
             return data, price_series
+
         except Exception as e:
             logging.error(f"Intento {attempt + 1}/{max_retries} fallido para {symbol}: {e}")
             if attempt == max_retries - 1:
