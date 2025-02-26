@@ -35,7 +35,7 @@ THRESHOLD_PRICE_CHANGE = 0.05  # 5% (more sensitive to moves)
 THRESHOLD_ATR = 0.02  # 2% de volatilidad
 THRESHOLD_RSI_OVERBOUGHT = 70  # Ajustado a 70
 THRESHOLD_RSI_OVERSOLD = 30
-SYMBOLS_TO_MONITOR = 50  # Mantener 50 símbolos para memoria baja
+SYMBOLS_TO_MONITOR = 100  # Mantener 50 símbolos para memoria baja
 
 # Variables globales
 last_conditions = {}

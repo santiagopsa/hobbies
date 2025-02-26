@@ -640,7 +640,7 @@ def analyze_trade_outcome(trade_id):
         is_profitable = profit_loss > 0
 
         gpt_prompt = f"""
-        Analiza los datos de la transacción de `{buy_data['symbol']}` (ID: {trade_id}) para determinar por qué fue un éxito o un fracaso, proporcionando detalles específicos sobre qué hicimos bien o mal según nuestra estrategia. Responde SOLO con un JSON válido:
+        Analiza los datos de la transacción de `{buy_data['symbol']}` (ID: {trade_id}) para determinar por qué fue un éxito o un fracaso, proporcionando detalles específicos sobre qué hicimos bien o mal según nuestra estrategia. Responde SOLO con un JSON válido sin etiqueta '''json''':
         {{"resultado": "éxito", "razon": "Compramos {buy_data['symbol']} a {buy_data['buy_price']} debido a un cruce alcista de MACD y volumen creciente de {buy_data['relative_volume']}, vendimos a {sell_data['sell_price']} por una ganancia de {profit_loss:.2f} USDT, confirmando una estrategia de momentum efectiva.", "confianza": 85}}
         o
         {{"resultado": "fracaso", "razon": "Compramos {buy_data['symbol']} a {buy_data['buy_price']} con RSI {buy_data['rsi']} y volumen bajo de {buy_data['relative_volume']}, pero vendimos a {sell_data['sell_price']} por una pérdida de {profit_loss:.2f} USDT debido a una tendencia decreciente no detectada.", "confianza": 75}}
@@ -735,11 +735,11 @@ def gpt_decision_buy(prepared_text):
     prompt = f"""
     Eres un experto en trading de criptomonedas de alto riesgo. Basándote en los datos para cualquier activo USDT en Binance:
     {prepared_text}
-    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza activos con alta volatilidad, volumen creciente (>0.8), o cruces alcistas recientes de MACD, incluso si RSI es > 40. Acepta riesgos moderados si el volumen y momentum son fuertes. Responde SOLO con un JSON válido:
+    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza activos con alta volatilidad, volumen creciente (>0.8), o cruces alcistas recientes de MACD, incluso si RSI es > 40. Acepta riesgos moderados si el volumen y momentum son fuertes. Responde SOLO con un JSON válido sin '''json''' asi:
     {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen creciente y cruce alcista de MACD indican oportunidad de ganancia rápida"}}
     Criterios:
     - Compra si volumen relativo > 0.8, precio tendencia 'increasing', o cruce alcista MACD reciente, incluso con RSI > 40.
-    - Mantener solo si todas las señales son débiles o negativas.
+    - Mantener solo si todas las señales son débiles o negativas o hay sobre venta.
     - Evalúa profundidad (>2000) y spread (<1% del precio) para liquidez.
     """
     max_retries = 2
