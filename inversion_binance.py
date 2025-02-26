@@ -208,6 +208,16 @@ def fetch_and_prepare_data(symbol):
                                    f"low={df['low'].isna().sum()}, volume={df['volume'].isna().sum()}")
                     continue
 
+                logging.debug(f"Validando tipos de datos para {symbol} en {tf}: "
+                             f"close type={df['close'].dtype}, high type={df['high'].dtype}, "
+                             f"low type={df['low'].dtype}, volume type={df['volume'].dtype}")
+                if not (pd.api.types.is_numeric_dtype(df['close']) and pd.api.types.is_numeric_dtype(df['high']) and
+                        pd.api.types.is_numeric_dtype(df['low']) and pd.api.types.is_numeric_dtype(df['volume'])):
+                    logging.warning(f"Tipos no numéricos detectados para {symbol} en {tf}: "
+                                   f"close={df['close'].dtype}, high={df['high'].dtype}, "
+                                   f"low={df['low'].dtype}, volume={df['volume'].dtype}")
+                    continue
+
                 logging.debug(f"Calculando indicadores para {symbol} en {tf}")
                 try:
                     if len(df['close']) < 14:
@@ -222,26 +232,32 @@ def fetch_and_prepare_data(symbol):
 
                     df['RSI'] = ta.rsi(df['close'], length=14)
                     logging.debug(f"RSI calculado para {symbol} en {tf}: {df['RSI'].iloc[-1] if not pd.isna(df['RSI'].iloc[-1]) else 'NaN'} "
-                                 f"(longitud serie: {len(df['close'])})")
+                                 f"(longitud serie: {len(df['close'])}, tipo: {df['close'].dtype})")
                     df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-                    logging.debug(f"ATR calculado para {symbol} en {tf}: {df['ATR'].iloc[-1] if not pd.isna(df['ATR'].iloc[-1]) else 'NaN'}")
+                    logging.debug(f"ATR calculado para {symbol} en {tf}: {df['ATR'].iloc[-1] if not pd.isna(df['ATR'].iloc[-1]) else 'NaN'} "
+                                 f"(longitud serie: {len(df['close'])}, tipo: {df['close'].dtype})")
                     bb = ta.bbands(df['close'], length=20, std=2)
                     df['BB_upper'] = bb['BBU_20_2.0']
                     df['BB_middle'] = bb['BBM_20_2.0']
                     df['BB_lower'] = bb['BBL_20_2.0']
-                    logging.debug(f"Bollinger Bands para {symbol} en {tf}: Upper={df['BB_upper'].iloc[-1]}, Middle={df['BB_middle'].iloc[-1]}, Lower={df['BB_lower'].iloc[-1]}")
+                    logging.debug(f"Bollinger Bands para {symbol} en {tf}: Upper={df['BB_upper'].iloc[-1]}, Middle={df['BB_middle'].iloc[-1]}, Lower={df['BB_lower'].iloc[-1]} "
+                                 f"(longitud serie: {len(df['close'])}, tipo: {df['close'].dtype})")
                     macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
                     df['MACD'] = macd['MACD_12_26_9']
                     df['MACD_signal'] = macd['MACDs_12_26_9']
-                    logging.debug(f"MACD para {symbol} en {tf}: MACD={df['MACD'].iloc[-1]}, Signal={df['MACD_signal'].iloc[-1]}")
+                    logging.debug(f"MACD para {symbol} en {tf}: MACD={df['MACD'].iloc[-1]}, Signal={df['MACD_signal'].iloc[-1]} "
+                                 f"(longitud serie: {len(df['close'])}, tipo: {df['close'].dtype})")
                     df['ROC'] = ta.roc(df['close'], length=12)
-                    logging.debug(f"ROC calculado para {symbol} en {tf}: {df['ROC'].iloc[-1] if not pd.isna(df['ROC'].iloc[-1]) else 'NaN'}")
+                    logging.debug(f"ROC calculado para {symbol} en {tf}: {df['ROC'].iloc[-1] if not pd.isna(df['ROC'].iloc[-1]) else 'NaN'} "
+                                 f"(longitud serie: {len(df['close'])}, tipo: {df['close'].dtype})")
                     data[tf] = df
                 except Exception as e:
                     logging.error(f"Error al calcular indicadores para {symbol} en {tf}: {e}. "
                                  f"Serie 'close': {df['close'].tolist() if not df.empty else 'Vacía'}, "
                                  f"longitud: {len(df['close']) if not df.empty else 0}, "
-                                 f"NaN en close: {df['close'].isna().sum() if not df.empty else 'N/A'}")
+                                 f"NaN en close: {df['close'].isna().sum() if not df.empty else 'N/A'}, "
+                                 f"tipo: {df['close'].dtype if not df.empty else 'N/A'}, "
+                                 f"valores únicos: {df['close'].unique() if not df.empty else 'N/A'}")
                     continue
 
             if not data:
