@@ -208,7 +208,7 @@ def fetch_and_prepare_data(symbol):
 
             for tf in timeframes:
                 logging.debug(f"Iniciando fetch_ohlcv para {symbol} en timeframe {tf} con limit=50")
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=50)  # Se aumenta el límite
+                ohlcv = fetch_ohlcv_with_retry(symbol, tf, limit=50)  # Se aumenta el límite
                 logging.debug(f"Respuesta cruda de fetch_ohlcv para {symbol} en {tf}: {ohlcv[:2] if ohlcv else 'None'} (longitud: {len(ohlcv) if ohlcv else 0})")
 
                 if ohlcv is None:
@@ -315,7 +315,11 @@ def fetch_and_prepare_data(symbol):
                 last_ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
                 logging.error(f"No se obtuvieron datos válidos para {symbol} en ningún timeframe. Última respuesta OHLCV: {last_ohlcv[:2] if last_ohlcv else 'None'}")
                 return None, None
-
+            has_enough_data = any(len(df['close']) >= 14 for df in data.values() if not df.empty)
+            if not has_enough_data:
+                logging.warning(f"Datos insuficientes para indicadores en {symbol}")
+                return None, None
+            
             logging.debug(f"Seleccionando series para {symbol}: 1h como preferencia")
             volume_series = data['1h']['volume'] if '1h' in data else data.get('4h', data.get('1d', pd.DataFrame())).get('volume', pd.Series())
             price_series = data['1h']['close'] if '1h' in data else data.get('4h', data.get('1d', pd.DataFrame())).get('close', pd.Series())
@@ -560,6 +564,18 @@ def calculate_adaptive_strategy(indicators):
             return "comprar" if bb_position == "below_lower" else "mantener", 80 if bb_position == "below_lower" else 50, "Reversión media confirmada por RSI y Bollinger Bands" if bb_position == "below_lower" else "Sin oportunidad de reversión"
         return "mantener", 50, "Mercado en rango sin señales claras"
 
+def fetch_ohlcv_with_retry(symbol, timeframe, limit=50, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            if ohlcv and len(ohlcv) > 0:
+                return ohlcv
+            logging.warning(f"Datos vacíos o None para {symbol} en {timeframe}, intento {attempt + 1}/{max_retries}")
+        except Exception as e:
+            logging.error(f"Error al obtener OHLCV para {symbol} en {timeframe}, intento {attempt + 1}/{max_retries}: {e}")
+        time.sleep(2 ** attempt)  # Exponential backoff
+    return None
+
 def demo_trading(high_volume_symbols=None):
     logging.info("Iniciando trading en segundo plano para todos los activos USDT relevantes...")
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
@@ -585,150 +601,168 @@ def demo_trading(high_volume_symbols=None):
     balance = exchange.fetch_balance()['free']
     logging.info(f"Balance actual: {balance}")
 
-    for symbol in selected_cryptos:
-        logging.info(f"Procesando {symbol}...")
-        base_asset = symbol.split('/')[0]
-        if base_asset in balance and balance[base_asset] > 0:
-            logging.info(f"Se omite {symbol} porque ya tienes una posición abierta.")
-            continue
+    # Batch processing to manage memory on e2-micro
+    for i in range(0, len(selected_cryptos), 10):  # Process 10 symbols at a time
+        batch = selected_cryptos[i:i+10]
+        for symbol in batch:
+            logging.info(f"Procesando {symbol}...")
+            base_asset = symbol.split('/')[0]
+            if base_asset in balance and balance[base_asset] > 0:
+                logging.info(f"Se omite {symbol} porque ya tienes una posición abierta.")
+                continue
 
-        daily_volume = fetch_volume(symbol)
-        if daily_volume is None or daily_volume < 500000:
-            logging.info(f"Se omite {symbol} por volumen insuficiente: {daily_volume}")
-            continue
+            daily_volume = fetch_volume(symbol)
+            if daily_volume is None or daily_volume < 250000:  # Ajustado para incluir más activos
+                logging.info(f"Se omite {symbol} por volumen insuficiente: {daily_volume}")
+                continue
 
-        order_book_data = fetch_order_book_data(symbol)
-        if not order_book_data:
-            logging.warning(f"Se omite {symbol} por fallo en datos del libro de órdenes")
-            continue
-        if order_book_data['depth'] < 2000:  # Reducido para incluir más activos
-            logging.info(f"Se omite {symbol} por profundidad insuficiente: {order_book_data['depth']}")
-            continue
-        current_price = fetch_price(symbol)
-        if current_price is None:
-            logging.warning(f"Se omite {symbol} por no obtener precio")
-            continue
-        try:
-            current_price = float(current_price)
-            spread = float(order_book_data['spread']) if order_book_data['spread'] is not None else float('inf')
-            imbalance = float(order_book_data['imbalance']) if order_book_data['imbalance'] is not None else 0
-            depth = float(order_book_data['depth'])
-        except (ValueError, TypeError) as e:
-            logging.error(f"Error al convertir datos numéricos para {symbol}: {e}")
-            continue
+            order_book_data = fetch_order_book_data(symbol)
+            if not order_book_data:
+                logging.warning(f"Se omite {symbol} por fallo en datos del libro de órdenes")
+                continue
+            if order_book_data['depth'] < 2000:  # Reducido para incluir más activos
+                logging.info(f"Se omite {symbol} por profundidad insuficiente: {order_book_data['depth']}")
+                continue
+            current_price = fetch_price(symbol)
+            if current_price is None:
+                logging.warning(f"Se omite {symbol} por no obtener precio")
+                continue
+            try:
+                current_price = float(current_price)
+                spread = float(order_book_data['spread']) if order_book_data['spread'] is not None else float('inf')
+                imbalance = float(order_book_data['imbalance']) if order_book_data['imbalance'] is not None else 0
+                depth = float(order_book_data['depth'])
+            except (ValueError, TypeError) as e:
+                logging.error(f"Error al convertir datos numéricos para {symbol}: {e}")
+                continue
 
-        if spread > 0.01 * current_price:  # Aumentado para incluir más activos
-            logging.info(f"Se omite {symbol} por spread alto: {spread}")
-            continue
-        if imbalance < 1.0:  # Reducido para incluir más activos
-            logging.info(f"Se omite {symbol} por imbalance bajo: {imbalance}")
-            continue
+            if spread > 0.01 * current_price:  # Aumentado para incluir más activos
+                logging.info(f"Se omite {symbol} por spread alto: {spread}")
+                continue
+            if imbalance < 1.0:  # Reducido para incluir más activos
+                logging.info(f"Se omite {symbol} por imbalance bajo: {imbalance}")
+                continue
 
-        data, price_series = fetch_and_prepare_data(symbol)
-        if not data or price_series is None:
-            logging.warning(f"Se omite {symbol} por datos insuficientes")
-            continue
+            data, price_series = fetch_and_prepare_data(symbol)
+            if not data or price_series is None:
+                logging.warning(f"Se omite {symbol} por datos insuficientes")
+                continue
 
-        # Detectar soporte potencial
-        support_level = detect_support_level(data, price_series)
-        if support_level is None:
-            logging.warning(f"No se detectó nivel de soporte para {symbol}, omitiendo.")
-            continue
-        if current_price > support_level * (1 + (indicators['atr'] / current_price) if indicators['atr'] else 0.02):
-            logging.info(f"Se omite {symbol} por no estar cerca de soporte: Precio={current_price}, Soporte={support_level}, Umbral={1 + (indicators['atr'] / current_price) if indicators['atr'] else 0.02:.3f}")
-            continue
+            # Calcular indicadores antes de usarlos
+            rsi = data['1h']['RSI'].iloc[-1] if not pd.isna(data['1h']['RSI'].iloc[-1]) else None
+            adx = calculate_adx(data['1h'])
+            atr = data['1h']['ATR'].iloc[-1] if not pd.isna(data['1h']['ATR'].iloc[-1]) else None
+            volume_series = data['1h']['volume']
+            relative_volume = volume_series.iloc[-1] / volume_series.mean() if not pd.isna(volume_series.mean()) and volume_series.mean() != 0 else None
+            divergence = detect_momentum_divergences(price_series, data['1h']['RSI'])
+            bb_position = get_bb_position(current_price, data['1h']['BB_upper'].iloc[-1], data['1h']['BB_middle'].iloc[-1], data['1h']['BB_lower'].iloc[-1])
+            macd = data['1h']['MACD'].iloc[-1]
+            macd_signal = data['1h']['MACD_signal'].iloc[-1]
+            roc = data['1h']['ROC'].iloc[-1] if not pd.isna(data['1h']['ROC'].iloc[-1]) else None
 
-        # Calcular tendencias cortas (short-term momentum)
-        volume_series = data['1h']['volume']
-        short_volume_trend = calculate_short_volume_trend(volume_series)
-        if short_volume_trend == "decreasing":
-            logging.info(f"Se omite {symbol} por tendencia de volumen decreciente a corto plazo")
-            continue
+            macd_series = data['1h']['MACD']
+            signal_series = data['1h']['MACD_signal']
+            has_crossover, candles_since = has_recent_macd_crossover(macd_series, signal_series, lookback=5)
 
-        # Calcular tendencias largas
-        if len(volume_series) >= 10:
-            last_10_volume = volume_series[-10:]
-            slope_volume, _, _, _, _ = linregress(range(10), last_10_volume)
-            if slope_volume > 0.01:
-                volume_trend = "increasing"
-            elif slope_volume < -0.01:
-                volume_trend = "decreasing"
+            # Inicializar indicators con valores calculados
+            indicators = {
+                "rsi": rsi,
+                "adx": adx,
+                "atr": atr,
+                "relative_volume": relative_volume,
+                "divergence": divergence,
+                "bb_position": bb_position,
+                "macd": macd,
+                "macd_signal": macd_signal,
+                "has_macd_crossover": has_crossover,
+                "candles_since_crossover": candles_since,
+                "spread": spread,
+                "imbalance": imbalance,
+                "depth": depth,
+                "volume_trend": "insufficient data",
+                "price_trend": "insufficient data",
+                "short_volume_trend": "insufficient data",
+                "support_level": None,
+                "short_price_trend": "insufficient data",
+                "short_volume_trend_1h": "insufficient data",
+                "roc": roc
+            }
+
+            # Detectar soporte potencial usando indicadores
+            support_level = detect_support_level(data, price_series)
+            if support_level is None:
+                logging.warning(f"No se detectó nivel de soporte para {symbol}, omitiendo.")
+                continue
+            if current_price > support_level * (1 + (indicators['atr'] / current_price) if indicators['atr'] else 0.02):
+                logging.info(f"Se omite {symbol} por no estar cerca de soporte: Precio={current_price}, Soporte={support_level}, Umbral={1 + (indicators['atr'] / current_price) if indicators['atr'] else 0.02:.3f}")
+                continue
+
+            # Calcular tendencias cortas y largas
+            short_volume_trend = calculate_short_volume_trend(volume_series)
+            if short_volume_trend == "decreasing":
+                logging.info(f"Se omite {symbol} por tendencia de volumen decreciente a corto plazo")
+                continue
+
+            if len(volume_series) >= 10:
+                last_10_volume = volume_series[-10:]
+                slope_volume, _, _, _, _ = linregress(range(10), last_10_volume)
+                if slope_volume > 0.01:
+                    volume_trend = "increasing"
+                elif slope_volume < -0.01:
+                    volume_trend = "decreasing"
+                else:
+                    volume_trend = "stable"
             else:
-                volume_trend = "stable"
-        else:
-            volume_trend = "insufficient data"
+                volume_trend = "insufficient data"
 
-        if len(price_series) >= 10:
-            last_10_price = price_series[-10:]
-            slope_price, _, _, _, _ = linregress(range(10), last_10_price)
-            if slope_price > 0.01:
-                price_trend = "increasing"
-            elif slope_price < -0.01:
-                price_trend = "decreasing"
+            if len(price_series) >= 10:
+                last_10_price = price_series[-10:]
+                slope_price, _, _, _, _ = linregress(range(10), last_10_price)
+                if slope_price > 0.01:
+                    price_trend = "increasing"
+                elif slope_price < -0.01:
+                    price_trend = "decreasing"
+                else:
+                    price_trend = "stable"
             else:
-                price_trend = "stable"
-        else:
-            price_trend = "insufficient data"
+                price_trend = "insufficient data"
 
-        # Short-term momentum check: prioritize increasing price or volume in the last 1-hour
-        short_price_trend = price_trend
-        short_volume_trend_1h = calculate_short_volume_trend(volume_series, window=1)
-        if short_price_trend != "increasing" and short_volume_trend_1h != "increasing":
-            logging.info(f"Se omite {symbol} por falta de momentum a corto plazo: Precio={short_price_trend}, Volumen={short_volume_trend_1h}")
-            continue
+            short_price_trend = price_trend
+            short_volume_trend_1h = calculate_short_volume_trend(volume_series, window=1)
+            if short_price_trend != "increasing" and short_volume_trend_1h != "increasing":
+                logging.info(f"Se omite {symbol} por falta de momentum a corto plazo: Precio={short_price_trend}, Volumen={short_volume_trend_1h}")
+                continue
 
-        # Calcular indicadores para decisión
-        rsi = data['1h']['RSI'].iloc[-1] if not pd.isna(data['1h']['RSI'].iloc[-1]) else None
-        adx = calculate_adx(data['1h'])
-        atr = data['1h']['ATR'].iloc[-1] if not pd.isna(data['1h']['ATR'].iloc[-1]) else None
-        relative_volume = volume_series.iloc[-1] / volume_series.mean() if volume_series.mean() != 0 else None
-        divergence = detect_momentum_divergences(price_series, data['1h']['RSI'])
-        bb_position = get_bb_position(current_price, data['1h']['BB_upper'].iloc[-1], data['1h']['BB_middle'].iloc[-1], data['1h']['BB_lower'].iloc[-1])
-        macd = data['1h']['MACD'].iloc[-1]
-        macd_signal = data['1h']['MACD_signal'].iloc[-1]
-        roc = data['1h']['ROC'].iloc[-1] if not pd.isna(data['1h']['ROC'].iloc[-1]) else None
+            # Actualizar indicators con tendencias calculadas
+            indicators.update({
+                "volume_trend": volume_trend,
+                "price_trend": price_trend,
+                "short_volume_trend": short_volume_trend,
+                "support_level": support_level,
+                "short_price_trend": short_price_trend,
+                "short_volume_trend_1h": short_volume_trend_1h
+            })
 
-        macd_series = data['1h']['MACD']
-        signal_series = data['1h']['MACD_signal']
-        has_crossover, candles_since = has_recent_macd_crossover(macd_series, signal_series, lookback=5)
+            logging.debug(f"Indicadores finales para {symbol}: {indicators}")
 
-        indicators = {
-            "rsi": rsi,
-            "adx": adx,
-            "atr": atr,
-            "relative_volume": relative_volume,
-            "divergence": divergence,
-            "bb_position": bb_position,
-            "macd": macd,
-            "macd_signal": macd_signal,
-            "has_macd_crossover": has_crossover,
-            "candles_since_crossover": candles_since,
-            "spread": spread,
-            "imbalance": imbalance,
-            "depth": depth,
-            "volume_trend": volume_trend,
-            "price_trend": price_trend,
-            "short_volume_trend": short_volume_trend,
-            "support_level": support_level,
-            "short_price_trend": short_price_trend,
-            "short_volume_trend_1h": short_volume_trend_1h,
-            "roc": roc
-        }
+            # Decisión basada en reglas o GPT
+            action, confidence, explanation = calculate_adaptive_strategy(indicators)
+            if action == "mantener" and (rsi is None or 30 < rsi < 70) and (relative_volume is None or relative_volume < 0.8) and not has_crossover:
+                prepared_text = gpt_prepare_data(data, indicators)
+                action, confidence, explanation = gpt_decision_buy(prepared_text)
 
-        # Decisión basada en reglas o GPT
-        action, confidence, explanation = calculate_adaptive_strategy(indicators)
-        if action == "mantener" and (rsi is None or 30 < rsi < 70) and (relative_volume is None or relative_volume < 0.8) and not has_crossover:
-            prepared_text = gpt_prepare_data(data, indicators)
-            action, confidence, explanation = gpt_decision_buy(prepared_text)
+            if action == "comprar" and confidence >= 70:
+                amount = min(budget_per_trade / current_price, 0.005 * usdt_balance / current_price)  # Límite al 0.5% del capital
+                if amount * current_price >= MIN_NOTIONAL:
+                    order = execute_order_buy(symbol, amount, indicators, confidence)
+                    if order:
+                        logging.info(f"Compra ejecutada para {symbol}: {explanation}")
+                        send_telegram_message(f"✅ *Compra* `{symbol}`\nConfianza: `{confidence}%`\nExplicación: `{explanation}`")
+                        dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], indicators)
 
-        if action == "comprar" and confidence >= 70:
-            amount = min(budget_per_trade / current_price, 0.005 * usdt_balance / current_price)  # Límite al 0.5% del capital
-            if amount * current_price >= MIN_NOTIONAL:
-                order = execute_order_buy(symbol, amount, indicators, confidence)
-                if order:
-                    logging.info(f"Compra ejecutada para {symbol}: {explanation}")
-                    send_telegram_message(f"✅ *Compra* `{symbol}`\nConfianza: `{confidence}%`\nExplicación: `{explanation}`")
-                    dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], indicators)
+        # Liberar memoria después de cada batch
+        del data
+        time.sleep(30)  # 30 segundos entre lotes para reducir API load y memory pressure
 
     logging.info("Trading ejecutado correctamente en segundo plano para todos los activos USDT")
     return True  # Indicate successful execution
