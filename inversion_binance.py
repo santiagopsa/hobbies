@@ -159,37 +159,48 @@ def fetch_volume(symbol):
         return None
 
 def fetch_and_prepare_data(symbol):
-    try:
-        timeframes = ['1h', '4h', '1d']
-        data = {}
-        for tf in timeframes:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=10)  # Reducido para memoria baja
-            if not ohlcv:
-                logging.warning(f"No se obtuvieron datos OHLCV para {symbol} en {tf}")
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            timeframes = ['1h', '4h', '1d']
+            data = {}
+            for tf in timeframes:
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=20)  # Aumentado a 20
+                if ohlcv is None or len(ohlcv) == 0:
+                    logging.warning(f"Datos vacíos o None para {symbol} en {tf}, intentando siguiente timeframe")
+                    continue  # Skip this timeframe but try others
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df.set_index('timestamp', inplace=True)
+                if len(df) < 5:  # Mínimo 5 velas para indicadores básicos
+                    logging.warning(f"Datos insuficientes (<5 velas) para {symbol} en {tf}")
+                    continue
+                df['RSI'] = ta.rsi(df['close'], length=14)
+                df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+                bb = ta.bbands(df['close'], length=20, std=2)
+                df['BB_upper'] = bb['BBU_20_2.0']
+                df['BB_middle'] = bb['BBM_20_2.0']
+                df['BB_lower'] = bb['BBL_20_2.0']
+                macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
+                df['MACD'] = macd['MACD_12_26_9']
+                df['MACD_signal'] = macd['MACDs_12_26_9']
+                df['ROC'] = ta.roc(df['close'], length=12)
+                data[tf] = df
+            if not data:  # Si no hay datos válidos en ningún timeframe
+                logging.error(f"No se obtuvieron datos válidos para {symbol} en ningún timeframe")
                 return None, None
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            df['RSI'] = ta.rsi(df['close'], length=14)
-            df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-            bb = ta.bbands(df['close'], length=20, std=2)
-            df['BB_upper'] = bb['BBU_20_2.0']
-            df['BB_middle'] = bb['BBM_20_2.0']
-            df['BB_lower'] = bb['BBL_20_2.0']
-            macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
-            df['MACD'] = macd['MACD_12_26_9']
-            df['MACD_signal'] = macd['MACDs_12_26_9']
-            df['ROC'] = ta.roc(df['close'], length=12)
-            data[tf] = df
-        volume_series = data['1h']['volume']
-        price_series = data['1h']['close']
-        if volume_series.empty or price_series.empty:
-            logging.warning(f"Datos vacíos para {symbol}: volumen o precios no disponibles")
-            return None, None
-        return data, price_series
-    except Exception as e:
-        logging.error(f"Error al obtener datos de {symbol}: {e}")
-        return None, None
+            volume_series = data['1h']['volume'] if '1h' in data else data.get('4h', data.get('1d', pd.Series())).volume
+            price_series = data['1h']['close'] if '1h' in data else data.get('4h', data.get('1d', pd.Series())).close
+            if volume_series.empty or price_series.empty:
+                logging.warning(f"Datos vacíos para {symbol} después de procesar timeframes")
+                return None, None
+            return data, price_series
+        except Exception as e:
+            logging.error(f"Intento {attempt + 1}/{max_retries} fallido para {symbol}: {e}")
+            if attempt == max_retries - 1:
+                logging.error(f"Error final al obtener datos de {symbol}: {e}")
+                return None, None
+            time.sleep(2 ** attempt)  # Exponential backoff
 
 def calculate_adx(df):
     try:
