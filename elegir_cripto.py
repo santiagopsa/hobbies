@@ -33,7 +33,7 @@ def get_markets():
         markets_cache_timestamp = current_time
     return markets_cache
 
-def choose_best_cryptos(base_currency="USDT", top_n=100, min_volume=10000):
+def choose_best_cryptos(base_currency="USDT", top_n=100, min_volume=500000):
     start_time = time.time()
     logging.info("Iniciando elección de criptomonedas (versión optimizada).")
     
