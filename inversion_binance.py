@@ -144,7 +144,7 @@ def detect_support_level(data, price_series, window=15):
                     break
 
             # Detectar y llenar gaps en los índices
-            expected_freq = pd.Timedelta('1H') if tf == '1h' else pd.Timedelta('4H') if tf == '4h' else pd.Timedelta('1D')
+            expected_freq = pd.Timedelta('1h') if tf == '1h' else pd.Timedelta('4h') if tf == '4h' else pd.Timedelta('1d')
             expected_index = pd.date_range(start=df.index[0], end=df.index[-1], freq=expected_freq)
             if len(expected_index) > len(df.index):
                 logging.warning(f"Gaps detectados en {price_series.name} en {tf}: índices esperados={len(expected_index)}, reales={len(df.index)}")
@@ -293,7 +293,7 @@ def fetch_and_prepare_data(symbol):
                     continue
 
                 # Detectar y llenar gaps en los índices
-                expected_freq = pd.Timedelta('1H') if tf == '1h' else pd.Timedelta('4H') if tf == '4h' else pd.Timedelta('1D')
+                expected_freq = pd.Timedelta('1h') if tf == '1h' else pd.Timedelta('4h') if tf == '4h' else pd.Timedelta('1d')
                 expected_index = pd.date_range(start=df.index[0], end=df.index[-1], freq=expected_freq)
                 if len(expected_index) > len(df.index):
                     logging.warning(f"Gaps detectados en {symbol} en {tf}: índices esperados={len(expected_index)}, reales={len(df.index)}")
@@ -409,7 +409,6 @@ def fetch_and_prepare_data(symbol):
                 logging.error(f"Error final al obtener datos de {symbol}: {e}. Última respuesta OHLCV: {last_ohlcv[:2] if last_ohlcv else 'None'}")
                 return None, None
             time.sleep(2 ** attempt)
-
 
 def calculate_adx(df):
     try:
