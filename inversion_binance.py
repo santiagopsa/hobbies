@@ -167,15 +167,18 @@ def fetch_and_prepare_data(symbol):
             logging.debug(f"Inicio de fetch_and_prepare_data para {symbol}, intento {attempt + 1}/{max_retries}")
 
             for tf in timeframes:
-                logging.debug(f"Iniciando fetch_ohlcv para {symbol} en timeframe {tf}")
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=20)  # Mantener limit=20 para balance memoria
-                logging.debug(f"Respuesta cruda de fetch_ohlcv para {symbol} en {tf}: {ohlcv[:2] if ohlcv else 'None'}")
+                logging.debug(f"Iniciando fetch_ohlcv para {symbol} en timeframe {tf} con limit=20")
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=20)
+                logging.debug(f"Respuesta cruda de fetch_ohlcv para {symbol} en {tf}: {ohlcv[:2] if ohlcv else 'None'} "
+                             f"(longitud: {len(ohlcv) if ohlcv else 0})")
 
                 if ohlcv is None:
-                    logging.warning(f"Respuesta None de fetch_ohlcv para {symbol} en {tf}, saltando timeframe")
+                    logging.warning(f"Respuesta None de fetch_ohlcv para {symbol} en {tf}, saltando timeframe. "
+                                   f"Posible límite de tasa o error del servidor.")
                     continue
                 if len(ohlcv) == 0:
-                    logging.warning(f"Lista vacía de fetch_ohlcv para {symbol} en {tf}, saltando timeframe")
+                    logging.warning(f"Lista vacía de fetch_ohlcv para {symbol} en {tf}, saltando timeframe. "
+                                   f"Posible símbolo restringido o falta de datos históricos.")
                     continue
 
                 logging.debug(f"Creando DataFrame para {symbol} en {tf} con {len(ohlcv)} velas")
@@ -183,22 +186,43 @@ def fetch_and_prepare_data(symbol):
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     logging.debug(f"DataFrame inicial para {symbol} en {tf}: {df.head(1).to_dict()}")
                 except Exception as e:
-                    logging.error(f"Error al crear DataFrame para {symbol} en {tf}: {e}")
+                    logging.error(f"Error al crear DataFrame para {symbol} en {tf}: {e}. Datos crudos: {ohlcv}")
                     continue
 
                 logging.debug(f"Convirtiendo timestamps para {symbol} en {tf}")
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                 df.set_index('timestamp', inplace=True)
-                logging.debug(f"DataFrame con timestamps para {symbol} en {tf}: {df.index.tolist()}")
+                logging.debug(f"DataFrame con timestamps para {symbol} en {tf}: {df.index.tolist()} "
+                             f"(longitud: {len(df)}, columnas: {df.columns.tolist()})")
 
                 if len(df) < 5:
                     logging.warning(f"Datos insuficientes (<5 velas) para {symbol} en {tf}, saltando timeframe")
                     continue
 
+                logging.debug(f"Validando columnas antes de indicadores para {symbol} en {tf}: "
+                             f"close={df['close'].notna().all()}, high={df['high'].notna().all()}, "
+                             f"low={df['low'].notna().all()}, volume={df['volume'].notna().all()}")
+                if df['close'].isna().any() or df['high'].isna().any() or df['low'].isna().any() or df['volume'].isna().any():
+                    logging.warning(f"Valores NaN detectados en columnas para {symbol} en {tf}: "
+                                   f"close={df['close'].isna().sum()}, high={df['high'].isna().sum()}, "
+                                   f"low={df['low'].isna().sum()}, volume={df['volume'].isna().sum()}")
+                    continue
+
                 logging.debug(f"Calculando indicadores para {symbol} en {tf}")
                 try:
+                    if len(df['close']) < 14:
+                        logging.warning(f"Datos insuficientes para RSI/ATR (<14 velas) para {symbol} en {tf}")
+                        continue
+                    if len(df['close']) < 20:
+                        logging.warning(f"Datos insuficientes para Bollinger Bands (<20 velas) para {symbol} en {tf}")
+                        continue
+                    if len(df['close']) < 12:
+                        logging.warning(f"Datos insuficientes para ROC (<12 velas) para {symbol} en {tf}")
+                        continue
+
                     df['RSI'] = ta.rsi(df['close'], length=14)
-                    logging.debug(f"RSI calculado para {symbol} en {tf}: {df['RSI'].iloc[-1] if not pd.isna(df['RSI'].iloc[-1]) else 'NaN'}")
+                    logging.debug(f"RSI calculado para {symbol} en {tf}: {df['RSI'].iloc[-1] if not pd.isna(df['RSI'].iloc[-1]) else 'NaN'} "
+                                 f"(longitud serie: {len(df['close'])})")
                     df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
                     logging.debug(f"ATR calculado para {symbol} en {tf}: {df['ATR'].iloc[-1] if not pd.isna(df['ATR'].iloc[-1]) else 'NaN'}")
                     bb = ta.bbands(df['close'], length=20, std=2)
@@ -214,11 +238,15 @@ def fetch_and_prepare_data(symbol):
                     logging.debug(f"ROC calculado para {symbol} en {tf}: {df['ROC'].iloc[-1] if not pd.isna(df['ROC'].iloc[-1]) else 'NaN'}")
                     data[tf] = df
                 except Exception as e:
-                    logging.error(f"Error al calcular indicadores para {symbol} en {tf}: {e}")
+                    logging.error(f"Error al calcular indicadores para {symbol} en {tf}: {e}. "
+                                 f"Serie 'close': {df['close'].tolist() if not df.empty else 'Vacía'}, "
+                                 f"longitud: {len(df['close']) if not df.empty else 0}, "
+                                 f"NaN en close: {df['close'].isna().sum() if not df.empty else 'N/A'}")
                     continue
 
             if not data:
-                logging.error(f"No se obtuvieron datos válidos para {symbol} en ningún timeframe")
+                logging.error(f"No se obtuvieron datos válidos para {symbol} en ningún timeframe. "
+                             f"Última respuesta OHLCV: {exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20)[:2] if exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20) else 'None'}")
                 return None, None
 
             logging.debug(f"Seleccionando series para {symbol}: 1h como preferencia")
@@ -226,16 +254,21 @@ def fetch_and_prepare_data(symbol):
             price_series = data['1h']['close'] if '1h' in data else data.get('4h', data.get('1d', pd.Series())).close
 
             if volume_series.empty or price_series.empty:
-                logging.warning(f"Datos vacíos para {symbol} después de procesar timeframes")
+                logging.warning(f"Datos vacíos para {symbol} después de procesar timeframes. "
+                               f"Volumen: {volume_series.empty}, Precio: {price_series.empty}, "
+                               f"Volumen último={volume_series.iloc[-1] if not volume_series.empty else 'N/A'}, "
+                               f"Precio último={price_series.iloc[-1] if not price_series.empty else 'N/A'}")
                 return None, None
 
             logging.debug(f"Datos finales para {symbol}: Volumen último={volume_series.iloc[-1]}, Precio último={price_series.iloc[-1]}")
             return data, price_series
 
         except Exception as e:
-            logging.error(f"Intento {attempt + 1}/{max_retries} fallido para {symbol}: {e}")
+            logging.error(f"Intento {attempt + 1}/{max_retries} fallido para {symbol}: {e}. "
+                         f"Stacktrace: {str(e.__traceback__)}")
             if attempt == max_retries - 1:
-                logging.error(f"Error final al obtener datos de {symbol}: {e}")
+                logging.error(f"Error final al obtener datos de {symbol}: {e}. "
+                             f"Última respuesta OHLCV: {exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20)[:2] if exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20) else 'None'}")
                 return None, None
             time.sleep(2 ** attempt)  # Exponential backoff
 
