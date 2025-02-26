@@ -165,28 +165,36 @@ def fetch_and_prepare_data(symbol):
             timeframes = ['1h', '4h', '1d']
             data = {}
             for tf in timeframes:
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=20)  # Aumentado a 20
-                if ohlcv is None or len(ohlcv) == 0:
-                    logging.warning(f"Datos vacíos o None para {symbol} en {tf}, intentando siguiente timeframe")
-                    continue  # Skip this timeframe but try others
-                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                df.set_index('timestamp', inplace=True)
-                if len(df) < 5:  # Mínimo 5 velas para indicadores básicos
-                    logging.warning(f"Datos insuficientes (<5 velas) para {symbol} en {tf}")
+                try:
+                    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=20)
+                    logging.debug(f"Respuesta OHLCV cruda para {symbol} en {tf}: {ohlcv[:2] if ohlcv else 'None'}")
+                    if ohlcv is None or len(ohlcv) == 0:
+                        logging.warning(f"Datos vacíos o None para {symbol} en {tf}, intentando siguiente timeframe")
+                        continue
+                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    df.set_index('timestamp', inplace=True)
+                    if len(df) < 5:
+                        logging.warning(f"Datos insuficientes (<5 velas) para {symbol} en {tf}")
+                        continue
+                    df['RSI'] = ta.rsi(df['close'], length=14)
+                    df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+                    bb = ta.bbands(df['close'], length=20, std=2)
+                    df['BB_upper'] = bb['BBU_20_2.0']
+                    df['BB_middle'] = bb['BBM_20_2.0']
+                    df['BB_lower'] = bb['BBL_20_2.0']
+                    macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
+                    df['MACD'] = macd['MACD_12_26_9']
+                    df['MACD_signal'] = macd['MACDs_12_26_9']
+                    df['ROC'] = ta.roc(df['close'], length=12)
+                    data[tf] = df
+                except ccxt.NetworkError as e:
+                    logging.error(f"Error de red para {symbol} en {tf}: {e}")
                     continue
-                df['RSI'] = ta.rsi(df['close'], length=14)
-                df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-                bb = ta.bbands(df['close'], length=20, std=2)
-                df['BB_upper'] = bb['BBU_20_2.0']
-                df['BB_middle'] = bb['BBM_20_2.0']
-                df['BB_lower'] = bb['BBL_20_2.0']
-                macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
-                df['MACD'] = macd['MACD_12_26_9']
-                df['MACD_signal'] = macd['MACDs_12_26_9']
-                df['ROC'] = ta.roc(df['close'], length=12)
-                data[tf] = df
-            if not data:  # Si no hay datos válidos en ningún timeframe
+                except ccxt.ExchangeError as e:
+                    logging.error(f"Error de intercambio para {symbol} en {tf}: {e}")
+                    continue
+            if not data:
                 logging.error(f"No se obtuvieron datos válidos para {symbol} en ningún timeframe")
                 return None, None
             volume_series = data['1h']['volume'] if '1h' in data else data.get('4h', data.get('1d', pd.Series())).volume
