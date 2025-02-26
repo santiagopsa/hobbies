@@ -86,14 +86,20 @@ VOLUME_GROWTH_THRESHOLD = 0.8
 decision_cache = {}
 CACHE_EXPIRATION = 300  # Reducido a 5 minutos para volatilidad
 
-def detect_support_level(price_series, window=15, threshold=0.98):
+def detect_support_level(price_series, window=15):
     if len(price_series) < window:
         logging.warning(f"Series too short for {price_series.name}: {len(price_series)} < {window}")
         return None
     recent_prices = price_series[-window:]
     min_price = recent_prices.min()
-    # Se considera soporte si el mínimo es menor que el precio actual multiplicado por el umbral
-    return min_price if min_price < price_series.iloc[-1] * threshold else None
+    current_price = price_series.iloc[-1]
+    atr = ta.atr(price_series.reindex(price_series.index, method='ffill').to_frame('close').join(
+                 price_series.reindex(price_series.index, method='ffill').to_frame('high')).join(
+                 price_series.reindex(price_series.index, method='ffill').to_frame('low')),
+                 length=14)['ATR'].iloc[-1] if len(price_series) >= 14 else 0
+    threshold = 1 + (atr / current_price) if atr > 0 and current_price > 0 else 1.02  # Default 2% if ATR unavailable
+    threshold = min(threshold, 1.05)  # Cap at 5% to limit risk
+    return min_price if min_price < current_price * threshold else None
 
 
 def calculate_short_volume_trend(volume_series, window=3):
@@ -596,8 +602,8 @@ def demo_trading(high_volume_symbols=None):
         if support_level is None:
             logging.warning(f"No se detectó nivel de soporte para {symbol}, omitiendo.")
             continue
-        if current_price > support_level * 1.0:  # Si no estamos cerca de soporte (<2% arriba)
-            logging.info(f"Se omite {symbol} por no estar cerca de soporte: Precio={current_price}, Soporte={support_level}")
+        if current_price > support_level * (1 + (indicators['atr'] / current_price) if indicators['atr'] else 0.02):
+            logging.info(f"Se omite {symbol} por no estar cerca de soporte: Precio={current_price}, Soporte={support_level}, Umbral={1 + (indicators['atr'] / current_price) if indicators['atr'] else 0.02:.3f}")
             continue
 
         # Calcular tendencias cortas (short-term momentum)
