@@ -113,17 +113,33 @@ def detect_support_level(data, price_series, window=15):
             if '1d' not in data or data['1d'].empty:
                 logging.warning(f"No hay datos OHLC válidos para {price_series.name} en ningún timeframe")
                 return None
+            df = data['1d']
+        else:
+            df = data['4h']
+    else:
+        df = data['1h']
 
-    df = data[timeframe]
     if len(df) < 14:  # ATR necesita al menos 14 velas
-        logging.warning(f"Datos insuficientes para ATR en {price_series.name} ({timeframe}): {len(df)} < 14")
+        logging.warning(f"Datos insuficientes para ATR en {price_series.name} ({timeframe}): {len(df)} < 14, usando 0")
         atr = 0
     else:
         try:
-            atr = ta.atr(df['high'], df['low'], df['close'], length=14)['ATR'].iloc[-1]
-            logging.debug(f"ATR calculado para {price_series.name} en {timeframe}: {atr}")
+            # Validar que las series son numéricas y no contienen NaN/None
+            for col in ['high', 'low', 'close']:
+                if not pd.api.types.is_numeric_dtype(df[col]) or df[col].isna().any():
+                    logging.warning(f"Datos inválidos en {col} para {price_series.name} en {timeframe}: tipo={df[col].dtype}, NaN={df[col].isna().sum()}")
+                    atr = 0
+                    break
+            else:
+                atr_series = ta.atr(df['high'], df['low'], df['close'], length=14)
+                if atr_series is None or 'ATR' not in atr_series or atr_series['ATR'].isna().all():
+                    logging.error(f"ATR no calculado para {price_series.name} en {timeframe}: {atr_series}")
+                    atr = 0
+                else:
+                    atr = atr_series['ATR'].iloc[-1]
+                    logging.debug(f"ATR calculado para {price_series.name} en {timeframe}: {atr}")
         except Exception as e:
-            logging.error(f"Error al calcular ATR para {price_series.name} en {timeframe}: {e}")
+            logging.error(f"Error al calcular ATR para {price_series.name} en {timeframe}: {e}. Series: close={df['close'].tolist()[:5]}, high={df['high'].tolist()[:5]}, low={df['low'].tolist()[:5]}")
             atr = 0
 
     # Calcular umbral dinámico basado en ATR (cappado en 5% para limitar riesgo)
@@ -208,7 +224,7 @@ def fetch_and_prepare_data(symbol):
 
             for tf in timeframes:
                 logging.debug(f"Iniciando fetch_ohlcv para {symbol} en timeframe {tf} con limit=50")
-                ohlcv = fetch_ohlcv_with_retry(symbol, tf, limit=50)  # Se aumenta el límite
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=50)  # Mantener limit=50
                 logging.debug(f"Respuesta cruda de fetch_ohlcv para {symbol} en {tf}: {ohlcv[:2] if ohlcv else 'None'} (longitud: {len(ohlcv) if ohlcv else 0})")
 
                 if ohlcv is None:
@@ -235,13 +251,11 @@ def fetch_and_prepare_data(symbol):
                     logging.warning(f"Datos insuficientes (<5 velas) para {symbol} en {tf}, saltando timeframe")
                     continue
 
-                # Validación de columnas y tipos
-                if df[['close', 'high', 'low', 'volume']].isna().any().any():
-                    logging.warning(f"Valores NaN detectados en columnas para {symbol} en {tf}")
-                    continue
-                if not all(pd.api.types.is_numeric_dtype(df[col]) for col in ['close', 'high', 'low', 'volume']):
-                    logging.warning(f"Tipos no numéricos detectados para {symbol} en {tf}")
-                    continue
+                # Validar columnas OHLCV antes de cálculos
+                for col in ['high', 'low', 'close', 'volume']:
+                    if not pd.api.types.is_numeric_dtype(df[col]) or df[col].isna().any():
+                        logging.warning(f"Datos inválidos en {col} para {symbol} en {tf}: tipo={df[col].dtype}, NaN={df[col].isna().sum()}")
+                        continue
 
                 # Validar índices únicos y ordenados
                 if not df.index.is_unique:
@@ -273,11 +287,15 @@ def fetch_and_prepare_data(symbol):
                     df['RSI'] = ta.rsi(df['close'], length=14)
                     logging.debug(f"RSI calculado para {symbol} en {tf}: {df['RSI'].iloc[-1]}")
                     
-                    # Calcular ATR
-                    df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+                    # Calcular ATR y validar
+                    atr_series = ta.atr(df['high'], df['low'], df['close'], length=14)
+                    if atr_series is None or 'ATR' not in atr_series or atr_series['ATR'].isna().all():
+                        logging.error(f"ATR no calculado para {symbol} en {tf}: {atr_series}")
+                        continue
+                    df['ATR'] = atr_series['ATR']
                     logging.debug(f"ATR calculado para {symbol} en {tf}: {df['ATR'].iloc[-1]}")
                     
-                    # Calcular Bollinger Bands y validar que no sean None
+                    # Calcular Bollinger Bands y validar
                     bb = ta.bbands(df['close'], length=20, std=2)
                     if bb is None:
                         logging.warning(f"Bollinger Bands no se pudieron calcular para {symbol} en {tf}")
@@ -315,11 +333,7 @@ def fetch_and_prepare_data(symbol):
                 last_ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
                 logging.error(f"No se obtuvieron datos válidos para {symbol} en ningún timeframe. Última respuesta OHLCV: {last_ohlcv[:2] if last_ohlcv else 'None'}")
                 return None, None
-            has_enough_data = any(len(df['close']) >= 14 for df in data.values() if not df.empty)
-            if not has_enough_data:
-                logging.warning(f"Datos insuficientes para indicadores en {symbol}")
-                return None, None
-            
+
             logging.debug(f"Seleccionando series para {symbol}: 1h como preferencia")
             volume_series = data['1h']['volume'] if '1h' in data else data.get('4h', data.get('1d', pd.DataFrame())).get('volume', pd.Series())
             price_series = data['1h']['close'] if '1h' in data else data.get('4h', data.get('1d', pd.DataFrame())).get('close', pd.Series())
