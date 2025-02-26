@@ -33,13 +33,12 @@ threading.Thread(target=log_worker, daemon=True).start()
 # Cargar variables de entorno desde .env
 load_dotenv()
 
-# Configuración de la API de Binance (entorno real)
+# Configuración de la API de Binance para spot (por defecto)
 exchange = ccxt.binance({
     'apiKey': os.getenv('BINANCE_API_KEY_REAL'),
     'secret': os.getenv('BINANCE_SECRET_KEY_REAL'),
-    'enableRateLimit': True,  # Respetar límites de la API
+    'enableRateLimit': True,
     'options': {
-        'defaultType': 'spot',
         'adjustForTimeDifference': True
     }
 })
@@ -155,11 +154,10 @@ def buy_symbol_microsecond(symbol, budget=5, max_attempts=100, retry_delay=0.01)
     log_queue.put((logging.INFO, f"🚀 Intentando comprar {symbol} tan pronto esté disponible..."))
     for attempt in range(max_attempts):
         try:
-            # Verificar si el símbolo está disponible para trading
-            exchange.load_markets(reload=True)  # Recargar mercados en cada intento
+            exchange.load_markets(reload=True)
             if symbol not in exchange.markets:
                 log_queue.put((logging.DEBUG, f"{symbol} no disponible aún. Intento {attempt+1}/{max_attempts}"))
-                time.sleep(retry_delay)  # 10ms de espera mínima
+                time.sleep(retry_delay)
                 continue
 
             market = exchange.markets[symbol]
@@ -168,7 +166,6 @@ def buy_symbol_microsecond(symbol, budget=5, max_attempts=100, retry_delay=0.01)
                 time.sleep(retry_delay)
                 continue
 
-            # Mercado disponible, proceder con la compra
             ticker = exchange.fetch_ticker(symbol)
             price = ticker['last']
             if not price:
@@ -200,7 +197,7 @@ def buy_symbol_microsecond(symbol, budget=5, max_attempts=100, retry_delay=0.01)
 
         except ccxt.RateLimitExceeded:
             log_queue.put((logging.WARNING, f"Límite de API excedido al intentar comprar {symbol}. Esperando..."))
-            time.sleep(1)  # Respetar el límite
+            time.sleep(1)
         except ccxt.ExchangeError as e:
             log_queue.put((logging.ERROR, f"Error de exchange al comprar {symbol}: {e}"))
             time.sleep(retry_delay)
@@ -279,7 +276,7 @@ def process_order(symbol, order_details):
         return
     threading.Thread(target=set_trailing_stop, args=(symbol, amount, purchase_price), daemon=True).start()
 
-# WebSocket
+# WebSocket para spot
 known_symbols = set()
 
 def on_message(ws, message):
@@ -313,9 +310,8 @@ def on_error(ws, error):
 
 def on_close(ws, close_status_code, close_msg):
     log_queue.put((logging.WARNING, f"WebSocket cerrado: {close_status_code} - {close_msg}. Reconectando..."))
-    ws.keep_running = False  # Esto le indica a run_forever que debe finalizar
+    ws.keep_running = False
     time.sleep(2)
-
 
 def on_open(ws):
     log_queue.put((logging.INFO, "Conexión WebSocket abierta"))
@@ -340,11 +336,10 @@ def start_websocket():
             del ws
             time.sleep(5)
 
-
 def start_ws_thread():
     threading.Thread(target=start_websocket, daemon=True).start()
 
-# Función para obtener símbolos iniciales
+# Función para obtener símbolos iniciales usando el endpoint de spot
 def fetch_current_symbols_fast():
     try:
         response = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=1)
@@ -359,7 +354,7 @@ def fetch_current_symbols_fast():
 # Código principal
 if __name__ == "__main__":
     initialize_db()
-    log_queue.put((logging.INFO, "Iniciando bot de trading en vivo."))
+    log_queue.put((logging.INFO, "Iniciando bot de trading en vivo (Spot)."))
     known_symbols = fetch_current_symbols_fast()
     log_queue.put((logging.INFO, f"Símbolos iniciales: {len(known_symbols)}"))
 
