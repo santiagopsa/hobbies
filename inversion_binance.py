@@ -124,22 +124,41 @@ def detect_support_level(data, price_series, window=15):
         atr = 0
     else:
         try:
-            # Validar que las series son numéricas y no contienen NaN/None
+            # Validar que las series son numéricas, no contienen NaN/None, y no tienen gaps
             for col in ['high', 'low', 'close']:
                 if not pd.api.types.is_numeric_dtype(df[col]) or df[col].isna().any():
                     logging.warning(f"Datos inválidos en {col} para {price_series.name} en {timeframe}: tipo={df[col].dtype}, NaN={df[col].isna().sum()}")
                     atr = 0
                     break
-            else:
-                atr_series = ta.atr(df['high'], df['low'], df['close'], length=14)
-                if atr_series is None or 'ATR' not in atr_series or atr_series['ATR'].isna().all():
-                    logging.error(f"ATR no calculado para {price_series.name} en {timeframe}: {atr_series}")
+                if df[col].isna().any() or df[col].empty:
+                    logging.warning(f"Gaps o valores NaN en {col} para {price_series.name} en {timeframe}: {df[col].isna().sum()}")
                     atr = 0
-                else:
-                    atr = atr_series['ATR'].iloc[-1]
-                    logging.debug(f"ATR calculado para {price_series.name} en {timeframe}: {atr}")
+                    break
+
+            # Validar que los índices están completos y monótonos
+            if not df.index.is_monotonic_increasing:
+                logging.warning(f"Índices no monótonos para {price_series.name} en {timeframe}, ordenando")
+                df = df.sort_index()
+            if df.index.has_duplicates:
+                logging.warning(f"Índices duplicados para {price_series.name} en {timeframe}: {df.index[df.index.duplicated()].tolist()}")
+                df = df[~df.index.duplicated(keep='first')]
+                if len(df) < 14:
+                    logging.warning(f"Datos insuficientes después de limpiar duplicados para {price_series.name} en {timeframe}")
+                    atr = 0
+
+            # Calcular ATR con validación adicional
+            atr_series = ta.atr(df['high'], df['low'], df['close'], length=14)
+            if atr_series is None or 'ATR' not in atr_series or atr_series['ATR'].isna().all():
+                logging.error(f"ATR no calculado para {price_series.name} en {timeframe}: {atr_series}")
+                atr = 0
+            else:
+                atr = atr_series['ATR'].iloc[-1]
+                if pd.isna(atr):
+                    logging.warning(f"ATR contiene NaN para {price_series.name} en {timeframe}, usando 0")
+                    atr = 0
+                logging.debug(f"ATR calculado para {price_series.name} en {timeframe}: {atr}")
         except Exception as e:
-            logging.error(f"Error al calcular ATR para {price_series.name} en {timeframe}: {e}. Series: close={df['close'].tolist()[:5]}, high={df['high'].tolist()[:5]}, low={df['low'].tolist()[:5]}")
+            logging.error(f"Error al calcular ATR para {price_series.name} en {timeframe}: {e}. Series: close={df['close'].tolist()[:5]}, high={df['high'].tolist()[:5]}, low={df['low'].tolist()[:5]}, indices={df.index.tolist()[:5]}")
             atr = 0
 
     # Calcular umbral dinámico basado en ATR (cappado en 5% para limitar riesgo)
@@ -250,6 +269,16 @@ def fetch_and_prepare_data(symbol):
                 if len(df) < 5:
                     logging.warning(f"Datos insuficientes (<5 velas) para {symbol} en {tf}, saltando timeframe")
                     continue
+
+                # Detectar y llenar gaps en los índices
+                expected_freq = pd.Timedelta('1H') if tf == '1h' else pd.Timedelta('4H') if tf == '4h' else pd.Timedelta('1D')
+                expected_index = pd.date_range(start=df.index[0], end=df.index[-1], freq=expected_freq)
+                if len(expected_index) > len(df.index):
+                    logging.warning(f"Gaps detectados en {symbol} en {tf}: índices esperados={len(expected_index)}, reales={len(df.index)}")
+                    df = df.reindex(expected_index, method='ffill').dropna(how='all')
+                    if len(df) < 5:
+                        logging.warning(f"Datos insuficientes después de llenar gaps para {symbol} en {tf}")
+                        continue
 
                 # Validar columnas OHLCV antes de cálculos
                 for col in ['high', 'low', 'close', 'volume']:
