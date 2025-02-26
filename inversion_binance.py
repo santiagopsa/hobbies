@@ -104,70 +104,92 @@ def detect_support_level(data, price_series, window=15):
     min_price = recent_prices.min()
     current_price = price_series.iloc[-1]
 
-    # Usar datos de 1h para ATR, si disponible; de lo contrario, 4h o 1d
-    timeframe = '1h'
-    if timeframe not in data or data[timeframe].empty:
-        timeframe = '4h'
-        if timeframe not in data or data[timeframe].empty:
-            timeframe = '1d'
-            if '1d' not in data or data['1d'].empty:
-                logging.warning(f"No hay datos OHLC válidos para {price_series.name} en ningún timeframe")
-                return None
-            df = data['1d']
-        else:
-            df = data['4h']
-    else:
-        df = data['1h']
+    # Priorizar timeframes con datos suficientes, empezar por 1h
+    timeframes = ['1h', '4h', '1d']
+    atr = 0  # Default if no valid data, but we’ll try to find valid data
+    used_timeframe = None
 
-    if len(df) < 14:  # ATR necesita al menos 14 velas
-        logging.warning(f"Datos insuficientes para ATR en {price_series.name} ({timeframe}): {len(df)} < 14, usando 0")
-        atr = 0
-    else:
+    for tf in timeframes:
+        if tf not in data or data[tf].empty:
+            logging.warning(f"No hay datos en {tf} para {price_series.name}")
+            continue
+
+        df = data[tf]
+        if len(df) < 14:  # ATR necesita al menos 14 velas
+            logging.warning(f"Datos insuficientes para ATR en {price_series.name} ({tf}): {len(df)} < 14, intentando siguiente timeframe")
+            continue
+
         try:
             # Validar que las series son numéricas, no contienen NaN/None, y no tienen gaps
             for col in ['high', 'low', 'close']:
                 if not pd.api.types.is_numeric_dtype(df[col]) or df[col].isna().any():
-                    logging.warning(f"Datos inválidos en {col} para {price_series.name} en {timeframe}: tipo={df[col].dtype}, NaN={df[col].isna().sum()}")
+                    logging.warning(f"Datos inválidos en {col} para {price_series.name} en {tf}: tipo={df[col].dtype}, NaN={df[col].isna().sum()}")
                     atr = 0
                     break
                 if df[col].isna().any() or df[col].empty:
-                    logging.warning(f"Gaps o valores NaN en {col} para {price_series.name} en {timeframe}: {df[col].isna().sum()}")
+                    logging.warning(f"Gaps o valores NaN en {col} para {price_series.name} en {tf}: {df[col].isna().sum()}")
                     atr = 0
                     break
 
             # Validar que los índices están completos y monótonos
             if not df.index.is_monotonic_increasing:
-                logging.warning(f"Índices no monótonos para {price_series.name} en {timeframe}, ordenando")
+                logging.warning(f"Índices no monótonos para {price_series.name} en {tf}, ordenando")
                 df = df.sort_index()
             if df.index.has_duplicates:
-                logging.warning(f"Índices duplicados para {price_series.name} en {timeframe}: {df.index[df.index.duplicated()].tolist()}")
+                logging.warning(f"Índices duplicados para {price_series.name} en {tf}: {df.index[df.index.duplicated()].tolist()}")
                 df = df[~df.index.duplicated(keep='first')]
                 if len(df) < 14:
-                    logging.warning(f"Datos insuficientes después de limpiar duplicados para {price_series.name} en {timeframe}")
+                    logging.warning(f"Datos insuficientes después de limpiar duplicados para {price_series.name} en {tf}")
                     atr = 0
+                    break
+
+            # Detectar y llenar gaps en los índices
+            expected_freq = pd.Timedelta('1H') if tf == '1h' else pd.Timedelta('4H') if tf == '4h' else pd.Timedelta('1D')
+            expected_index = pd.date_range(start=df.index[0], end=df.index[-1], freq=expected_freq)
+            if len(expected_index) > len(df.index):
+                logging.warning(f"Gaps detectados en {price_series.name} en {tf}: índices esperados={len(expected_index)}, reales={len(df.index)}")
+                df = df.reindex(expected_index, method='ffill').dropna(how='all')
+                if len(df) < 14:
+                    logging.warning(f"Datos insuficientes después de llenar gaps para {price_series.name} en {tf}")
+                    atr = 0
+                    break
 
             # Calcular ATR con validación adicional
             atr_series = ta.atr(df['high'], df['low'], df['close'], length=14)
             if atr_series is None or 'ATR' not in atr_series or atr_series['ATR'].isna().all():
-                logging.error(f"ATR no calculado para {price_series.name} en {timeframe}: {atr_series}")
+                logging.error(f"ATR no calculado para {price_series.name} en {tf}: {atr_series}")
                 atr = 0
-            else:
-                atr = atr_series['ATR'].iloc[-1]
-                if pd.isna(atr):
-                    logging.warning(f"ATR contiene NaN para {price_series.name} en {timeframe}, usando 0")
-                    atr = 0
-                logging.debug(f"ATR calculado para {price_series.name} en {timeframe}: {atr}")
-        except Exception as e:
-            logging.error(f"Error al calcular ATR para {price_series.name} en {timeframe}: {e}. Series: close={df['close'].tolist()[:5]}, high={df['high'].tolist()[:5]}, low={df['low'].tolist()[:5]}, indices={df.index.tolist()[:5]}")
-            atr = 0
+                continue
+            atr = atr_series['ATR'].iloc[-1]
+            if pd.isna(atr):
+                logging.warning(f"ATR contiene NaN para {price_series.name} en {tf}, intentando siguiente timeframe")
+                continue
+            used_timeframe = tf
+            logging.debug(f"ATR calculado para {price_series.name} en {tf}: {atr}")
+            break  # Usar el primer timeframe válido
 
+        except KeyError as e:
+            logging.error(f"Error de clave al calcular ATR para {price_series.name} en {tf}: {e}. DataFrame columnas={df.columns.tolist()}")
+            continue
+        except TypeError as e:
+            logging.error(f"Error de tipo al calcular ATR para {price_series.name} en {tf}: {e}. Series: close={df['close'].dtype}, high={df['high'].dtype}, low={df['low'].dtype}")
+            continue
+        except ValueError as e:
+            logging.error(f"Error de valor al calcular ATR para {price_series.name} en {tf}: {e}. Series: close={df['close'].tolist()[:5]}, high={df['high'].tolist()[:5]}, low={df['low'].tolist()[:5]}")
+            continue
+        except Exception as e:
+            logging.error(f"Error inesperado al calcular ATR para {price_series.name} en {tf}: {e}. Series: close={df['close'].tolist()[:5]}, high={df['high'].dtype}, low={df['low'].dtype}, indices={df.index.tolist()[:5]}")
+            continue
+
+    if atr == 0 and not used_timeframe:
+        logging.warning(f"No se pudo calcular ATR para {price_series.name} en ningún timeframe, usando umbral predeterminado de 2%")
+    
     # Calcular umbral dinámico basado en ATR (cappado en 5% para limitar riesgo)
     threshold = 1 + (atr / current_price) if atr > 0 and current_price > 0 else 1.02  # Default 2% si ATR no disponible
     threshold = min(threshold, 1.05)  # Límite máximo del 5%
 
-    logging.debug(f"Umbral de soporte para {price_series.name}: Precio actual={current_price}, Soporte={min_price}, Umbral={threshold:.3f}")
+    logging.debug(f"Umbral de soporte para {price_series.name}: Precio actual={current_price}, Soporte={min_price}, Umbral={threshold:.3f}, Timeframe usado={used_timeframe}")
     return min_price if min_price < current_price * threshold else None
-
 
 def calculate_short_volume_trend(volume_series, window=3):
     if len(volume_series) < window:
@@ -358,14 +380,20 @@ def fetch_and_prepare_data(symbol):
                     logging.error(f"Error al calcular indicadores para {symbol} en {tf}: {e}")
                     continue
 
+            # Retener datos si al menos un timeframe tiene indicadores válidos
             if not data:
                 last_ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
                 logging.error(f"No se obtuvieron datos válidos para {symbol} en ningún timeframe. Última respuesta OHLCV: {last_ohlcv[:2] if last_ohlcv else 'None'}")
                 return None, None
 
+            has_valid_data = any(len(df['close']) >= 14 and not df['ATR'].isna().all() for df in data.values() if not df.empty)
+            if not has_valid_data:
+                logging.warning(f"Datos insuficientes para indicadores en {symbol} a pesar de timeframes válidos")
+                return None, None
+
             logging.debug(f"Seleccionando series para {symbol}: 1h como preferencia")
-            volume_series = data['1h']['volume'] if '1h' in data else data.get('4h', data.get('1d', pd.DataFrame())).get('volume', pd.Series())
-            price_series = data['1h']['close'] if '1h' in data else data.get('4h', data.get('1d', pd.DataFrame())).get('close', pd.Series())
+            volume_series = data['1h']['volume'] if '1h' in data and not data['1h'].empty else data.get('4h', data.get('1d', pd.DataFrame())).get('volume', pd.Series())
+            price_series = data['1h']['close'] if '1h' in data and not data['1h'].empty else data.get('4h', data.get('1d', pd.DataFrame())).get('close', pd.Series())
 
             if volume_series.empty or price_series.empty:
                 logging.warning(f"Datos vacíos para {symbol} después de procesar timeframes. Volumen: {volume_series.empty}, Precio: {price_series.empty}")
