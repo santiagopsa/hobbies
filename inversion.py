@@ -5,6 +5,7 @@ import os
 import requests
 import numpy as np
 import threading
+import logging
 from inversion_binance import demo_trading
 from dotenv import load_dotenv
 from elegir_cripto import choose_best_cryptos
@@ -18,36 +19,44 @@ exchange = ccxt.binance({
     "secret": os.getenv("BINANCE_SECRET_KEY_REAL"),
 })
 
+# Configurar logging
+logging.basicConfig(
+    level=logging.INFO,
+    filename="inversion_monitor.log",
+    filemode="a",
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
 # Constantes
-MONITOR_INTERVAL = 300       # 5 minutos
-EXECUTION_INTERVAL = 14400   # 4 horas
-THRESHOLD_VOLUME_CHANGE = 0.2   # 20%
-THRESHOLD_PRICE_CHANGE = 0.03   # 3%
-THRESHOLD_ATR = 0.02            # 2% de volatilidad
-THRESHOLD_RSI_OVERBOUGHT = 70   # Ajustado a 70
+MONITOR_INTERVAL = 60  # 1 minuto (real-time monitoring)
+EXECUTION_INTERVAL = 3600  # 1 hora (faster execution)
+THRESHOLD_VOLUME_CHANGE = 0.5  # 50% (more sensitive to spikes)
+THRESHOLD_PRICE_CHANGE = 0.05  # 5% (more sensitive to moves)
+THRESHOLD_ATR = 0.02  # 2% de volatilidad
+THRESHOLD_RSI_OVERBOUGHT = 70  # Ajustado a 70
 THRESHOLD_RSI_OVERSOLD = 30
-SYMBOLS_TO_MONITOR = 200     # Monitorear 200 símbolos
+SYMBOLS_TO_MONITOR = 50  # Mantener 50 símbolos para memoria baja
 
 # Variables globales
 last_conditions = {}
 next_execution_time = time.time() + EXECUTION_INTERVAL
 
-def fetch_klines(symbol, interval="1h", limit=15):
+def fetch_klines(symbol, interval="1h", limit=10):  # Reducido a 10 para memoria baja
     binance_symbol = symbol.replace("/", "")
     url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": binance_symbol, "interval": interval, "limit": limit}
     try:
         response = requests.get(url, params=params, timeout=5)
         if response.status_code != 200:
-            print(f"❌ Error al obtener velas para {symbol}: {response.text}")
+            logging.error(f"Error al obtener velas para {symbol}: {response.text}")
             return []
         data = response.json()
         if not isinstance(data, list) or len(data) == 0:
-            print(f"⚠️ Respuesta inesperada para {symbol}: {data}")
+            logging.warning(f"Respuesta inesperada para {symbol}: {data}")
             return []
         return data
     except Exception as e:
-        print(f"❌ Error al procesar datos de {symbol}: {e}")
+        logging.error(f"Error al procesar datos de {symbol}: {e}")
         return []
 
 def calculate_rsi(prices, period=14):
@@ -83,7 +92,7 @@ def calculate_atr(symbol, period=14):
         atr = np.mean(true_ranges)
         return atr / float(klines[-1][4])
     except Exception as e:
-        print(f"Error calculating ATR for {symbol}: {e}")
+        logging.error(f"Error calculating ATR for {symbol}: {e}")
         return None
 
 def fetch_price(symbol):
@@ -91,7 +100,7 @@ def fetch_price(symbol):
         ticker = exchange.fetch_ticker(symbol)
         return ticker['last']
     except Exception as e:
-        print(f"❌ Error al obtener precio para {symbol}: {e}")
+        logging.error(f"Error al obtener precio para {symbol}: {e}")
         return None
 
 def fetch_volume(symbol):
@@ -99,7 +108,7 @@ def fetch_volume(symbol):
         ticker = exchange.fetch_ticker(symbol)
         return ticker['quoteVolume']
     except Exception as e:
-        print(f"❌ Error al obtener volumen para {symbol}: {e}")
+        logging.error(f"Error al obtener volumen para {symbol}: {e}")
         return None
 
 def fetch_portfolio_symbols():
@@ -107,7 +116,7 @@ def fetch_portfolio_symbols():
         balance = exchange.fetch_balance()
         return [f"{asset}/USDT" for asset, total in balance['total'].items() if total > 0 and asset != 'USDT']
     except Exception as e:
-        print(f"❌ Error al obtener símbolos del portafolio: {e}")
+        logging.error(f"Error al obtener símbolos del portafolio: {e}")
         return []
 
 def should_execute_trading(symbol):
@@ -132,52 +141,51 @@ def should_execute_trading(symbol):
     last = last_conditions[symbol]
 
     if rsi > THRESHOLD_RSI_OVERBOUGHT or rsi < THRESHOLD_RSI_OVERSOLD:
-        print(f"⚠️ RSI extremo para {symbol}: {rsi}")
+        logging.info(f"RSI extremo para {symbol}: {rsi}")
         execute = True
     if last["price"] and abs((current_price - last["price"]) / last["price"]) > THRESHOLD_PRICE_CHANGE:
-        print(f"⚠️ Cambio significativo en precio para {symbol}: {current_price} vs {last['price']}")
+        logging.info(f"Cambio significativo en precio para {symbol}: {current_price} vs {last['price']}")
         execute = True
     if last["volume"] and abs((current_volume - last["volume"]) / last["volume"]) > THRESHOLD_VOLUME_CHANGE:
-        print(f"⚠️ Cambio significativo en volumen para {symbol}: {current_volume} vs {last['volume']}")
+        logging.info(f"Cambio significativo en volumen para {symbol}: {current_volume} vs {last['volume']}")
         execute = True
     if atr > THRESHOLD_ATR:
-        print(f"⚠️ Alta volatilidad para {symbol}: ATR {atr*100:.2f}%")
+        logging.info(f"Alta volatilidad para {symbol}: ATR {atr*100:.2f}%")
         execute = True
 
     last_conditions[symbol] = {"price": current_price, "volume": current_volume, "rsi": rsi}
     return execute
 
 def run_trading(high_volume_symbols=None):
-    print(f"🏁 Ejecutando demo_trading en segundo plano a las {datetime.datetime.now()}")
+    logging.info(f"Ejecutando demo_trading en segundo plano a las {datetime.datetime.now()}")
     try:
         # Run demo_trading in a separate thread to avoid blocking
         thread = threading.Thread(target=demo_trading, args=(high_volume_symbols,))
         thread.daemon = True  # Ensure the thread doesn’t prevent the main program from exiting
         thread.start()
-        print("✅ Trading iniciado en segundo plano.")
+        logging.info("Trading iniciado en segundo plano.")
         return True
     except Exception as e:
-        print(f"❌ Error al iniciar demo_trading: {e}")
+        logging.error(f"Error al iniciar demo_trading: {e}")
         return False
 
-def main_loop():
+def monitor_realtime(symbols):
     global next_execution_time
     
-    print("🚀 Ejecución inicial al iniciar el programa.")
-    run_trading()
+    logging.info("Iniciando monitoreo en tiempo real para los 50 mejores activos USDT...")
+    run_trading(symbols)  # Initial execution
 
     while True:
         current_time = time.time()
         portfolio_symbols = fetch_portfolio_symbols()
         
-        # Llamada bloqueante a choose_best_cryptos: el programa espera el resultado incluso si demora
-        print("⏳ Esperando a que se complete la selección de criptomonedas (choose_best_cryptos)...")
+        # Llamada a choose_best_cryptos (puede ser bloqueante, pero reducida a 50 símbolos)
+        logging.info("Esperando a que se complete la selección de criptomonedas (choose_best_cryptos)...")
         high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=SYMBOLS_TO_MONITOR)
-        print(f"DEBUG: Símbolos de alto volumen pedidos: {SYMBOLS_TO_MONITOR}, obtenidos: {len(high_volume_symbols)}")
-        print("DEBUG: Lista de símbolos:", high_volume_symbols)
-        
-        symbols = list(set(high_volume_symbols))
-        print(f"🔍 Monitoreando {len(symbols)} símbolos a las {datetime.datetime.now()}")
+        logging.info(f"Símbolos de alto volumen pedidos: {SYMBOLS_TO_MONITOR}, obtenidos: {len(high_volume_symbols)}")
+
+        symbols = list(set(high_volume_symbols + portfolio_symbols))
+        logging.info(f"Monitoreando {len(symbols)} símbolos a las {datetime.datetime.now()}")
         execute_now = False
         
         for symbol in symbols:
@@ -186,18 +194,19 @@ def main_loop():
                 break
         
         if execute_now or current_time >= next_execution_time:
-            run_trading(high_volume_symbols)
+            run_trading(symbols)
             next_execution_time = current_time + EXECUTION_INTERVAL
-            print(f"⏳ Próxima ejecución programada a las {datetime.datetime.fromtimestamp(next_execution_time)}")
+            logging.info(f"Próxima ejecución programada a las {datetime.datetime.fromtimestamp(next_execution_time)}")
         else:
-            print(f"⏳ No se cumplen condiciones. Próxima revisión en {MONITOR_INTERVAL//60} minutos.")
+            logging.info(f"No se cumplen condiciones. Próxima revisión en {MONITOR_INTERVAL//60} minutos.")
 
         time.sleep(MONITOR_INTERVAL)
 
 if __name__ == "__main__":
-    print("Iniciando el proceso principal...")
-    print("Optimizando para revisar cada 5 minutos y capturar oportunidades de trading.")
+    logging.info("Iniciando el proceso principal...")
+    logging.info("Optimizando para revisar cada minuto y capturar oportunidades de trading en todos los activos USDT relevantes.")
     try:
-        main_loop()
+        high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=SYMBOLS_TO_MONITOR)
+        monitor_realtime(high_volume_symbols)
     except KeyboardInterrupt:
-        print("\n❌ Programa detenido por el usuario.")
+        logging.info("\nPrograma detenido por el usuario.")
