@@ -218,6 +218,14 @@ def fetch_and_prepare_data(symbol):
                                    f"low={df['low'].dtype}, volume={df['volume'].dtype}")
                     continue
 
+                logging.debug(f"Validando índices únicos para {symbol} en {tf}: {df.index.is_unique}")
+                if not df.index.is_unique:
+                    logging.warning(f"Índices duplicados detectados para {symbol} en {tf}: {df.index[df.index.duplicated()].tolist()}")
+                    df = df[~df.index.duplicated(keep='first')]
+                    if len(df) < 5:
+                        logging.warning(f"Datos insuficientes después de limpiar índices duplicados para {symbol} en {tf}")
+                        continue
+
                 logging.debug(f"Calculando indicadores para {symbol} en {tf}")
                 try:
                     if len(df['close']) < 14:
@@ -232,7 +240,8 @@ def fetch_and_prepare_data(symbol):
 
                     df['RSI'] = ta.rsi(df['close'], length=14)
                     logging.debug(f"RSI calculado para {symbol} en {tf}: {df['RSI'].iloc[-1] if not pd.isna(df['RSI'].iloc[-1]) else 'NaN'} "
-                                 f"(longitud serie: {len(df['close'])}, tipo: {df['close'].dtype})")
+                                 f"(longitud serie: {len(df['close'])}, tipo: {df['close'].dtype}, "
+                                 f"índices únicos: {df.index.is_unique})")
                     df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
                     logging.debug(f"ATR calculado para {symbol} en {tf}: {df['ATR'].iloc[-1] if not pd.isna(df['ATR'].iloc[-1]) else 'NaN'} "
                                  f"(longitud serie: {len(df['close'])}, tipo: {df['close'].dtype})")
@@ -257,7 +266,9 @@ def fetch_and_prepare_data(symbol):
                                  f"longitud: {len(df['close']) if not df.empty else 0}, "
                                  f"NaN en close: {df['close'].isna().sum() if not df.empty else 'N/A'}, "
                                  f"tipo: {df['close'].dtype if not df.empty else 'N/A'}, "
-                                 f"valores únicos: {df['close'].unique() if not df.empty else 'N/A'}")
+                                 f"valores únicos: {df['close'].unique() if not df.empty else 'N/A'}, "
+                                 f"índices: {df.index.tolist() if not df.empty else 'N/A'}, "
+                                 f"índices únicos: {df.index.is_unique if not df.empty else 'N/A'}")
                     continue
 
             if not data:
