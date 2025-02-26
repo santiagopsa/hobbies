@@ -167,18 +167,15 @@ def fetch_and_prepare_data(symbol):
             logging.debug(f"Inicio de fetch_and_prepare_data para {symbol}, intento {attempt + 1}/{max_retries}")
 
             for tf in timeframes:
-                logging.debug(f"Iniciando fetch_ohlcv para {symbol} en timeframe {tf} con limit=20")
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=20)
-                logging.debug(f"Respuesta cruda de fetch_ohlcv para {symbol} en {tf}: {ohlcv[:2] if ohlcv else 'None'} "
-                             f"(longitud: {len(ohlcv) if ohlcv else 0})")
+                logging.debug(f"Iniciando fetch_ohlcv para {symbol} en timeframe {tf} con limit=50")
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=50)  # Se aumenta el límite
+                logging.debug(f"Respuesta cruda de fetch_ohlcv para {symbol} en {tf}: {ohlcv[:2] if ohlcv else 'None'} (longitud: {len(ohlcv) if ohlcv else 0})")
 
                 if ohlcv is None:
-                    logging.warning(f"Respuesta None de fetch_ohlcv para {symbol} en {tf}, saltando timeframe. "
-                                   f"Posible límite de tasa o error del servidor.")
+                    logging.warning(f"Respuesta None de fetch_ohlcv para {symbol} en {tf}, saltando timeframe. Posible límite de tasa o error del servidor.")
                     continue
                 if len(ohlcv) == 0:
-                    logging.warning(f"Lista vacía de fetch_ohlcv para {symbol} en {tf}, saltando timeframe. "
-                                   f"Posible símbolo restringido o falta de datos históricos.")
+                    logging.warning(f"Lista vacía de fetch_ohlcv para {symbol} en {tf}, saltando timeframe. Posible símbolo restringido o falta de datos históricos.")
                     continue
 
                 logging.debug(f"Creando DataFrame para {symbol} en {tf} con {len(ohlcv)} velas")
@@ -192,34 +189,21 @@ def fetch_and_prepare_data(symbol):
                 logging.debug(f"Convirtiendo timestamps para {symbol} en {tf}")
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                 df.set_index('timestamp', inplace=True)
-                logging.debug(f"DataFrame con timestamps para {symbol} en {tf}: {df.index.tolist()} "
-                             f"(longitud: {len(df)}, columnas: {df.columns.tolist()})")
+                logging.debug(f"DataFrame con timestamps para {symbol} en {tf}: {df.index.tolist()} (longitud: {len(df)}, columnas: {df.columns.tolist()})")
 
                 if len(df) < 5:
                     logging.warning(f"Datos insuficientes (<5 velas) para {symbol} en {tf}, saltando timeframe")
                     continue
 
-                logging.debug(f"Validando columnas antes de indicadores para {symbol} en {tf}: "
-                             f"close={df['close'].notna().all()}, high={df['high'].notna().all()}, "
-                             f"low={df['low'].notna().all()}, volume={df['volume'].notna().all()}")
-                if df['close'].isna().any() or df['high'].isna().any() or df['low'].isna().any() or df['volume'].isna().any():
-                    logging.warning(f"Valores NaN detectados en columnas para {symbol} en {tf}: "
-                                   f"close={df['close'].isna().sum()}, high={df['high'].isna().sum()}, "
-                                   f"low={df['low'].isna().sum()}, volume={df['volume'].isna().sum()}")
+                # Validación de columnas y tipos
+                if df[['close', 'high', 'low', 'volume']].isna().any().any():
+                    logging.warning(f"Valores NaN detectados en columnas para {symbol} en {tf}")
+                    continue
+                if not all(pd.api.types.is_numeric_dtype(df[col]) for col in ['close', 'high', 'low', 'volume']):
+                    logging.warning(f"Tipos no numéricos detectados para {symbol} en {tf}")
                     continue
 
-                logging.debug(f"Validando tipos de datos para {symbol} en {tf}: "
-                             f"close type={df['close'].dtype}, high type={df['high'].dtype}, "
-                             f"low type={df['low'].dtype}, volume type={df['volume'].dtype}")
-                if not (pd.api.types.is_numeric_dtype(df['close']) and pd.api.types.is_numeric_dtype(df['high']) and
-                        pd.api.types.is_numeric_dtype(df['low']) and pd.api.types.is_numeric_dtype(df['volume'])):
-                    logging.warning(f"Tipos no numéricos detectados para {symbol} en {tf}: "
-                                   f"close={df['close'].dtype}, high={df['high'].dtype}, "
-                                   f"low={df['low'].dtype}, volume={df['volume'].dtype}")
-                    continue
-
-                logging.debug(f"Validando índices únicos y monótonos para {symbol} en {tf}: "
-                             f"únicos={df.index.is_unique}, monótonos={df.index.is_monotonic_increasing}")
+                # Validar índices únicos y ordenados
                 if not df.index.is_unique:
                     logging.warning(f"Índices duplicados detectados para {symbol} en {tf}: {df.index[df.index.duplicated()].tolist()}")
                     df = df[~df.index.duplicated(keep='first')]
@@ -227,7 +211,7 @@ def fetch_and_prepare_data(symbol):
                         logging.warning(f"Datos insuficientes después de limpiar índices duplicados para {symbol} en {tf}")
                         continue
                 if not df.index.is_monotonic_increasing:
-                    logging.warning(f"Índices no monótonos para {symbol} en {tf}: {df.index.tolist()}")
+                    logging.warning(f"Índices no monótonos para {symbol} en {tf}, se ordenarán")
                     df = df.sort_index()
                     if len(df) < 5:
                         logging.warning(f"Datos insuficientes después de ordenar índices para {symbol} en {tf}")
@@ -245,67 +229,72 @@ def fetch_and_prepare_data(symbol):
                         logging.warning(f"Datos insuficientes para ROC (<12 velas) para {symbol} en {tf}")
                         continue
 
+                    # Calcular RSI
                     df['RSI'] = ta.rsi(df['close'], length=14)
-                    logging.debug(f"RSI calculado para {symbol} en {tf}: {df['RSI'].iloc[-1] if not pd.isna(df['RSI'].iloc[-1]) else 'NaN'} "
-                                 f"(longitud serie: {len(df['close'])}, tipo: {df['close'].dtype}, "
-                                 f"índices únicos: {df.index.is_unique}, monótonos: {df.index.is_monotonic_increasing})")
+                    logging.debug(f"RSI calculado para {symbol} en {tf}: {df['RSI'].iloc[-1]}")
+                    
+                    # Calcular ATR
                     df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-                    logging.debug(f"ATR calculado para {symbol} en {tf}: {df['ATR'].iloc[-1] if not pd.isna(df['ATR'].iloc[-1]) else 'NaN'} "
-                                 f"(longitud serie: {len(df['close'])}, tipo: {df['close'].dtype})")
+                    logging.debug(f"ATR calculado para {symbol} en {tf}: {df['ATR'].iloc[-1]}")
+                    
+                    # Calcular Bollinger Bands y validar que no sean None
                     bb = ta.bbands(df['close'], length=20, std=2)
-                    df['BB_upper'] = bb['BBU_20_2.0']
-                    df['BB_middle'] = bb['BBM_20_2.0']
-                    df['BB_lower'] = bb['BBL_20_2.0']
-                    logging.debug(f"Bollinger Bands para {symbol} en {tf}: Upper={df['BB_upper'].iloc[-1]}, Middle={df['BB_middle'].iloc[-1]}, Lower={df['BB_lower'].iloc[-1]} "
-                                 f"(longitud serie: {len(df['close'])}, tipo: {df['close'].dtype})")
+                    if bb is None:
+                        logging.warning(f"Bollinger Bands no se pudieron calcular para {symbol} en {tf}")
+                        continue
+                    df['BB_upper'] = bb.get('BBU_20_2.0')
+                    df['BB_middle'] = bb.get('BBM_20_2.0')
+                    df['BB_lower'] = bb.get('BBL_20_2.0')
+                    if df['BB_upper'].isna().all() or df['BB_lower'].isna().all():
+                        logging.warning(f"Bollinger Bands sin valores válidos para {symbol} en {tf}")
+                        continue
+                    logging.debug(f"Bollinger Bands para {symbol} en {tf}: Upper={df['BB_upper'].iloc[-1]}, Middle={df['BB_middle'].iloc[-1]}, Lower={df['BB_lower'].iloc[-1]}")
+
+                    # Calcular MACD y validar
                     macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
-                    df['MACD'] = macd['MACD_12_26_9']
-                    df['MACD_signal'] = macd['MACDs_12_26_9']
-                    logging.debug(f"MACD para {symbol} en {tf}: MACD={df['MACD'].iloc[-1]}, Signal={df['MACD_signal'].iloc[-1]} "
-                                 f"(longitud serie: {len(df['close'])}, tipo: {df['close'].dtype})")
+                    if macd is None:
+                        logging.warning(f"MACD no se pudo calcular para {symbol} en {tf}")
+                        continue
+                    df['MACD'] = macd.get('MACD_12_26_9')
+                    df['MACD_signal'] = macd.get('MACDs_12_26_9')
+                    if df['MACD'].isna().all() or df['MACD_signal'].isna().all():
+                        logging.warning(f"MACD sin valores válidos para {symbol} en {tf}")
+                        continue
+                    logging.debug(f"MACD para {symbol} en {tf}: MACD={df['MACD'].iloc[-1]}, Signal={df['MACD_signal'].iloc[-1]}")
+
+                    # Calcular ROC
                     df['ROC'] = ta.roc(df['close'], length=12)
-                    logging.debug(f"ROC calculado para {symbol} en {tf}: {df['ROC'].iloc[-1] if not pd.isna(df['ROC'].iloc[-1]) else 'NaN'} "
-                                 f"(longitud serie: {len(df['close'])}, tipo: {df['close'].dtype})")
+                    logging.debug(f"ROC calculado para {symbol} en {tf}: {df['ROC'].iloc[-1]}")
+
                     data[tf] = df
                 except Exception as e:
-                    logging.error(f"Error al calcular indicadores para {symbol} en {tf}: {e}. "
-                                 f"Serie 'close': {df['close'].tolist() if not df.empty else 'Vacía'}, "
-                                 f"longitud: {len(df['close']) if not df.empty else 0}, "
-                                 f"NaN en close: {df['close'].isna().sum() if not df.empty else 'N/A'}, "
-                                 f"tipo: {df['close'].dtype if not df.empty else 'N/A'}, "
-                                 f"valores únicos: {df['close'].unique() if not df.empty else 'N/A'}, "
-                                 f"índices: {df.index.tolist() if not df.empty else 'N/A'}, "
-                                 f"índices únicos: {df.index.is_unique if not df.empty else 'N/A'}, "
-                                 f"monótonos: {df.index.is_monotonic_increasing if not df.empty else 'N/A'}")
+                    logging.error(f"Error al calcular indicadores para {symbol} en {tf}: {e}")
                     continue
 
             if not data:
-                logging.error(f"No se obtuvieron datos válidos para {symbol} en ningún timeframe. "
-                             f"Última respuesta OHLCV: {exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20)[:2] if exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20) else 'None'}")
+                last_ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
+                logging.error(f"No se obtuvieron datos válidos para {symbol} en ningún timeframe. Última respuesta OHLCV: {last_ohlcv[:2] if last_ohlcv else 'None'}")
                 return None, None
 
             logging.debug(f"Seleccionando series para {symbol}: 1h como preferencia")
-            volume_series = data['1h']['volume'] if '1h' in data else data.get('4h', data.get('1d', pd.Series())).volume
-            price_series = data['1h']['close'] if '1h' in data else data.get('4h', data.get('1d', pd.Series())).close
+            volume_series = data['1h']['volume'] if '1h' in data else data.get('4h', data.get('1d', pd.DataFrame())).get('volume', pd.Series())
+            price_series = data['1h']['close'] if '1h' in data else data.get('4h', data.get('1d', pd.DataFrame())).get('close', pd.Series())
 
             if volume_series.empty or price_series.empty:
-                logging.warning(f"Datos vacíos para {symbol} después de procesar timeframes. "
-                               f"Volumen: {volume_series.empty}, Precio: {price_series.empty}, "
-                               f"Volumen último={volume_series.iloc[-1] if not volume_series.empty else 'N/A'}, "
-                               f"Precio último={price_series.iloc[-1] if not price_series.empty else 'N/A'}")
+                logging.warning(f"Datos vacíos para {symbol} después de procesar timeframes. Volumen: {volume_series.empty}, Precio: {price_series.empty}")
                 return None, None
 
             logging.debug(f"Datos finales para {symbol}: Volumen último={volume_series.iloc[-1]}, Precio último={price_series.iloc[-1]}")
             return data, price_series
 
         except Exception as e:
-            logging.error(f"Intento {attempt + 1}/{max_retries} fallido para {symbol}: {e}. "
-                         f"Stacktrace: {str(e.__traceback__)}")
+            logging.error(f"Intento {attempt + 1}/{max_retries} fallido para {symbol}: {e}")
             if attempt == max_retries - 1:
-                logging.error(f"Error final al obtener datos de {symbol}: {e}. "
-                             f"Última respuesta OHLCV: {exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20)[:2] if exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20) else 'None'}")
+                last_ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
+                logging.error(f"Error final al obtener datos de {symbol}: {e}. Última respuesta OHLCV: {last_ohlcv[:2] if last_ohlcv else 'None'}")
                 return None, None
-            time.sleep(2 ** attempt)  # Exponential backoff
+            time.sleep(2 ** attempt)
+
 
 def calculate_adx(df):
     try:
