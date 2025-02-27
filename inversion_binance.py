@@ -106,7 +106,7 @@ def detect_support_level(data, price_series, window=15):
     min_price = recent_prices.min()
     current_price = price_series.iloc[-1]
 
-    # Intentamos calcular ATR usando distintos timeframes, priorizando '1h', luego '4h' y finalmente '1d'
+    # Se intentará calcular ATR usando distintos timeframes, priorizando '1h', luego '4h' y finalmente '1d'
     timeframes = ['1h', '4h', '1d']
     atr_value = None
     used_tf = None
@@ -122,7 +122,7 @@ def detect_support_level(data, price_series, window=15):
             continue
 
         try:
-            # Aseguramos que los índices estén ordenados y sin duplicados
+            # Ordenar y eliminar duplicados si fuera necesario
             if not df.index.is_monotonic_increasing:
                 df = df.sort_index()
             if df.index.duplicated().any():
@@ -131,19 +131,21 @@ def detect_support_level(data, price_series, window=15):
                     logging.warning(f"Datos insuficientes después de limpiar duplicados en {price_series.name} en {tf}")
                     continue
 
-            # Rellenar gaps en el índice, según la frecuencia esperada
-            expected_freq = pd.Timedelta('1h') if tf == '1h' else pd.Timedelta('4h') if tf == '4h' else pd.Timedelta('1d')
-            expected_index = pd.date_range(start=df.index[0], end=df.index[-1], freq=expected_freq)
-            if len(expected_index) > len(df.index):
-                df = df.reindex(expected_index, method='ffill').dropna(how='all')
-                if len(df) < 14:
-                    logging.warning(f"Datos insuficientes después de llenar gaps en {price_series.name} en {tf}")
-                    continue
+            # Para timeframes intradía, rellenar gaps; para 1d asumimos datos diarios consecutivos
+            if tf != '1d':
+                expected_freq = pd.Timedelta('1h') if tf == '1h' else pd.Timedelta('4h')
+                expected_index = pd.date_range(start=df.index[0], end=df.index[-1], freq=expected_freq)
+                if len(expected_index) > len(df.index):
+                    logging.warning(f"Gaps detectados en {price_series.name} en {tf}: índices esperados={len(expected_index)}, reales={len(df.index)}")
+                    df = df.reindex(expected_index, method='ffill').dropna(how='all')
+                    if len(df) < 14:
+                        logging.warning(f"Datos insuficientes después de llenar gaps para {price_series.name} en {tf}")
+                        continue
 
-            # Calcular ATR con una ventana de 14
+            # Calcular ATR con ventana de 14
             atr_series = ta.atr(df['high'], df['low'], df['close'], length=14)
-            # Extraer solo los valores válidos
             atr_valid = atr_series.dropna()
+            logging.debug(f"Para {price_series.name} en {tf}, se encontraron {len(atr_valid)} valores ATR válidos.")
             if atr_valid.empty:
                 logging.error(f"ATR no calculado para {price_series.name} en {tf}: {atr_series}")
                 continue
@@ -151,7 +153,7 @@ def detect_support_level(data, price_series, window=15):
             atr_value = atr_valid.iloc[-1]
             used_tf = tf
             logging.debug(f"ATR calculado para {price_series.name} en {tf}: {atr_value}")
-            break  # Se usa el primer timeframe con datos válidos
+            break  # Usamos el primer timeframe válido encontrado
 
         except Exception as e:
             logging.error(f"Error al calcular ATR para {price_series.name} en {tf}: {e}")
