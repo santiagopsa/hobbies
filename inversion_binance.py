@@ -122,7 +122,7 @@ def detect_support_level(data, price_series, window=15):
             continue
 
         try:
-            # Ordenar y eliminar duplicados si fuera necesario
+            # Ordenar y eliminar duplicados si es necesario
             if not df.index.is_monotonic_increasing:
                 df = df.sort_index()
             if df.index.duplicated().any():
@@ -144,13 +144,14 @@ def detect_support_level(data, price_series, window=15):
 
             # Calcular ATR con ventana de 14
             atr_series = ta.atr(df['high'], df['low'], df['close'], length=14)
-            atr_valid = atr_series.dropna()
-            logging.debug(f"Para {price_series.name} en {tf}, se encontraron {len(atr_valid)} valores ATR válidos.")
-            if atr_valid.empty:
+            # Rellenar hacia adelante los NaN para asegurar un valor final válido
+            atr_series_filled = atr_series.ffill()
+            logging.debug(f"Serie ATR para {price_series.name} en {tf} (después de ffill):\n{atr_series_filled}")
+            if atr_series_filled.isna().all():
                 logging.error(f"ATR no calculado para {price_series.name} en {tf}: {atr_series}")
                 continue
 
-            atr_value = atr_valid.iloc[-1]
+            atr_value = atr_series_filled.iloc[-1]
             used_tf = tf
             logging.debug(f"ATR calculado para {price_series.name} en {tf}: {atr_value}")
             break  # Usamos el primer timeframe con datos válidos
@@ -163,14 +164,13 @@ def detect_support_level(data, price_series, window=15):
         logging.warning(f"No se pudo calcular ATR para {price_series.name} en ningún timeframe, usando umbral predeterminado de 2%")
         atr_value = 0
 
-    # Calcular un umbral dinámico basado en ATR.
-    # Actualmente: threshold = 1 + (atr_value / current_price), capado a 1.05 (5%).
-    # Si deseas detectar soporte en condiciones de menor volatilidad, puedes reducir el cap o usar un valor fijo.
+    # Calcular un umbral dinámico basado en ATR (capado en 5% para limitar riesgo)
     threshold = 1 + (atr_value / current_price) if atr_value > 0 and current_price > 0 else 1.02
-    threshold = min(threshold, 1.05)  # Aquí se capea el umbral al 5%. Puedes ajustar este valor.
+    threshold = min(threshold, 1.05)
 
     logging.debug(f"Umbral de soporte para {price_series.name}: Precio actual={current_price}, Mínimo reciente={min_price}, Umbral={threshold:.3f}, Timeframe usado={used_tf}")
     return min_price if min_price < current_price * threshold else None
+
 
 
 
