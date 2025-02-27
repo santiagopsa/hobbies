@@ -66,17 +66,20 @@ initialize_db()
 
 def fetch_historical_data(symbol, timeframe='5m', start_time=None, end_time=None, limit=1000):
     colombia_tz = pytz.timezone("America/Bogota")
-    # Si start_time ya tiene tzinfo, usarlo directamente; si no, localizarlo
-    start_timestamp = int(start_time.timestamp() * 1000) if start_time else None
+    if start_time:
+        adjusted_start_time = start_time - pd.Timedelta(minutes=70)  # 14 velas previas
+        start_timestamp = int(adjusted_start_time.timestamp() * 1000)
+    else:
+        start_timestamp = None
     end_timestamp = int(end_time.timestamp() * 1000) if end_time else None
     
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=start_timestamp, limit=limit)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
+    df.index = df.index.tz_localize('UTC').tz_convert(colombia_tz)
     df = df[(df.index >= start_time) & (df.index <= end_time)]
     
-    # Calcular indicadores
     df['RSI'] = ta.rsi(df['close'], length=7).ffill().bfill()
     df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=7).ffill().bfill()
     bb = ta.bbands(df['close'], length=14, std=2)
@@ -91,8 +94,14 @@ def fetch_historical_data(symbol, timeframe='5m', start_time=None, end_time=None
     return df
 
 def calculate_adx(df):
-    adx = ta.adx(df['high'], df['low'], df['close'], length=14)
-    return adx['ADX_14'].iloc[-1] if not pd.isna(adx['ADX_14'].iloc[-1]) else None
+    try:
+        adx = ta.adx(df['high'], df['low'], df['close'], length=14)
+        if adx is None or 'ADX_14' not in adx or adx['ADX_14'].iloc[-1] is None:
+            return None
+        return adx['ADX_14'].iloc[-1] if not pd.isna(adx['ADX_14'].iloc[-1]) else None
+    except Exception as e:
+        logging.error(f"Error al calcular ADX: {e}")
+        return None
 
 def detect_momentum_divergences(price_series, rsi_series):
     price = np.array(price_series)
@@ -117,8 +126,10 @@ def get_bb_position(price, bb_upper, bb_middle, bb_lower):
         return "below_middle"
 
 def has_recent_macd_crossover(macd_series, signal_series, lookback=5):
+    if len(macd_series) < 2 or len(signal_series) < 2:  # Necesitamos al menos 2 velas para comparar
+        return False, None
     for i in range(-1, -lookback-1, -1):
-        if i < -len(macd_series):
+        if i < -len(macd_series) or i-1 < -len(macd_series):  # Evitar índices fuera de rango
             break
         if macd_series.iloc[i-1] <= signal_series.iloc[i-1] and macd_series.iloc[i] > signal_series.iloc[i]:
             return True, abs(i)
@@ -170,31 +181,38 @@ def analyze_historical_data(symbol, start_time, end_time):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
+    # Búfer mínimo de 26 velas (para MACD slow=26) o todo el DataFrame si es más corto
+    buffer_size = 26
+
     for timestamp, row in df.iterrows():
+        idx = df.index.get_loc(timestamp)
+        start_idx = max(0, idx - buffer_size)  # Asegurar al menos 26 velas previas si es posible
+        df_slice = df.iloc[start_idx:idx + 1]
+
         price = row['close']
         rsi = row['RSI']
         atr = row['ATR']
         macd = row['MACD']
         macd_signal = row['MACD_signal']
         roc = row['ROC']
-        volume_series = df['volume'][:df.index.get_loc(timestamp) + 1]
-        price_series = df['close'][:df.index.get_loc(timestamp) + 1]
+        volume_series = df['volume'].iloc[start_idx:idx + 1]
+        price_series = df['close'].iloc[start_idx:idx + 1]
 
         indicators = {
             'rsi': rsi,
-            'adx': calculate_adx(df[:df.index.get_loc(timestamp) + 1]),
+            'adx': calculate_adx(df_slice),
             'atr': atr,
             'relative_volume': volume_series.iloc[-1] / volume_series.mean() if volume_series.mean() != 0 else None,
-            'divergence': detect_momentum_divergences(price_series, df['RSI'][:df.index.get_loc(timestamp) + 1]),
+            'divergence': detect_momentum_divergences(price_series, df['RSI'].iloc[start_idx:idx + 1]),
             'bb_position': get_bb_position(price, row['BB_upper'], row['BB_middle'], row['BB_lower']),
             'macd': macd,
             'macd_signal': macd_signal,
-            'has_macd_crossover': has_recent_macd_crossover(df['MACD'][:df.index.get_loc(timestamp) + 1], df['MACD_signal'][:df.index.get_loc(timestamp) + 1])[0],
-            'candles_since_crossover': has_recent_macd_crossover(df['MACD'][:df.index.get_loc(timestamp) + 1], df['MACD_signal'][:df.index.get_loc(timestamp) + 1])[1],
+            'has_macd_crossover': has_recent_macd_crossover(df['MACD'].iloc[start_idx:idx + 1], df['MACD_signal'].iloc[start_idx:idx + 1])[0],
+            'candles_since_crossover': has_recent_macd_crossover(df['MACD'].iloc[start_idx:idx + 1], df['MACD_signal'].iloc[start_idx:idx + 1])[1],
             'volume_trend': "insufficient_data" if len(volume_series) < 10 else ("increasing" if linregress(range(10), volume_series[-10:])[0] > 0.01 else "decreasing" if linregress(range(10), volume_series[-10:])[0] < -0.01 else "stable"),
             'price_trend': "insufficient_data" if len(price_series) < 10 else ("increasing" if linregress(range(10), price_series[-10:])[0] > 0.01 else "decreasing" if linregress(range(10), price_series[-10:])[0] < -0.01 else "stable"),
             'short_volume_trend': calculate_short_volume_trend(volume_series),
-            'support_level': detect_support_level(df[:df.index.get_loc(timestamp) + 1], price_series),
+            'support_level': detect_support_level(df_slice, price_series),
             'roc': roc
         }
 

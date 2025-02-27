@@ -75,12 +75,12 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Constantes
+# Constantes actualizadas
 MAX_DAILY_BUYS = 5  # Reducido de 10 para memoria baja
 MIN_NOTIONAL = 10
-RSI_THRESHOLD = 30  # Ajustado para capturar más oportunidades
+RSI_THRESHOLD = 80  # Aumentado para permitir compras en sobrecompra (cryptos alcistas)
 ADX_THRESHOLD = 15
-VOLUME_GROWTH_THRESHOLD = 0.8
+VOLUME_GROWTH_THRESHOLD = 0.5  # Reducido para capturar volumen moderado en criptos
 
 # Cache de decisiones
 decision_cache = {}
@@ -184,9 +184,6 @@ def detect_support_level(data, price_series, window=15, max_threshold_multiplier
     )
     return min_price if min_price < current_price * threshold else None
 
-
-
-
 def calculate_short_volume_trend(volume_series, window=3):
     if len(volume_series) < window:
         return "insufficient_data"
@@ -251,7 +248,7 @@ def fetch_volume(symbol):
         logging.error(f"Error al obtener volumen de {symbol}: {e}")
         return None
 
-def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=7, bb_length=14, roc_length=7, limit=50):
+def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, roc_length=7, limit=50):
     """
     Obtiene datos OHLCV para los timeframes '1h', '4h' y '1d' y calcula indicadores usando
     un número reducido de velas para ATR, RSI, Bollinger Bands y ROC, de modo que se pueda operar
@@ -260,8 +257,8 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=7, bb_length=14, roc
     Args:
         symbol (str): Símbolo a consultar (ej. 'DOGE/USDT').
         atr_length (int): Número de velas para calcular el ATR (default 7).
-        rsi_length (int): Número de velas para calcular el RSI (default 7).
-        bb_length (int): Número de velas para calcular Bollinger Bands (default 14).
+        rsi_length (int): Número de velas para calcular el RSI (default 14, ajustado para criptos).
+        bb_length (int): Número de velas para calcular Bollinger Bands (default 20, alineado con TradingView).
         roc_length (int): Número de velas para calcular ROC (default 7).
         limit (int): Número de velas a solicitar por timeframe (default 50).
 
@@ -340,7 +337,7 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=7, bb_length=14, roc
                 logging.warning(f"Datos insuficientes para ROC (<{roc_length} velas) para {symbol} en {tf}")
                 continue
 
-            # Calcular RSI
+            # Calcular RSI con length=14 para alinear con TradingView
             df['RSI'] = ta.rsi(df['close'], length=rsi_length).ffill().bfill()
             logging.debug(f"RSI para {symbol} en {tf}: {df['RSI'].iloc[-1]}")
 
@@ -356,7 +353,7 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=7, bb_length=14, roc
             df['ATR'] = atr_filled
             logging.debug(f"ATR para {symbol} en {tf}: {df['ATR'].iloc[-1]}")
 
-            # Calcular Bollinger Bands
+            # Calcular Bollinger Bands con length=20 para alinear con TradingView
             bb = ta.bbands(df['close'], length=bb_length, std=2)
             if bb is None:
                 logging.warning(f"Bollinger Bands no se pudieron calcular para {symbol} en {tf}")
@@ -420,7 +417,6 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=7, bb_length=14, roc
     logging.debug(f"Datos finales para {symbol}: Último volumen={data[list(data.keys())[0]]['volume'].iloc[-1]}, Último precio={price_series.iloc[-1]}")
     return data, price_series
 
-
 def calculate_adx(df):
     try:
         adx = ta.adx(df['high'], df['low'], df['close'], length=14)
@@ -460,8 +456,10 @@ def get_bb_position(price, bb_upper, bb_middle, bb_lower):
         return "below_middle"
 
 def has_recent_macd_crossover(macd_series, signal_series, lookback=5):
+    if len(macd_series) < 2 or len(signal_series) < 2:  # Necesitamos al menos 2 velas para comparar
+        return False, None
     for i in range(-1, -lookback-1, -1):
-        if i < -len(macd_series):
+        if i < -len(macd_series) or i-1 < -len(macd_series):  # Evitar índices fuera de rango
             break
         if macd_series.iloc[i-1] <= signal_series.iloc[i-1] and macd_series.iloc[i] > signal_series.iloc[i]:
             return True, abs(i)
@@ -633,12 +631,15 @@ def calculate_adaptive_strategy(indicators):
     macd_signal = indicators.get('macd_signal', None)
     roc = indicators.get('roc', None)
     bb_position = indicators.get('bb_position', 'unknown')
+    price_trend = indicators.get('price_trend', 'insufficient_data')
 
     is_trending = adx > 25 if adx is not None else False
 
     if is_trending:
         if (rsi is not None and rsi <= RSI_THRESHOLD) or (has_macd_crossover and macd > macd_signal and macd_signal > 0) or (roc is not None and roc > 0):
             return "comprar", 85, "Tendencia alcista confirmada por RSI bajo, cruce MACD, o ROC positivo"
+        if rsi is not None and rsi > 70 and relative_volume > VOLUME_GROWTH_THRESHOLD and price_trend == "increasing":  # Nueva regla para sobrecompra
+            return "comprar", 75, "Compra en sobrecompra con volumen creciente y tendencia alcista"
         return "mantener", 50, "Sin señales claras de tendencia alcista"
     else:
         if (rsi is not None and rsi < 30 and bb_position == "below_lower") or (rsi is not None and rsi > 70 and bb_position == "above_upper"):
@@ -729,20 +730,26 @@ def demo_trading(high_volume_symbols=None):
                 logging.warning(f"Se omite {symbol} por datos insuficientes")
                 continue
 
-            # Calcular indicadores antes de usarlos
-            rsi = data['1h']['RSI'].iloc[-1] if not pd.isna(data['1h']['RSI'].iloc[-1]) else None
-            adx = calculate_adx(data['1h'])
-            atr = data['1h']['ATR'].iloc[-1] if not pd.isna(data['1h']['ATR'].iloc[-1]) else None
-            volume_series = data['1h']['volume']
-            relative_volume = volume_series.iloc[-1] / volume_series.mean() if not pd.isna(volume_series.mean()) and volume_series.mean() != 0 else None
-            divergence = detect_momentum_divergences(price_series, data['1h']['RSI'])
-            bb_position = get_bb_position(current_price, data['1h']['BB_upper'].iloc[-1], data['1h']['BB_middle'].iloc[-1], data['1h']['BB_lower'].iloc[-1])
-            macd = data['1h']['MACD'].iloc[-1]
-            macd_signal = data['1h']['MACD_signal'].iloc[-1]
-            roc = data['1h']['ROC'].iloc[-1] if not pd.isna(data['1h']['ROC'].iloc[-1]) else None
+            # Buffer para más datos históricos
+            buffer_size = 100
+            idx = data['1h'].index.get_loc(data['1h'].index[-1])
+            start_idx = max(0, idx - buffer_size)
+            df_slice = data['1h'].iloc[start_idx:]
 
-            macd_series = data['1h']['MACD']
-            signal_series = data['1h']['MACD_signal']
+            # Calcular indicadores antes de usarlos
+            rsi = df_slice['RSI'].iloc[-1] if not pd.isna(df_slice['RSI'].iloc[-1]) else None
+            adx = calculate_adx(df_slice)
+            atr = df_slice['ATR'].iloc[-1] if not pd.isna(df_slice['ATR'].iloc[-1]) else None
+            volume_series = df_slice['volume']
+            relative_volume = volume_series.iloc[-1] / volume_series[-20:].mean() if len(volume_series) >= 20 and volume_series[-20:].mean() != 0 else 1.0  # Ajuste para volumen reciente
+            divergence = detect_momentum_divergences(price_series, df_slice['RSI'])
+            bb_position = get_bb_position(current_price, df_slice['BB_upper'].iloc[-1], df_slice['BB_middle'].iloc[-1], df_slice['BB_lower'].iloc[-1])
+            macd = df_slice['MACD'].iloc[-1]
+            macd_signal = df_slice['MACD_signal'].iloc[-1]
+            roc = df_slice['ROC'].iloc[-1] if not pd.isna(df_slice['ROC'].iloc[-1]) else None
+
+            macd_series = df_slice['MACD']
+            signal_series = df_slice['MACD_signal']
             has_crossover, candles_since = has_recent_macd_crossover(macd_series, signal_series, lookback=5)
 
             # Inicializar indicators con valores calculados
@@ -770,14 +777,13 @@ def demo_trading(high_volume_symbols=None):
             }
 
             # Detectar soporte potencial usando indicadores
-            # Dentro del bucle for symbol in batch:
-            support_level = detect_support_level(data, price_series, window=15, max_threshold_multiplier=2.5)
+            support_level = detect_support_level(data, price_series, window=15, max_threshold_multiplier=3.0)  # Aumentar umbral para más flexibilidad
             if support_level is None:
                 logging.warning(f"No se detectó nivel de soporte para {symbol}, omitiendo.")
                 continue
 
             # Umbral dinámico basado en ATR, con un máximo de 15%
-            support_threshold = 1 + (indicators['atr'] * 2.5 / current_price) if indicators['atr'] and current_price > 0 else 1.10
+            support_threshold = 1 + (indicators['atr'] * 3.0 / current_price) if indicators['atr'] and current_price > 0 else 1.10
             support_threshold = min(support_threshold, 1.15)  # Máximo 15%
 
             if current_price > support_level * support_threshold:
@@ -834,7 +840,7 @@ def demo_trading(high_volume_symbols=None):
 
             # Decisión basada en reglas o GPT
             action, confidence, explanation = calculate_adaptive_strategy(indicators)
-            if action == "mantener" and (rsi is None or 30 < rsi < 70) and (relative_volume is None or relative_volume < 0.8) and not has_crossover:
+            if action == "mantener" and (rsi is None or 30 < rsi < 70) and (relative_volume is None or relative_volume < 0.5) and not has_crossover:
                 prepared_text = gpt_prepare_data(data, indicators)
                 action, confidence, explanation = gpt_decision_buy(prepared_text)
 
@@ -1001,11 +1007,11 @@ def gpt_decision_buy(prepared_text):
     prompt = f"""
     Eres un experto en trading de criptomonedas de alto riesgo. Basándote en los datos para cualquier activo USDT en Binance:
     {prepared_text}
-    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza activos con alta volatilidad, volumen creciente (>0.8), o cruces alcistas recientes de MACD, incluso si RSI es > 40. Acepta riesgos moderados si el volumen y momentum son fuertes. Responde SOLO con un JSON válido sin '''json''' asi:
-    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen creciente y cruce alcista de MACD indican oportunidad de ganancia rápida"}}
+    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza activos con alta volatilidad, volumen creciente (>0.5), o cruces alcistas recientes de MACD, incluso si RSI es > 70. Acepta riesgos moderados si el volumen y momentum son fuertes. Responde SOLO con un JSON válido sin '''json''' asi:
+    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen creciente y cruce alcista de MACD indican oportunidad de ganancia rápida en sobrecompra"}}
     Criterios:
-    - Compra si volumen relativo > 0.8, precio tendencia 'increasing', o cruce alcista MACD reciente, incluso con RSI > 40.
-    - Mantener solo si todas las señales son débiles o negativas o hay sobre venta.
+    - Compra si volumen relativo > 0.5, precio tendencia 'increasing', o cruce alcista MACD reciente, incluso con RSI > 70.
+    - Mantener solo si todas las señales son débiles o negativas o hay sobre venta extrema (RSI < 20).
     - Evalúa profundidad (>2000) y spread (<1% del precio) para liquidez.
     """
     max_retries = 2
