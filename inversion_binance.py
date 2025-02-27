@@ -131,8 +131,7 @@ def detect_support_level(data, price_series, window=15):
                     logging.warning(f"Datos insuficientes después de limpiar duplicados en {price_series.name} en {tf}")
                     continue
 
-            # Para timeframes intradía, rellenar gaps; para 1d se asume que vienen datos diarios consecutivos.
-            # En todos los casos aplicamos ffill a la serie ATR para asegurar un valor final válido.
+            # Para timeframes intradía, rellenar gaps; para 1d se asume que vienen datos diarios consecutivos
             if tf != '1d':
                 expected_freq = pd.Timedelta('1h') if tf == '1h' else pd.Timedelta('4h')
                 expected_index = pd.date_range(start=df.index[0], end=df.index[-1], freq=expected_freq)
@@ -143,11 +142,10 @@ def detect_support_level(data, price_series, window=15):
                         logging.warning(f"Datos insuficientes después de llenar gaps para {price_series.name} en {tf}")
                         continue
 
-            # Calcular ATR con ventana de 14
+            # Calcular ATR con ventana de 14 y rellenar NaN tanto hacia adelante como hacia atrás
             atr_series = ta.atr(df['high'], df['low'], df['close'], length=14)
-            # Rellenar hacia adelante los NaN para asegurar que el último valor sea válido
-            atr_series_filled = atr_series.ffill()
-            logging.debug(f"Serie ATR para {price_series.name} en {tf} (después de ffill):\n{atr_series_filled}")
+            atr_series_filled = atr_series.ffill().bfill()
+            logging.debug(f"Serie ATR para {price_series.name} en {tf} (después de ffill & bfill):\n{atr_series_filled}")
             if atr_series_filled.isna().all():
                 logging.error(f"ATR no calculado para {price_series.name} en {tf}: {atr_series}")
                 continue
@@ -171,6 +169,7 @@ def detect_support_level(data, price_series, window=15):
 
     logging.debug(f"Umbral de soporte para {price_series.name}: Precio actual={current_price}, Mínimo reciente={min_price}, Umbral={threshold:.3f}, Timeframe usado={used_tf}")
     return min_price if min_price < current_price * threshold else None
+
 
 
 def calculate_short_volume_trend(volume_series, window=3):
