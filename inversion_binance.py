@@ -131,7 +131,7 @@ def detect_support_level(data, price_series, window=15):
                     logging.warning(f"Datos insuficientes después de limpiar duplicados en {price_series.name} en {tf}")
                     continue
 
-            # Para timeframes intradía, rellenar gaps; para 1d asumimos datos diarios consecutivos
+            # Para timeframes intradía, rellenar gaps; para 1d se asume que vienen datos diarios consecutivos
             if tf != '1d':
                 expected_freq = pd.Timedelta('1h') if tf == '1h' else pd.Timedelta('4h')
                 expected_index = pd.date_range(start=df.index[0], end=df.index[-1], freq=expected_freq)
@@ -153,7 +153,7 @@ def detect_support_level(data, price_series, window=15):
             atr_value = atr_valid.iloc[-1]
             used_tf = tf
             logging.debug(f"ATR calculado para {price_series.name} en {tf}: {atr_value}")
-            break  # Usamos el primer timeframe válido encontrado
+            break  # Usamos el primer timeframe con datos válidos
 
         except Exception as e:
             logging.error(f"Error al calcular ATR para {price_series.name} en {tf}: {e}")
@@ -163,12 +163,15 @@ def detect_support_level(data, price_series, window=15):
         logging.warning(f"No se pudo calcular ATR para {price_series.name} en ningún timeframe, usando umbral predeterminado de 2%")
         atr_value = 0
 
-    # Calcular un umbral dinámico basado en ATR (capado en 5% para limitar riesgo)
+    # Calcular un umbral dinámico basado en ATR.
+    # Actualmente: threshold = 1 + (atr_value / current_price), capado a 1.05 (5%).
+    # Si deseas detectar soporte en condiciones de menor volatilidad, puedes reducir el cap o usar un valor fijo.
     threshold = 1 + (atr_value / current_price) if atr_value > 0 and current_price > 0 else 1.02
-    threshold = min(threshold, 1.05)
+    threshold = min(threshold, 1.05)  # Aquí se capea el umbral al 5%. Puedes ajustar este valor.
 
     logging.debug(f"Umbral de soporte para {price_series.name}: Precio actual={current_price}, Mínimo reciente={min_price}, Umbral={threshold:.3f}, Timeframe usado={used_tf}")
     return min_price if min_price < current_price * threshold else None
+
 
 
 
