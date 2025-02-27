@@ -261,7 +261,7 @@ def fetch_and_prepare_data(symbol):
 
             for tf in timeframes:
                 logging.debug(f"Iniciando fetch_ohlcv para {symbol} en timeframe {tf} con limit=50")
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=50)  # Mantener limit=50
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=200)  # Mantener limit=50
                 logging.debug(f"Respuesta cruda de fetch_ohlcv para {symbol} en {tf}: {ohlcv[:2] if ohlcv else 'None'} (longitud: {len(ohlcv) if ohlcv else 0})")
 
                 if ohlcv is None:
