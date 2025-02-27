@@ -396,13 +396,28 @@ def fetch_current_symbols_fast():
 # Código principal
 if __name__ == "__main__":
     initialize_db()
-    log_queue.put((logging.INFO, "Iniciando bot de trading en vivo (Spot)."))
+    log_queue.put((logging.INFO, "Iniciando bot de trading en vivo (Spot) - MODO DE PRUEBA REAL."))
     known_symbols = fetch_current_symbols_fast()
     log_queue.put((logging.INFO, f"Símbolos iniciales: {len(known_symbols)}"))
-
+    
+    # Inicia el thread que actualiza mercados durante la ventana crítica de cada hora
     threading.Thread(target=keep_markets_updated, daemon=True).start()
+    # Inicia el thread del WebSocket real (puedes mantenerlo o no para este test)
     start_ws_thread()
 
+    # -----------------------------
+    # BLOQUE DE PRUEBA: Forzar mensaje de WebSocket
+    # -----------------------------
+    import json
+    # Construimos un mensaje simulando la detección de una nueva moneda
+    fake_message = json.dumps([{
+        "s": "DOGEUSDT",  # Esto se convertirá en "TESTCOIN/USDT"
+        "E": int(time.time() * 1000)
+    }])
+    # Llamamos a on_message directamente para activar la lógica de compra
+    on_message(None, fake_message)
+    # -----------------------------
+    
     try:
         while True:
             time.sleep(60)  # Mantener el programa vivo
