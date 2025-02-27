@@ -86,15 +86,69 @@ VOLUME_GROWTH_THRESHOLD = 0.8
 decision_cache = {}
 CACHE_EXPIRATION = 300  # Reducido a 5 minutos para volatilidad
 
-def detect_support_level(data, price_series, window=15):
+def progressive_atr(df, length=14):
     """
-    Detecta un nivel de soporte usando precios históricos y ajusta con ATR para la volatilidad.
+    Calcula ATR de forma progresiva (estilo Welles Wilder) manejando huecos.
+    df: DataFrame con columnas: 'high', 'low', 'close'.
+    length: número de velas para el smoothing (por defecto 14).
+    return: pd.Series con el ATR calculado, alineado al índice de df (NaN en filas descartadas).
+    """
+    # Copia para no modificar el original
+    df_local = df.copy()
+
+    # Elimina filas donde no hay high/low/close
+    df_local.dropna(subset=['high', 'low', 'close'], inplace=True)
+    if df_local.empty:
+        return pd.Series([], dtype=float)
     
+    # Calcula True Range (TR)
+    df_local['prev_close'] = df_local['close'].shift(1)
+    df_local['TR'] = (
+        pd.concat([
+            (df_local['high'] - df_local['low']).abs(),
+            (df_local['high'] - df_local['prev_close']).abs(),
+            (df_local['low'] - df_local['prev_close']).abs(),
+        ], axis=1).max(axis=1)
+    )
+
+    atr_vals = []
+    prev_atr = np.nan
+    count = 0  # cuántas velas válidas se han procesado
+
+    for i, row in df_local.iterrows():
+        tr = row['TR']
+        if count == 0:
+            # primera vela válida
+            current_atr = tr
+        elif count < length:
+            # Hasta 'length', ATR es el promedio simple de los TR procesados hasta ahora
+            current_atr = (prev_atr * count + tr) / (count + 1)
+        else:
+            # Una vez superado 'length', fórmula de Welles Wilder
+            current_atr = prev_atr + (tr - prev_atr) / length
+
+        atr_vals.append(current_atr)
+        prev_atr = current_atr
+        count += 1
+
+    # Crear una serie alineada con las filas que sí tenían datos
+    atr_series = pd.Series(data=atr_vals, index=df_local.index, name='Progressive_ATR')
+    return atr_series
+
+def detect_support_level(data, price_series, window=15, length=14, fallback_percent=0.02):
+    """
+    Detecta un nivel de soporte usando un cálculo progresivo de ATR.
+    Si no hay suficientes datos (o no se puede calcular ATR) en ninguno de los timeframes,
+    aplica un fallback basado en un porcentaje fijo (por defecto 2%).
+
     Args:
-        data: Diccionario con DataFrames para timeframes '1h', '4h' y '1d' (resultado de fetch_and_prepare_data).
-        price_series: Serie de precios de cierre ('close') para análisis.
-        window: Ventana para detectar el mínimo (por defecto 15).
-        
+        data (dict): Diccionario con DataFrames para '1h', '4h', '1d', etc.
+        price_series (pd.Series): Serie de precios de cierre para análisis principal.
+        window (int): Cuántas velas recientes revisar para hallar el mínimo.
+        length (int): Ventana para el cálculo progresivo de ATR (por defecto 14).
+        fallback_percent (float): Si no hay ATR, se considera soporte si el mínimo
+                                  está al menos este porcentaje por debajo del precio actual.
+
     Returns:
         float con el nivel de soporte o None si no se detecta.
     """
@@ -102,90 +156,62 @@ def detect_support_level(data, price_series, window=15):
         logging.warning(f"Series too short for {price_series.name}: {len(price_series)} < {window}")
         return None
 
+    # Mínimo de las últimas 'window' velas y precio actual
     recent_prices = price_series[-window:]
     min_price = recent_prices.min()
     current_price = price_series.iloc[-1]
 
-    # Se intentará calcular ATR usando distintos timeframes
-    timeframes = ['1h', '4h', '1d']
+    # Intentar calcular ATR en orden de timeframes
     atr_value = None
     used_tf = None
+    timeframes = ['1h', '4h', '1d']
 
     for tf in timeframes:
         if tf not in data or data[tf].empty:
             logging.warning(f"No hay datos en {tf} para {price_series.name}")
             continue
 
-        df = data[tf]
-        if len(df) < 14:  # ATR requiere al menos 14 velas
-            logging.warning(f"Datos insuficientes para ATR en {price_series.name} ({tf}): {len(df)} < 14")
+        df_tf = data[tf]
+        if len(df_tf) < length:
+            logging.warning(f"Datos insuficientes para progresive ATR en {price_series.name} ({tf}): {len(df_tf)} < {length}")
             continue
 
-        try:
-            # Ordenar y eliminar duplicados si es necesario
-            if not df.index.is_monotonic_increasing:
-                df = df.sort_index()
-            if df.index.duplicated().any():
-                df = df[~df.index.duplicated(keep='first')]
-                if len(df) < 14:
-                    logging.warning(f"Datos insuficientes tras limpiar duplicados en {price_series.name} en {tf}")
-                    continue
-
-            # Para timeframes intradía, rellenar gaps
-            if tf != '1d':
-                expected_freq = pd.Timedelta('1h') if tf == '1h' else pd.Timedelta('4h')
-                expected_index = pd.date_range(start=df.index[0], end=df.index[-1], freq=expected_freq)
-                if len(expected_index) > len(df.index):
-                    logging.warning(
-                        f"Gaps detectados en {price_series.name} en {tf}: "
-                        f"esperados={len(expected_index)}, reales={len(df.index)}"
-                    )
-                    df = df.reindex(expected_index, method='ffill').dropna(how='all')
-                    if len(df) < 14:
-                        logging.warning(
-                            f"Datos insuficientes al llenar gaps para {price_series.name} en {tf}"
-                        )
-                        continue
-
-            # Calcular ATR y rellenar NaN tanto hacia adelante como hacia atrás
-            atr_series = ta.atr(df['high'], df['low'], df['close'], length=14)
-
-            # *** AQUÍ ESTÁ LA DIFERENCIA: usamos ffill() y bfill() en vez de solo ffill() ***
-            atr_series_filled = atr_series.ffill().bfill()
-
-            logging.debug(
-                f"Serie ATR para {price_series.name} en {tf} (después de ffill & bfill):\n{atr_series_filled}"
-            )
-
-            if atr_series_filled.isna().all():
-                logging.error(f"ATR no calculado para {price_series.name} en {tf}: {atr_series}")
-                continue
-
-            atr_value = atr_series_filled.iloc[-1]
+        # Calcular ATR progresivo
+        atr_series = progressive_atr(df_tf, length=length)
+        # Tomamos el último valor válido si existe
+        atr_valid = atr_series.dropna()
+        if not atr_valid.empty:
+            atr_value = atr_valid.iloc[-1]  # último valor de ATR
             used_tf = tf
-            logging.debug(f"ATR calculado para {price_series.name} en {tf}: {atr_value}")
-            break  # Usamos el primer timeframe con datos válidos
+            logging.debug(f"ATR progresivo calculado para {price_series.name} en {tf}: {atr_value}")
+            break  # Usamos el primer timeframe en el que sí obtenemos ATR
 
-        except Exception as e:
-            logging.error(f"Error al calcular ATR para {price_series.name} en {tf}: {e}")
-            continue
-
-    if atr_value is None:
-        logging.warning(f"No se pudo calcular ATR para {price_series.name} en ningún timeframe, usando 2% por defecto")
-        atr_value = 0
-
-    # Umbral dinámico basado en ATR (capado a 5%)
-    threshold = 1 + (atr_value / current_price) if (atr_value > 0 and current_price > 0) else 1.02
-    threshold = min(threshold, 1.05)
+    if atr_value and atr_value > 0 and current_price > 0:
+        # Cálculo dinámico con un 'cap' de 5% para no exagerar
+        # Se asume que si ATR es 3 USDT y el precio es 30 USDT -> 10%,
+        # cap en 5% => threshold_price = current_price * 0.95
+        ratio = atr_value / current_price
+        ratio_capped = min(ratio, 0.05)  # 5% max
+        threshold_price = current_price * (1 - ratio_capped)
+    else:
+        # Fallback si no se pudo calcular ATR o es 0
+        threshold_price = current_price * (1 - fallback_percent)
+        logging.warning(
+            f"No se pudo calcular ATR para {price_series.name} en ningún timeframe. "
+            f"Aplicando fallback del {fallback_percent*100}%"
+        )
 
     logging.debug(
-        f"Umbral soporte {price_series.name}: precio={current_price}, min_reciente={min_price}, "
-        f"umbral={threshold:.3f}, timeframe={used_tf}"
+        f"Umbral calculado para {price_series.name}: Precio actual={current_price}, "
+        f"Min reciente={min_price}, Threshold={threshold_price:.3f}, "
+        f"Timeframe usado={used_tf}"
     )
-    return min_price if min_price < current_price * threshold else None
 
-
-
+    # Decidir si se detecta soporte
+    if min_price < threshold_price:
+        return min_price
+    else:
+        return None
 
 def calculate_short_volume_trend(volume_series, window=3):
     if len(volume_series) < window:
