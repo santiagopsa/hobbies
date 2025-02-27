@@ -131,7 +131,8 @@ def detect_support_level(data, price_series, window=15):
                     logging.warning(f"Datos insuficientes después de limpiar duplicados en {price_series.name} en {tf}")
                     continue
 
-            # Para timeframes intradía, rellenar gaps; para 1d se asume que vienen datos diarios consecutivos
+            # Para timeframes intradía, rellenar gaps; para 1d se asume que vienen datos diarios consecutivos.
+            # En todos los casos aplicamos ffill a la serie ATR para asegurar un valor final válido.
             if tf != '1d':
                 expected_freq = pd.Timedelta('1h') if tf == '1h' else pd.Timedelta('4h')
                 expected_index = pd.date_range(start=df.index[0], end=df.index[-1], freq=expected_freq)
@@ -144,7 +145,7 @@ def detect_support_level(data, price_series, window=15):
 
             # Calcular ATR con ventana de 14
             atr_series = ta.atr(df['high'], df['low'], df['close'], length=14)
-            # Rellenar hacia adelante los NaN para asegurar un valor final válido
+            # Rellenar hacia adelante los NaN para asegurar que el último valor sea válido
             atr_series_filled = atr_series.ffill()
             logging.debug(f"Serie ATR para {price_series.name} en {tf} (después de ffill):\n{atr_series_filled}")
             if atr_series_filled.isna().all():
@@ -164,15 +165,12 @@ def detect_support_level(data, price_series, window=15):
         logging.warning(f"No se pudo calcular ATR para {price_series.name} en ningún timeframe, usando umbral predeterminado de 2%")
         atr_value = 0
 
-    # Calcular un umbral dinámico basado en ATR (capado en 5% para limitar riesgo)
+    # Calcular un umbral dinámico basado en ATR (capado a 5% para limitar riesgo)
     threshold = 1 + (atr_value / current_price) if atr_value > 0 and current_price > 0 else 1.02
     threshold = min(threshold, 1.05)
 
     logging.debug(f"Umbral de soporte para {price_series.name}: Precio actual={current_price}, Mínimo reciente={min_price}, Umbral={threshold:.3f}, Timeframe usado={used_tf}")
     return min_price if min_price < current_price * threshold else None
-
-
-
 
 
 def calculate_short_volume_trend(volume_series, window=3):
