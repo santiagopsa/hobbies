@@ -118,14 +118,16 @@ def increment_daily_purchases():
     conn.close()
 
 def get_sleep_duration():
-    now = datetime.now().time()
-    # Definir la ventana crítica (ajusta las horas según tu zona horaria)
-    critical_start = datetime.strptime("03:58", "%H:%M").time()
-    critical_end = datetime.strptime("04:02", "%H:%M").time()
-    if critical_start <= now <= critical_end:
-        return 0.2  # Consultas rápidas en la ventana crítica (cada 0.2 segundos)
+    now_dt = datetime.now()
+    minute = now_dt.minute
+    if minute >= 58 or minute < 2:
+        return 0.2
     else:
-        return 5    # Consultas normales fuera de la ventana
+        next_critical = now_dt.replace(minute=58, second=0, microsecond=0)
+        if next_critical <= now_dt:
+            next_critical += timedelta(hours=1)
+        sleep_time = (next_critical - now_dt).total_seconds()
+        return sleep_time
 
 new_coin_detected = False
 # Pre-carga de mercados en segundo plano
