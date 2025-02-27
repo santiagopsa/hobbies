@@ -412,6 +412,8 @@ if __name__ == "__main__":
     # BLOQUE DE PRUEBA: Forzar mensaje de WebSocket
     # -----------------------------
     import json
+    # Forzamos que el símbolo se procese borrándolo de known_symbols
+    known_symbols.discard("DOGE/USDT")
     # Construimos un mensaje simulando la detección de una nueva moneda
     fake_message = json.dumps([{
         "s": "DOGEUSDT",  # Esto se convertirá en "TESTCOIN/USDT"
