@@ -106,7 +106,7 @@ def detect_support_level(data, price_series, window=15):
     min_price = recent_prices.min()
     current_price = price_series.iloc[-1]
 
-    # Se intentará calcular ATR usando distintos timeframes, priorizando '1h', luego '4h' y finalmente '1d'
+    # Se intentará calcular ATR usando distintos timeframes
     timeframes = ['1h', '4h', '1d']
     atr_value = None
     used_tf = None
@@ -118,7 +118,7 @@ def detect_support_level(data, price_series, window=15):
 
         df = data[tf]
         if len(df) < 14:  # ATR requiere al menos 14 velas
-            logging.warning(f"Datos insuficientes para ATR en {price_series.name} ({tf}): {len(df)} < 14, intentando siguiente timeframe")
+            logging.warning(f"Datos insuficientes para ATR en {price_series.name} ({tf}): {len(df)} < 14")
             continue
 
         try:
@@ -128,24 +128,35 @@ def detect_support_level(data, price_series, window=15):
             if df.index.duplicated().any():
                 df = df[~df.index.duplicated(keep='first')]
                 if len(df) < 14:
-                    logging.warning(f"Datos insuficientes después de limpiar duplicados en {price_series.name} en {tf}")
+                    logging.warning(f"Datos insuficientes tras limpiar duplicados en {price_series.name} en {tf}")
                     continue
 
-            # Para timeframes intradía, rellenar gaps; para 1d se asume que vienen datos diarios consecutivos
+            # Para timeframes intradía, rellenar gaps
             if tf != '1d':
                 expected_freq = pd.Timedelta('1h') if tf == '1h' else pd.Timedelta('4h')
                 expected_index = pd.date_range(start=df.index[0], end=df.index[-1], freq=expected_freq)
                 if len(expected_index) > len(df.index):
-                    logging.warning(f"Gaps detectados en {price_series.name} en {tf}: índices esperados={len(expected_index)}, reales={len(df.index)}")
+                    logging.warning(
+                        f"Gaps detectados en {price_series.name} en {tf}: "
+                        f"esperados={len(expected_index)}, reales={len(df.index)}"
+                    )
                     df = df.reindex(expected_index, method='ffill').dropna(how='all')
                     if len(df) < 14:
-                        logging.warning(f"Datos insuficientes después de llenar gaps para {price_series.name} en {tf}")
+                        logging.warning(
+                            f"Datos insuficientes al llenar gaps para {price_series.name} en {tf}"
+                        )
                         continue
 
-            # Calcular ATR con ventana de 14 y rellenar NaN tanto hacia adelante como hacia atrás
+            # Calcular ATR y rellenar NaN tanto hacia adelante como hacia atrás
             atr_series = ta.atr(df['high'], df['low'], df['close'], length=14)
+
+            # *** AQUÍ ESTÁ LA DIFERENCIA: usamos ffill() y bfill() en vez de solo ffill() ***
             atr_series_filled = atr_series.ffill().bfill()
-            logging.debug(f"Serie ATR para {price_series.name} en {tf} (después de ffill & bfill):\n{atr_series_filled}")
+
+            logging.debug(
+                f"Serie ATR para {price_series.name} en {tf} (después de ffill & bfill):\n{atr_series_filled}"
+            )
+
             if atr_series_filled.isna().all():
                 logging.error(f"ATR no calculado para {price_series.name} en {tf}: {atr_series}")
                 continue
@@ -160,15 +171,19 @@ def detect_support_level(data, price_series, window=15):
             continue
 
     if atr_value is None:
-        logging.warning(f"No se pudo calcular ATR para {price_series.name} en ningún timeframe, usando umbral predeterminado de 2%")
+        logging.warning(f"No se pudo calcular ATR para {price_series.name} en ningún timeframe, usando 2% por defecto")
         atr_value = 0
 
-    # Calcular un umbral dinámico basado en ATR (capado a 5% para limitar riesgo)
-    threshold = 1 + (atr_value / current_price) if atr_value > 0 and current_price > 0 else 1.02
+    # Umbral dinámico basado en ATR (capado a 5%)
+    threshold = 1 + (atr_value / current_price) if (atr_value > 0 and current_price > 0) else 1.02
     threshold = min(threshold, 1.05)
 
-    logging.debug(f"Umbral de soporte para {price_series.name}: Precio actual={current_price}, Mínimo reciente={min_price}, Umbral={threshold:.3f}, Timeframe usado={used_tf}")
+    logging.debug(
+        f"Umbral soporte {price_series.name}: precio={current_price}, min_reciente={min_price}, "
+        f"umbral={threshold:.3f}, timeframe={used_tf}"
+    )
     return min_price if min_price < current_price * threshold else None
+
 
 
 
