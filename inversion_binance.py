@@ -86,7 +86,7 @@ VOLUME_GROWTH_THRESHOLD = 0.8
 decision_cache = {}
 CACHE_EXPIRATION = 300  # Reducido a 5 minutos para volatilidad
 
-def detect_support_level(data, price_series, window=15):
+def detect_support_level(data, price_series, window=15, max_threshold_multiplier=2.5):
     """
     Detecta un nivel de soporte usando precios históricos y ajusta con ATR para la volatilidad.
     
@@ -172,10 +172,10 @@ def detect_support_level(data, price_series, window=15):
 
     if atr_value is None:
         logging.warning(f"No se pudo calcular ATR para {price_series.name} en ningún timeframe, usando 2% por defecto")
-        atr_value = 0
+        atr_value = current_price * 0.02
 
     # Umbral dinámico basado en ATR (capado a 5%)
-    threshold = 1 + (atr_value / current_price) if (atr_value > 0 and current_price > 0) else 1.02
+    threshold = 1 + (atr_value * max_threshold_multiplier / current_price) if current_price > 0 else 1.02
     threshold = min(threshold, 1.05)
 
     logging.debug(
@@ -770,12 +770,18 @@ def demo_trading(high_volume_symbols=None):
             }
 
             # Detectar soporte potencial usando indicadores
-            support_level = detect_support_level(data, price_series)
+            # Dentro del bucle for symbol in batch:
+            support_level = detect_support_level(data, price_series, window=15, max_threshold_multiplier=2.5)
             if support_level is None:
                 logging.warning(f"No se detectó nivel de soporte para {symbol}, omitiendo.")
                 continue
-            if current_price > support_level * (1 + (indicators['atr'] / current_price) if indicators['atr'] else 0.02):
-                logging.info(f"Se omite {symbol} por no estar cerca de soporte: Precio={current_price}, Soporte={support_level}, Umbral={1 + (indicators['atr'] / current_price) if indicators['atr'] else 0.02:.3f}")
+
+            # Umbral dinámico basado en ATR, con un máximo de 15%
+            support_threshold = 1 + (indicators['atr'] * 2.5 / current_price) if indicators['atr'] and current_price > 0 else 1.10
+            support_threshold = min(support_threshold, 1.15)  # Máximo 15%
+
+            if current_price > support_level * support_threshold:
+                logging.info(f"Se omite {symbol} por no estar cerca de soporte: Precio={current_price}, Soporte={support_level}, Umbral={support_threshold:.3f}")
                 continue
 
             # Calcular tendencias cortas y largas
