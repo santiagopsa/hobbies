@@ -80,7 +80,7 @@ MAX_DAILY_BUYS = 5  # Reducido de 10 para memoria baja
 MIN_NOTIONAL = 10
 RSI_THRESHOLD = 80  # Aumentado para permitir compras en sobrecompra (cryptos alcistas)
 ADX_THRESHOLD = 15
-VOLUME_GROWTH_THRESHOLD = 0.5  # Reducido para capturar volumen moderado en criptos
+VOLUME_GROWTH_THRESHOLD = 0.3  # Reducido para capturar volumen moderado en criptos
 
 # Cache de decisiones
 decision_cache = {}
@@ -189,9 +189,9 @@ def calculate_short_volume_trend(volume_series, window=3):
         return "insufficient_data"
     last_volume = volume_series.iloc[-1]
     avg_volume = volume_series[-window:].mean()
-    if last_volume > avg_volume * 1.1:  # Volumen 10% superior al promedio
+    if last_volume > avg_volume * 1.05:  # Ajustado de 1.1 a 1.05 (5% superior)
         return "increasing"
-    elif last_volume < avg_volume * 0.9:  # Volumen 10% inferior al promedio
+    elif last_volume < avg_volume * 0.95:  # Ajustado de 0.9 a 0.95 (5% inferior)
         return "decreasing"
     else:
         return "stable"
@@ -632,13 +632,18 @@ def calculate_adaptive_strategy(indicators):
     roc = indicators.get('roc', None)
     bb_position = indicators.get('bb_position', 'unknown')
     price_trend = indicators.get('price_trend', 'insufficient_data')
+    short_volume_trend = indicators.get('short_volume_trend', 'insufficient_data')
 
     is_trending = adx > 25 if adx is not None else False
+
+    # Nueva regla basada en tendencia corta de volumen
+    if short_volume_trend == "increasing" and price_trend != "decreasing" and relative_volume > VOLUME_GROWTH_THRESHOLD:
+        return "comprar", 80, "Volumen creciente a corto plazo con tendencia de precio no bajista"
 
     if is_trending:
         if (rsi is not None and rsi <= RSI_THRESHOLD) or (has_macd_crossover and macd > macd_signal and macd_signal > 0) or (roc is not None and roc > 0):
             return "comprar", 85, "Tendencia alcista confirmada por RSI bajo, cruce MACD, o ROC positivo"
-        if rsi is not None and rsi > 70 and relative_volume > VOLUME_GROWTH_THRESHOLD and price_trend == "increasing":  # Nueva regla para sobrecompra
+        if rsi is not None and rsi > 70 and relative_volume > VOLUME_GROWTH_THRESHOLD and price_trend == "increasing":
             return "comprar", 75, "Compra en sobrecompra con volumen creciente y tendencia alcista"
         return "mantener", 50, "Sin señales claras de tendencia alcista"
     else:
@@ -741,7 +746,7 @@ def demo_trading(high_volume_symbols=None):
             adx = calculate_adx(df_slice)
             atr = df_slice['ATR'].iloc[-1] if not pd.isna(df_slice['ATR'].iloc[-1]) else None
             volume_series = df_slice['volume']
-            relative_volume = volume_series.iloc[-1] / volume_series[-20:].mean() if len(volume_series) >= 20 and volume_series[-20:].mean() != 0 else 1.0  # Ajuste para volumen reciente
+            relative_volume = volume_series.iloc[-1] / volume_series[-10:].mean() if len(volume_series) >= 10 and volume_series[-10:].mean() != 0 else 1.0  # Ajuste para volumen reciente
             divergence = detect_momentum_divergences(price_series, df_slice['RSI'])
             bb_position = get_bb_position(current_price, df_slice['BB_upper'].iloc[-1], df_slice['BB_middle'].iloc[-1], df_slice['BB_lower'].iloc[-1])
             macd = df_slice['MACD'].iloc[-1]
