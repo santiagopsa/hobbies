@@ -13,8 +13,8 @@ from scipy.stats import linregress
 
 # Configuración
 load_dotenv()
-DB_NAME = "trading_analysis.db"
-logging.basicConfig(level=logging.INFO, filename="historical_analysis.log", filemode="a", format="%(asctime)s - %(levelname)s - %(message)s")
+DB_NAME = "trading_analysis_ern.db"
+logging.basicConfig(level=logging.INFO, filename="historical_analysis_ern.log", filemode="a", format="%(asctime)s - %(levelname)s - %(message)s")
 
 exchange = ccxt.binance({
     'apiKey': os.getenv("BINANCE_API_KEY_REAL"),
@@ -24,9 +24,9 @@ exchange = ccxt.binance({
 })
 
 # Constantes del programa principal
-RSI_THRESHOLD = 30
+RSI_THRESHOLD = 80
 ADX_THRESHOLD = 15
-VOLUME_GROWTH_THRESHOLD = 0.8
+VOLUME_GROWTH_THRESHOLD = 0.3  # Ajustado para capturar crecimiento temprano de volumen
 
 # Inicializar base de datos para almacenar resultados
 def initialize_db():
@@ -74,12 +74,21 @@ def fetch_historical_data(symbol, timeframe='5m', start_time=None, end_time=None
     end_timestamp = int(end_time.timestamp() * 1000) if end_time else None
     
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=start_timestamp, limit=limit)
+    if not ohlcv or len(ohlcv) == 0:
+        logging.error(f"No data fetched for {symbol}")
+        return pd.DataFrame()
+
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
     df.index = df.index.tz_localize('UTC').tz_convert(colombia_tz)
     df = df[(df.index >= start_time) & (df.index <= end_time)]
     
+    if df.empty:
+        logging.warning(f"Empty DataFrame for {symbol} after filtering")
+        return df
+
+    # Calcular indicadores
     df['RSI'] = ta.rsi(df['close'], length=7).ffill().bfill()
     df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=7).ffill().bfill()
     bb = ta.bbands(df['close'], length=14, std=2)
@@ -131,7 +140,7 @@ def has_recent_macd_crossover(macd_series, signal_series, lookback=5):
     for i in range(-1, -lookback-1, -1):
         if i < -len(macd_series) or i-1 < -len(macd_series):  # Evitar índices fuera de rango
             break
-        if macd_series.iloc[i-1] <= signal_series.iloc[i-1] and macd_series.iloc[i] > signal_series.iloc[i]:
+        if macd_series.iloc[i-1] <= signal_series.iloc[i-1] and macd_series.iloc[i] > signal_series[i]:
             return True, abs(i)
     return False, None
 
@@ -149,7 +158,19 @@ def calculate_short_volume_trend(volume_series, window=3):
         return "insufficient_data"
     last_volume = volume_series.iloc[-1]
     avg_volume = volume_series[-window:].mean()
-    return "increasing" if last_volume > avg_volume * 1.1 else "decreasing" if last_volume < avg_volume * 0.9 else "stable"
+    return "increasing" if last_volume > avg_volume * 1.05 else "decreasing" if last_volume < avg_volume * 0.95 else "stable"  # Ajustado a ±5%
+
+def calculate_volume_trend(volume_series, window=10):
+    if len(volume_series) < window:
+        return "insufficient_data"
+    slope_volume, _, _, _, _ = linregress(range(window), volume_series[-window:])
+    return "increasing" if slope_volume > 0.01 else "decreasing" if slope_volume < -0.01 else "stable"
+
+def calculate_price_trend(price_series, window=10):
+    if len(price_series) < window:
+        return "insufficient_data"
+    slope_price, _, _, _, _ = linregress(range(window), price_series[-window:])
+    return "increasing" if slope_price > 0.01 else "decreasing" if slope_price < -0.01 else "stable"
 
 def calculate_adaptive_strategy(indicators):
     rsi = indicators.get('rsi')
@@ -160,12 +181,20 @@ def calculate_adaptive_strategy(indicators):
     macd_signal = indicators.get('macd_signal')
     roc = indicators.get('roc')
     bb_position = indicators.get('bb_position', 'unknown')
+    price_trend = indicators.get('price_trend', 'insufficient_data')
+    short_volume_trend = indicators.get('short_volume_trend', 'insufficient_data')
 
     is_trending = adx > 25 if adx is not None else False
+
+    # Nueva regla basada en tendencia corta de volumen y precio
+    if short_volume_trend == "increasing" and price_trend != "decreasing" and relative_volume > VOLUME_GROWTH_THRESHOLD:
+        return "comprar", 80, "Volumen creciente a corto plazo con tendencia de precio no bajista"
 
     if is_trending:
         if (rsi is not None and rsi <= RSI_THRESHOLD) or (has_macd_crossover and macd > macd_signal and macd_signal > 0) or (roc is not None and roc > 0):
             return "comprar", 85, "Tendencia alcista confirmada por RSI bajo, cruce MACD, o ROC positivo"
+        if rsi is not None and rsi > 70 and relative_volume > VOLUME_GROWTH_THRESHOLD and price_trend == "increasing":
+            return "comprar", 75, "Compra en sobrecompra con volumen creciente y tendencia alcista"
         return "mantener", 50, "Sin señales claras de tendencia alcista"
     else:
         if (rsi is not None and rsi < 30 and bb_position == "below_lower") or (rsi is not None and rsi > 70 and bb_position == "above_upper"):
@@ -202,34 +231,30 @@ def analyze_historical_data(symbol, start_time, end_time):
             'rsi': rsi,
             'adx': calculate_adx(df_slice),
             'atr': atr,
-            'relative_volume': volume_series.iloc[-1] / volume_series.mean() if volume_series.mean() != 0 else None,
+            'relative_volume': volume_series.iloc[-1] / volume_series[-10:].mean() if len(volume_series) >= 10 and volume_series[-10:].mean() != 0 else 1.0,  # Ajustado a 10 velas
             'divergence': detect_momentum_divergences(price_series, df['RSI'].iloc[start_idx:idx + 1]),
             'bb_position': get_bb_position(price, row['BB_upper'], row['BB_middle'], row['BB_lower']),
             'macd': macd,
             'macd_signal': macd_signal,
             'has_macd_crossover': has_recent_macd_crossover(df['MACD'].iloc[start_idx:idx + 1], df['MACD_signal'].iloc[start_idx:idx + 1])[0],
             'candles_since_crossover': has_recent_macd_crossover(df['MACD'].iloc[start_idx:idx + 1], df['MACD_signal'].iloc[start_idx:idx + 1])[1],
-            'volume_trend': "insufficient_data" if len(volume_series) < 10 else ("increasing" if linregress(range(10), volume_series[-10:])[0] > 0.01 else "decreasing" if linregress(range(10), volume_series[-10:])[0] < -0.01 else "stable"),
-            'price_trend': "insufficient_data" if len(price_series) < 10 else ("increasing" if linregress(range(10), price_series[-10:])[0] > 0.01 else "decreasing" if linregress(range(10), price_series[-10:])[0] < -0.01 else "stable"),
+            'volume_trend': calculate_volume_trend(volume_series),
+            'price_trend': calculate_price_trend(price_series),
             'short_volume_trend': calculate_short_volume_trend(volume_series),
-            'support_level': detect_support_level(df_slice, price_series),
+            'support_level': detect_support_level(df_slice, price_series),  # Opcional, no bloqueante
             'roc': roc
         }
 
         # Decisión de compra según estrategia
         action, confidence, explanation = calculate_adaptive_strategy(indicators)
 
-        # Filtros adicionales de demo_trading
+        # Filtros adicionales (sin requerir soporte estricto)
         rejecting_variable = None
         if action == "comprar" and confidence >= 70:
-            if indicators['support_level'] is None:
-                action, rejecting_variable = "mantener", "support_level is None"
-            elif price > indicators['support_level'] * (1 + (indicators['atr'] / price) if indicators['atr'] else 0.02):
-                action, rejecting_variable = "mantener", "price too far from support"
-            elif indicators['short_volume_trend'] == "decreasing":
+            if indicators['short_volume_trend'] == "decreasing":
                 action, rejecting_variable = "mantener", "short_volume_trend decreasing"
-            elif indicators['price_trend'] != "increasing" and indicators['short_volume_trend'] != "increasing":
-                action, rejecting_variable = "mantener", "lack of short-term momentum"
+            elif indicators['price_trend'] == "decreasing":
+                action, rejecting_variable = "mantener", "price_trend decreasing"
 
         # Guardar en la base de datos
         cursor.execute('''
@@ -253,7 +278,8 @@ def analyze_historical_data(symbol, start_time, end_time):
     conn.close()
 
 if __name__ == "__main__":
-    start_time = datetime(2025, 2, 27, 8, 0, tzinfo=pytz.timezone("America/Bogota"))
-    end_time = datetime(2025, 2, 27, 11, 0, tzinfo=pytz.timezone("America/Bogota"))
-    analyze_historical_data('FIO/USDT', start_time, end_time)
-    logging.info("Análisis histórico completado.")
+    # Ajustar el rango de tiempo para coincidir con el gráfico (March 3, 2025, alrededor de 16:30)
+    start_time = datetime(2025, 3, 3, 15, 0, tzinfo=pytz.timezone("America/Bogota"))  # 15:00 para capturar datos previos
+    end_time = datetime(2025, 3, 3, 17, 0, tzinfo=pytz.timezone("America/Bogota"))   # 17:00 para incluir 16:30
+    analyze_historical_data('ERN/USDT', start_time, end_time)
+    logging.info("Análisis histórico completado para ERN/USDT.")
