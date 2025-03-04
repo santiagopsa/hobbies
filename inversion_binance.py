@@ -1012,12 +1012,13 @@ def gpt_decision_buy(prepared_text):
     prompt = f"""
     Eres un experto en trading de criptomonedas de alto riesgo. Basándote en los datos para cualquier activo USDT en Binance:
     {prepared_text}
-    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza activos con alta volatilidad, volumen creciente (>0.5), o cruces alcistas recientes de MACD, incluso si RSI es > 70. Acepta riesgos moderados si el volumen y momentum son fuertes. Responde SOLO con un JSON válido sin '''json''' asi:
-    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen creciente y cruce alcista de MACD indican oportunidad de ganancia rápida en sobrecompra"}}
+    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza activos con alta volatilidad, volumen creciente (>0.2), o cruces alcistas recientes de MACD, incluso si RSI es > 70. Acepta riesgos moderados si el volumen y momentum a corto plazo son fuertes, especialmente cuando short_volume_trend es 'increasing' y price_trend no es 'decreasing'. Responde SOLO con un JSON válido sin '''json''' asi:
+    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen creciente a corto plazo (>0.2) y tendencia de precio no bajista indican oportunidad de ganancia rápida en alta volatilidad"}}
     Criterios:
-    - Compra si volumen relativo > 0.5, precio tendencia 'increasing', o cruce alcista MACD reciente, incluso con RSI > 70.
-    - Mantener solo si todas las señales son débiles o negativas o hay sobre venta extrema (RSI < 20).
+    - Compra si volumen relativo > 0.2, short_volume_trend es 'increasing', precio tendencia 'increasing' o 'stable', o cruce alcista MACD reciente, incluso con RSI > 70.
+    - Mantener solo si todas las señales son débiles, negativas (e.g., short_volume_trend 'decreasing' o price_trend 'decreasing'), o hay sobre venta extrema (RSI < 20).
     - Evalúa profundidad (>2000) y spread (<1% del precio) para liquidez.
+    - Ignora tendencias largas si short_volume_trend y volumen relativo indican momentum fuerte.
     """
     max_retries = 2
     for attempt in range(max_retries + 1):
