@@ -874,11 +874,12 @@ def demo_trading(high_volume_symbols=None):
             logging.info(f"Decisión inicial para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
 
             gpt_conditions = {
-                'action == "mantener"': action == "mantener",
-                'rsi is None or 30 < rsi < 70': rsi is None or (rsi is not None and 30 < rsi < 70),
-                'relative_volume is None or < 0.5': relative_volume is None or (relative_volume is not None and relative_volume < 0.5),
-                'no macd_crossover': not has_crossover
+                'action is "mantener"': action == "mantener",
+                'RSI is None or neutral (30 < RSI < 70)': rsi is None or (rsi is not None and 30 < rsi < 70),
+                'Relative volume is None or low (< 0.5)': relative_volume is None or (relative_volume is not None and relative_volume < 0.5),
+                'No recent MACD crossover': not has_crossover
             }
+
             gpt_conditions_str = "\n".join([f"{key}: {'Sí' if value else 'No'}" for key, value in gpt_conditions.items()])
             total_gpt_conditions = len(gpt_conditions)
             passed_gpt_conditions = sum(1 for value in gpt_conditions.values() if value)
