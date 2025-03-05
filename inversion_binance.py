@@ -691,7 +691,7 @@ def demo_trading(high_volume_symbols=None):
         logging.warning("Saldo insuficiente en USDT.")
         return False
 
-    reserve = 150  # Reserva para comisiones y posibles pérdidas
+    reserve = 150
     available_for_trading = usdt_balance - reserve
     logging.info(f"Disponible para trading: {available_for_trading}, se deja una reserva de {reserve}")
     daily_buys = get_daily_buys()
@@ -718,8 +718,12 @@ def demo_trading(high_volume_symbols=None):
                 logging.info(f"Se omite {symbol} porque ya tienes una posición abierta.")
                 continue
 
+            # Condiciones iniciales
+            conditions = {}
+
             daily_volume = fetch_volume(symbol)
-            if daily_volume is None or daily_volume < 250000:
+            conditions['daily_volume >= 250000'] = daily_volume is not None and daily_volume >= 250000
+            if not conditions['daily_volume >= 250000']:
                 logging.info(f"Se omite {symbol} por volumen insuficiente: {daily_volume}")
                 continue
 
@@ -727,14 +731,19 @@ def demo_trading(high_volume_symbols=None):
             if not order_book_data:
                 logging.warning(f"Se omite {symbol} por fallo en datos del libro de órdenes")
                 continue
-            if order_book_data['depth'] < 2000:
+            conditions['order_book_available'] = True
+
+            conditions['depth >= 2000'] = order_book_data['depth'] >= 2000
+            if not conditions['depth >= 2000']:
                 logging.info(f"Se omite {symbol} por profundidad insuficiente: {order_book_data['depth']}")
                 continue
 
             current_price = fetch_price(symbol)
-            if current_price is None:
+            conditions['price_available'] = current_price is not None
+            if not conditions['price_available']:
                 logging.warning(f"Se omite {symbol} por no obtener precio")
                 continue
+
             try:
                 current_price = float(current_price)
                 spread = float(order_book_data['spread']) if order_book_data['spread'] is not None else float('inf')
@@ -744,27 +753,31 @@ def demo_trading(high_volume_symbols=None):
                 logging.error(f"Error al convertir datos numéricos para {symbol}: {e}")
                 continue
 
-            if spread > 0.01 * current_price:
+            conditions['spread <= 0.01 * price'] = spread <= 0.01 * current_price
+            if not conditions['spread <= 0.01 * price']:
                 logging.info(f"Se omite {symbol} por spread alto: {spread}")
                 continue
-            if imbalance < 1.0:
+
+            conditions['imbalance >= 1.0'] = imbalance >= 1.0
+            if not conditions['imbalance >= 1.0']:
                 logging.info(f"Se omite {symbol} por imbalance bajo: {imbalance}")
                 continue
 
-            # Obtener datos OHLCV y serie de precios
+            # Obtener datos OHLCV
             data, price_series = fetch_and_prepare_data(symbol)
-            if not data or price_series is None:
+            conditions['data_available'] = data is not None and price_series is not None
+            if not conditions['data_available']:
                 logging.warning(f"Se omite {symbol} por datos insuficientes")
                 continue
 
-            # Usar timeframe 1h como principal, con fallback a 4h o 1d
             df_slice = data.get('1h', data.get('4h', data.get('1d')))
-            if df_slice.empty:
+            conditions['timeframe_available'] = not df_slice.empty
+            if not conditions['timeframe_available']:
                 logging.warning(f"No hay datos válidos en ningún timeframe para {symbol}")
                 continue
-            df_slice = df_slice.iloc[-100:]  # Últimas 100 velas para más historial
+            df_slice = df_slice.iloc[-100:]
 
-            # Extraer indicadores de manera segura
+            # Indicadores
             rsi = df_slice['RSI'].iloc[-1] if 'RSI' in df_slice and not pd.isna(df_slice['RSI'].iloc[-1]) else None
             adx = calculate_adx(df_slice) if not df_slice.empty else None
             atr = df_slice['ATR'].iloc[-1] if 'ATR' in df_slice and not pd.isna(df_slice['ATR'].iloc[-1]) else None
@@ -780,14 +793,11 @@ def demo_trading(high_volume_symbols=None):
             macd = df_slice['MACD'].iloc[-1] if 'MACD' in df_slice and not pd.isna(df_slice['MACD'].iloc[-1]) else None
             macd_signal = df_slice['MACD_signal'].iloc[-1] if 'MACD_signal' in df_slice and not pd.isna(df_slice['MACD_signal'].iloc[-1]) else None
             roc = df_slice['ROC'].iloc[-1] if 'ROC' in df_slice and not pd.isna(df_slice['ROC'].iloc[-1]) else None
-
             has_crossover, candles_since = has_recent_macd_crossover(
                 df_slice['MACD'] if 'MACD' in df_slice else pd.Series(),
                 df_slice['MACD_signal'] if 'MACD_signal' in df_slice else pd.Series(),
                 lookback=5
             )
-
-            # Calcular tendencias con manejo de datos insuficientes
             short_volume_trend = calculate_short_volume_trend(volume_series) if len(volume_series) >= 3 else "insufficient_data"
             volume_trend = "insufficient_data"
             price_trend = "insufficient_data"
@@ -799,29 +809,30 @@ def demo_trading(high_volume_symbols=None):
                 last_10_price = price_series[-10:]
                 slope_price, _, _, _, _ = linregress(range(10), last_10_price)
                 price_trend = "increasing" if slope_price > 0.01 else "decreasing" if slope_price < -0.01 else "stable"
-
             short_price_trend = price_trend
             short_volume_trend_1h = calculate_short_volume_trend(volume_series, window=1) if len(volume_series) >= 1 else "insufficient_data"
-
-            # Detectar nivel de soporte
             support_level = detect_support_level(data, price_series, window=15, max_threshold_multiplier=3.0)
-            if support_level is None:
-                logging.warning(f"No se detectó nivel de soporte para {symbol}")
-                support_level = None  # Continuamos, no usamos continue
-
-            # Umbral dinámico basado en ATR
             support_threshold = 1 + (atr * 3.0 / current_price) if atr and current_price > 0 else 1.10
             support_threshold = min(support_threshold, 1.15)
 
-            # Validación de soporte (opcional, no interrumpimos el flujo)
-            if support_level and current_price > support_level * support_threshold:
-                logging.info(f"Precio de {symbol} ({current_price}) está por encima del umbral de soporte ({support_level * support_threshold:.3f})")
+            # Condiciones específicas
+            conditions['support_near'] = support_level is not None and current_price <= support_level * support_threshold
+            conditions['short_volume_trend_increasing'] = short_volume_trend == "increasing"
+            conditions['price_trend_not_decreasing'] = price_trend != "decreasing"
+            conditions['relative_volume > VOLUME_GROWTH_THRESHOLD'] = relative_volume is not None and relative_volume > VOLUME_GROWTH_THRESHOLD
+            conditions['adx > 25'] = adx is not None and adx > 25
+            conditions['rsi <= RSI_THRESHOLD'] = rsi is not None and rsi <= RSI_THRESHOLD
+            conditions['macd_crossover'] = has_crossover and macd is not None and macd_signal is not None and macd > macd_signal and macd_signal > 0
+            conditions['roc > 0'] = roc is not None and roc > 0
+            conditions['rsi > 70'] = rsi is not None and rsi > 70
+            conditions['rsi < 30 and bb_below_lower'] = rsi is not None and rsi < 30 and bb_position == "below_lower"
+            conditions['rsi > 70 and bb_above_upper'] = rsi is not None and rsi > 70 and bb_position == "above_upper"
 
-            # Validación de volumen corto (opcional)
-            if short_volume_trend == "decreasing":
-                logging.info(f"Tendencia de volumen decreciente a corto plazo para {symbol}")
+            # Registrar todas las condiciones
+            conditions_str = "\n".join([f"{k}: {'Sí' if v else 'No'}" for k, v in conditions.items()])
+            logging.info(f"Condiciones evaluadas para {symbol}:\n{conditions_str}\nValores: RSI={rsi}, ADX={adx}, RelVol={relative_volume}, ShortVolTrend={short_volume_trend}, PriceTrend={price_trend}, Support={support_level}, MACD={macd}, Signal={macd_signal}, Crossover={has_crossover}")
 
-            # Diccionario de indicadores
+            # Indicadores para la decisión
             indicators = {
                 "rsi": rsi,
                 "adx": adx,
@@ -843,16 +854,22 @@ def demo_trading(high_volume_symbols=None):
                 "short_price_trend": short_price_trend,
                 "short_volume_trend_1h": short_volume_trend_1h,
                 "roc": roc,
-                "current_price": current_price  # Añadido para GPT si lo usas
+                "current_price": current_price
             }
 
-            logging.debug(f"Indicadores finales para {symbol}: {indicators}")
+            # Validaciones adicionales (registradas pero no interrumpen)
+            if not conditions['support_near']:
+                logging.info(f"Precio de {symbol} ({current_price}) está por encima del umbral de soporte ({support_level * support_threshold:.3f})")
+            if not conditions['short_volume_trend_increasing']:
+                logging.info(f"Tendencia de volumen decreciente a corto plazo para {symbol}")
 
-            # Decisión de compra
+            # Decisión
             action, confidence, explanation = calculate_adaptive_strategy(indicators)
             if action == "mantener" and (rsi is None or 30 < rsi < 70) and (relative_volume is None or relative_volume < 0.5) and not has_crossover:
                 prepared_text = gpt_prepare_data(data, indicators)
                 action, confidence, explanation = gpt_decision_buy(prepared_text)
+
+            logging.info(f"Decisión para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
 
             if action == "comprar" and confidence >= 70:
                 amount = min(budget_per_trade / current_price, 0.005 * usdt_balance / current_price)
@@ -863,7 +880,7 @@ def demo_trading(high_volume_symbols=None):
                         send_telegram_message(f"✅ *Compra* `{symbol}`\nConfianza: `{confidence}%`\nExplicación: `{explanation}`")
                         dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], indicators)
 
-        # Liberar memoria después de cada batch
+        # Liberar memoria
         del data
         time.sleep(30)
 
