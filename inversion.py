@@ -30,7 +30,7 @@ logging.basicConfig(
 # Constantes
 MONITOR_INTERVAL = 60  # 1 minuto por lote
 EXECUTION_INTERVAL = 3600  # 1 hora
-SYMBOL_UPDATE_INTERVAL = 3600  # 1 hora para actualizar símbolos
+SYMBOL_UPDATE_INTERVAL = 600  # 10 minutos para actualizar símbolos
 THRESHOLD_VOLUME_CHANGE = 0.5  # 50%
 THRESHOLD_PRICE_CHANGE = 0.05  # 5%
 THRESHOLD_RSI_OVERBOUGHT = 70

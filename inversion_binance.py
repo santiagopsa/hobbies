@@ -718,7 +718,8 @@ def demo_trading(high_volume_symbols=None):
         for symbol in batch:
             logging.info(f"Procesando {symbol}...")
             base_asset = symbol.split('/')[0]
-            if base_asset in balance and base_asset in balance and balance[base_asset] > 0:
+            # Corrección: Eliminamos la duplicación en la condición
+            if base_asset in balance and balance[base_asset] > 0:
                 logging.info(f"Se omite {symbol} porque ya tienes una posición abierta.")
                 continue
 
@@ -834,7 +835,7 @@ def demo_trading(high_volume_symbols=None):
             conditions['rsi < 30 and bb_below_lower'] = rsi is not None and rsi < 30 and bb_position == "below_lower"
             conditions['rsi > 70 and bb_above_upper'] = rsi is not None and rsi > 70 and bb_position == "above_upper"
 
-            conditions_str = "\n".join([f"{k}: {'Sí' if v else 'No'}" for k in sorted(conditions.keys())])
+            conditions_str = "\n".join([f"{key}: {'Sí' if value else 'No'}" for key, value in sorted(conditions.items())])
             logging.info(f"Condiciones evaluadas para {symbol}:\n{conditions_str}\nValores: RSI={rsi}, ADX={adx}, RelVol={relative_volume}, ShortVolTrend={short_volume_trend}, PriceTrend={price_trend}, Support={support_level}, MACD={macd}, Signal={macd_signal}, Crossover={has_crossover}")
 
             indicators = {
@@ -875,10 +876,10 @@ def demo_trading(high_volume_symbols=None):
                 'relative_volume is None or < 0.5': relative_volume is None or (relative_volume is not None and relative_volume < 0.5),
                 'no macd_crossover': not has_crossover
             }
-            gpt_conditions_str = "\n".join([f"{k}: {'Sí' if v else 'No'}" for k in gpt_conditions.keys()])
+            gpt_conditions_str = "\n".join([f"{key}: {'Sí' if value else 'No'}" for key, value in gpt_conditions.items()])
             total_gpt_conditions = len(gpt_conditions)
-            passed_gpt_conditions = sum(1 for v in gpt_conditions.values() if v)
-            failed_gpt_conditions = [k for k, v in gpt_conditions.items() if not v]
+            passed_gpt_conditions = sum(1 for value in gpt_conditions.values() if value)
+            failed_gpt_conditions = [key for key, value in gpt_conditions.items() if not value]
             failed_gpt_conditions_str = ", ".join(failed_gpt_conditions) if failed_gpt_conditions else "Ninguna"
             logging.info(f"Condiciones para llamar a gpt_decision_buy en {symbol}: Pasadas {passed_gpt_conditions} de {total_gpt_conditions}:\n{gpt_conditions_str}\nNo se cumplieron: {failed_gpt_conditions_str}")
 
@@ -892,8 +893,8 @@ def demo_trading(high_volume_symbols=None):
             logging.info(f"Decisión final para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
 
             total_conditions = len(conditions)
-            passed_conditions = sum(1 for v in conditions.values() if v)
-            failed_conditions = [k for k, v in conditions.items() if not v]
+            passed_conditions = sum(1 for value in conditions.values() if value)
+            failed_conditions = [key for key, value in conditions.items() if not value]
             failed_conditions_str = ", ".join(failed_conditions) if failed_conditions else "Ninguna"
             logging.info(f"Resumen para {symbol}: Pasadas {passed_conditions} condiciones de {total_conditions}, no se cumplieron: {failed_conditions_str}")
 
@@ -911,7 +912,7 @@ def demo_trading(high_volume_symbols=None):
                         send_telegram_message(f"✅ *Compra* `{symbol}`\nConfianza: `{confidence}%`\nExplicación: `{explanation}`")
                         dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], indicators)
 
-        # Liberar memoria después de cada batch
+        # Liberar memoria
         del data
         time.sleep(30)
 
