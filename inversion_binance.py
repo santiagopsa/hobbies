@@ -264,7 +264,7 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
 
     Returns:
         tuple(dict, pd.Series): 
-          - Un diccionario con DataFrames para cada timeframe.
+          - Un diccionario con DataFrames para cada timeframe ('1h', '4h', '1d').
           - La serie de precios de cierre preferida (prioridad '1h', luego '4h', luego '1d').
           Si no hay datos válidos, retorna (None, None).
     """
@@ -276,13 +276,12 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
         try:
             logging.debug(f"Iniciando fetch_ohlcv para {symbol} en {tf} con limit={limit}")
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-            logging.debug(f"Respuesta cruda para {symbol} en {tf}: {ohlcv[:2] if ohlcv else 'None'} (longitud: {len(ohlcv) if ohlcv else 0})")
-            if ohlcv is None or len(ohlcv) == 0:
+            if not ohlcv or len(ohlcv) == 0:
                 logging.warning(f"Datos vacíos para {symbol} en {tf}")
                 continue
 
             # Crear DataFrame
-            df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
             df.sort_index(inplace=True)
@@ -302,11 +301,12 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
                     logging.warning(f"Datos insuficientes tras rellenar gaps para {symbol} en {tf}")
                     continue
 
-            # Validar columnas esenciales
-            for col in ['high', 'low', 'close', 'volume']:
-                if not pd.api.types.is_numeric_dtype(df[col]) or df[col].isna().any():
-                    logging.warning(f"Datos inválidos en {col} para {symbol} en {tf} (tipo={df[col].dtype}, NaN={df[col].isna().sum()})")
-                    continue
+            # Convertir columnas a numérico y manejar valores inválidos
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')  # NaN si no es numérico
+                if df[col].isna().any():
+                    logging.warning(f"Valores NaN detectados en {col} para {symbol} en {tf}, rellenando")
+                    df[col] = df[col].ffill().bfill()  # Rellenar hacia adelante y atrás
 
             # Asegurar índices únicos y ordenados
             if not df.index.is_unique:
@@ -323,82 +323,102 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
                     continue
 
             logging.debug(f"Calculando indicadores para {symbol} en {tf}")
-            # Verificar que tenemos suficientes velas para cada indicador:
-            if len(df['close']) < atr_length:
+
+            # Calcular ATR
+            if len(df) >= atr_length:
+                atr_series = ta.atr(df['high'], df['low'], df['close'], length=atr_length)
+                if atr_series is None or atr_series.isna().all():
+                    logging.warning(f"ATR no calculado para {symbol} en {tf}, asignando NaN")
+                    df['ATR'] = np.nan
+                else:
+                    df['ATR'] = atr_series.ffill().bfill()
+                    logging.debug(f"ATR para {symbol} en {tf}: {df['ATR'].iloc[-1]}")
+            else:
                 logging.warning(f"Datos insuficientes para ATR (<{atr_length} velas) para {symbol} en {tf}")
-                continue
-            if len(df['close']) < rsi_length:
+                df['ATR'] = np.nan
+
+            # Calcular RSI
+            if len(df) >= rsi_length:
+                rsi_series = ta.rsi(df['close'], length=rsi_length)
+                if rsi_series is None or rsi_series.isna().all():
+                    logging.warning(f"RSI no calculado para {symbol} en {tf}, asignando NaN")
+                    df['RSI'] = np.nan
+                else:
+                    df['RSI'] = rsi_series.ffill().bfill()
+                    logging.debug(f"RSI para {symbol} en {tf}: {df['RSI'].iloc[-1]}")
+            else:
                 logging.warning(f"Datos insuficientes para RSI (<{rsi_length} velas) para {symbol} en {tf}")
-                continue
-            if len(df['close']) < bb_length:
+                df['RSI'] = np.nan
+
+            # Calcular Bollinger Bands
+            if len(df) >= bb_length:
+                bb = ta.bbands(df['close'], length=bb_length, std=2)
+                if bb is None or bb.empty:
+                    logging.warning(f"Bollinger Bands no calculadas para {symbol} en {tf}")
+                    df['BB_upper'] = df['BB_middle'] = df['BB_lower'] = np.nan
+                else:
+                    df['BB_upper'] = bb.get(f'BBU_{bb_length}_2.0', pd.Series(np.nan, index=df.index))
+                    df['BB_middle'] = bb.get(f'BBM_{bb_length}_2.0', pd.Series(np.nan, index=df.index))
+                    df['BB_lower'] = bb.get(f'BBL_{bb_length}_2.0', pd.Series(np.nan, index=df.index))
+                    if df['BB_upper'].isna().all() or df['BB_lower'].isna().all():
+                        logging.warning(f"Bollinger Bands sin valores válidos para {symbol} en {tf}")
+                        df['BB_upper'] = df['BB_middle'] = df['BB_lower'] = np.nan
+                    else:
+                        logging.debug(f"Bollinger Bands para {symbol} en {tf}: Upper={df['BB_upper'].iloc[-1]}, Middle={df['BB_middle'].iloc[-1]}, Lower={df['BB_lower'].iloc[-1]}")
+            else:
                 logging.warning(f"Datos insuficientes para Bollinger Bands (<{bb_length} velas) para {symbol} en {tf}")
-                continue
-            if len(df['close']) < roc_length:
-                logging.warning(f"Datos insuficientes para ROC (<{roc_length} velas) para {symbol} en {tf}")
-                continue
-
-            # Calcular RSI con length=14 para alinear con TradingView
-            df['RSI'] = ta.rsi(df['close'], length=rsi_length).ffill().bfill()
-            logging.debug(f"RSI para {symbol} en {tf}: {df['RSI'].iloc[-1]}")
-
-            # Calcular ATR con el parámetro atr_length y rellenar NaN (ffill y bfill)
-            atr_series = ta.atr(df['high'], df['low'], df['close'], length=atr_length)
-            if atr_series is None:
-                logging.error(f"ATR devolvió None para {symbol} en {tf}")
-                continue
-            atr_filled = atr_series.ffill().bfill()
-            if atr_filled.isna().all():
-                logging.error(f"ATR sigue con NaN para {symbol} en {tf}")
-                continue
-            df['ATR'] = atr_filled
-            logging.debug(f"ATR para {symbol} en {tf}: {df['ATR'].iloc[-1]}")
-
-            # Calcular Bollinger Bands con length=20 para alinear con TradingView
-            bb = ta.bbands(df['close'], length=bb_length, std=2)
-            if bb is None:
-                logging.warning(f"Bollinger Bands no se pudieron calcular para {symbol} en {tf}")
-                continue
-            df['BB_upper'] = bb.get(f'BBU_{bb_length}_2.0')
-            df['BB_middle'] = bb.get(f'BBM_{bb_length}_2.0')
-            df['BB_lower'] = bb.get(f'BBL_{bb_length}_2.0')
-            if df['BB_upper'].isna().all() or df['BB_lower'].isna().all():
-                logging.warning(f"Bollinger Bands sin valores válidos para {symbol} en {tf}")
-                continue
-            logging.debug(f"Bollinger Bands para {symbol} en {tf}: Upper={df['BB_upper'].iloc[-1]}, Middle={df['BB_middle'].iloc[-1]}, Lower={df['BB_lower'].iloc[-1]}")
+                df['BB_upper'] = df['BB_middle'] = df['BB_lower'] = np.nan
 
             # Calcular MACD
             macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
-            if macd is None:
-                logging.warning(f"MACD no se pudo calcular para {symbol} en {tf}")
-                continue
-            df['MACD'] = macd.get('MACD_12_26_9')
-            df['MACD_signal'] = macd.get('MACDs_12_26_9')
-            if df['MACD'].isna().all() or df['MACD_signal'].isna().all():
-                logging.warning(f"MACD sin valores válidos para {symbol} en {tf}")
-                continue
-            logging.debug(f"MACD para {symbol} en {tf}: MACD={df['MACD'].iloc[-1]}, Signal={df['MACD_signal'].iloc[-1]}")
+            if macd is None or macd.empty:
+                logging.warning(f"MACD no calculado para {symbol} en {tf}")
+                df['MACD'] = df['MACD_signal'] = np.nan
+            else:
+                df['MACD'] = macd.get('MACD_12_26_9', pd.Series(np.nan, index=df.index))
+                df['MACD_signal'] = macd.get('MACDs_12_26_9', pd.Series(np.nan, index=df.index))
+                if df['MACD'].isna().all() or df['MACD_signal'].isna().all():
+                    logging.warning(f"MACD sin valores válidos para {symbol} en {tf}")
+                    df['MACD'] = df['MACD_signal'] = np.nan
+                else:
+                    logging.debug(f"MACD para {symbol} en {tf}: MACD={df['MACD'].iloc[-1]}, Signal={df['MACD_signal'].iloc[-1]}")
 
             # Calcular ROC
-            df['ROC'] = ta.roc(df['close'], length=roc_length).ffill().bfill()
-            logging.debug(f"ROC para {symbol} en {tf}: {df['ROC'].iloc[-1]}")
+            if len(df) >= roc_length:
+                roc_series = ta.roc(df['close'], length=roc_length)
+                if roc_series is None or roc_series.isna().all():
+                    logging.warning(f"ROC no calculado para {symbol} en {tf}, asignando NaN")
+                    df['ROC'] = np.nan
+                else:
+                    df['ROC'] = roc_series.ffill().bfill()
+                    logging.debug(f"ROC para {symbol} en {tf}: {df['ROC'].iloc[-1]}")
+            else:
+                logging.warning(f"Datos insuficientes para ROC (<{roc_length} velas) para {symbol} en {tf}")
+                df['ROC'] = np.nan
 
             data[tf] = df
             logging.debug(f"{symbol} en {tf}: DataFrame final con {len(df)} velas obtenido.")
 
         except Exception as e:
             logging.error(f"Error procesando {symbol} en {tf}: {e}")
-            continue
+            continue  # Continúa con el siguiente timeframe
 
     if not data:
         last_ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=limit)
         logging.error(f"No se obtuvieron datos válidos para {symbol} en ningún timeframe. Última respuesta OHLCV: {last_ohlcv[:2] if last_ohlcv else 'None'}")
         return None, None
 
-    has_valid_data = any(len(df['close']) >= atr_length and not df['ATR'].isna().all() for df in data.values() if not df.empty)
+    # Verificar si hay suficientes datos para al menos un indicador útil
+    has_valid_data = any(
+        len(df) >= max(atr_length, rsi_length, bb_length, roc_length) and 
+        not df[['ATR', 'RSI', 'BB_upper', 'MACD', 'ROC']].isna().all().all() 
+        for df in data.values()
+    )
     if not has_valid_data:
         logging.warning(f"Datos insuficientes para indicadores en {symbol} a pesar de timeframes válidos")
         return None, None
 
+    # Seleccionar serie de precios preferida
     logging.debug(f"Seleccionando serie de precios para {symbol}: se prefiere '1h'")
     if '1h' in data and not data['1h'].empty:
         price_series = data['1h']['close']
@@ -410,8 +430,8 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
         logging.error(f"No se pudieron obtener series de precios para {symbol}")
         return None, None
 
-    if price_series.empty:
-        logging.warning(f"Serie de precios vacía para {symbol} después de procesar timeframes")
+    if price_series.empty or price_series.isna().all():
+        logging.warning(f"Serie de precios vacía o inválida para {symbol} después de procesar timeframes")
         return None, None
 
     logging.debug(f"Datos finales para {symbol}: Último volumen={data[list(data.keys())[0]]['volume'].iloc[-1]}, Último precio={price_series.iloc[-1]}")
@@ -680,7 +700,7 @@ def demo_trading(high_volume_symbols=None):
         logging.info("Límite diario de compras alcanzado.")
         return False
     if high_volume_symbols is None:
-        high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=100)  # Mantener 100 símbolos
+        high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=100)
 
     budget_per_trade = available_for_trading / (MAX_DAILY_BUYS - daily_buys)
     selected_cryptos = high_volume_symbols
@@ -688,8 +708,8 @@ def demo_trading(high_volume_symbols=None):
     balance = exchange.fetch_balance()['free']
     logging.info(f"Balance actual: {balance}")
 
-    # Batch processing to manage memory on e2-micro
-    for i in range(0, len(selected_cryptos), 10):  # Process 10 symbols at a time
+    # Batch processing
+    for i in range(0, len(selected_cryptos), 10):
         batch = selected_cryptos[i:i+10]
         for symbol in batch:
             logging.info(f"Procesando {symbol}...")
@@ -699,7 +719,7 @@ def demo_trading(high_volume_symbols=None):
                 continue
 
             daily_volume = fetch_volume(symbol)
-            if daily_volume is None or daily_volume < 250000:  # Ajustado para incluir más activos
+            if daily_volume is None or daily_volume < 250000:
                 logging.info(f"Se omite {symbol} por volumen insuficiente: {daily_volume}")
                 continue
 
@@ -707,9 +727,10 @@ def demo_trading(high_volume_symbols=None):
             if not order_book_data:
                 logging.warning(f"Se omite {symbol} por fallo en datos del libro de órdenes")
                 continue
-            if order_book_data['depth'] < 2000:  # Reducido para incluir más activos
+            if order_book_data['depth'] < 2000:
                 logging.info(f"Se omite {symbol} por profundidad insuficiente: {order_book_data['depth']}")
                 continue
+
             current_price = fetch_price(symbol)
             if current_price is None:
                 logging.warning(f"Se omite {symbol} por no obtener precio")
@@ -723,41 +744,84 @@ def demo_trading(high_volume_symbols=None):
                 logging.error(f"Error al convertir datos numéricos para {symbol}: {e}")
                 continue
 
-            if spread > 0.01 * current_price:  # Aumentado para incluir más activos
+            if spread > 0.01 * current_price:
                 logging.info(f"Se omite {symbol} por spread alto: {spread}")
                 continue
-            if imbalance < 1.0:  # Reducido para incluir más activos
+            if imbalance < 1.0:
                 logging.info(f"Se omite {symbol} por imbalance bajo: {imbalance}")
                 continue
 
+            # Obtener datos OHLCV y serie de precios
             data, price_series = fetch_and_prepare_data(symbol)
             if not data or price_series is None:
                 logging.warning(f"Se omite {symbol} por datos insuficientes")
                 continue
 
-            # Buffer para más datos históricos
-            buffer_size = 100
-            idx = data['1h'].index.get_loc(data['1h'].index[-1])
-            start_idx = max(0, idx - buffer_size)
-            df_slice = data['1h'].iloc[start_idx:]
+            # Usar timeframe 1h como principal, con fallback a 4h o 1d
+            df_slice = data.get('1h', data.get('4h', data.get('1d')))
+            if df_slice.empty:
+                logging.warning(f"No hay datos válidos en ningún timeframe para {symbol}")
+                continue
+            df_slice = df_slice.iloc[-100:]  # Últimas 100 velas para más historial
 
-            # Calcular indicadores antes de usarlos
-            rsi = df_slice['RSI'].iloc[-1] if not pd.isna(df_slice['RSI'].iloc[-1]) else None
-            adx = calculate_adx(df_slice)
-            atr = df_slice['ATR'].iloc[-1] if not pd.isna(df_slice['ATR'].iloc[-1]) else None
+            # Extraer indicadores de manera segura
+            rsi = df_slice['RSI'].iloc[-1] if 'RSI' in df_slice and not pd.isna(df_slice['RSI'].iloc[-1]) else None
+            adx = calculate_adx(df_slice) if not df_slice.empty else None
+            atr = df_slice['ATR'].iloc[-1] if 'ATR' in df_slice and not pd.isna(df_slice['ATR'].iloc[-1]) else None
             volume_series = df_slice['volume']
-            relative_volume = volume_series.iloc[-1] / volume_series[-10:].mean() if len(volume_series) >= 10 and volume_series[-10:].mean() != 0 else 1.0  # Ajuste para volumen reciente
-            divergence = detect_momentum_divergences(price_series, df_slice['RSI'])
-            bb_position = get_bb_position(current_price, df_slice['BB_upper'].iloc[-1], df_slice['BB_middle'].iloc[-1], df_slice['BB_lower'].iloc[-1])
-            macd = df_slice['MACD'].iloc[-1]
-            macd_signal = df_slice['MACD_signal'].iloc[-1]
-            roc = df_slice['ROC'].iloc[-1] if not pd.isna(df_slice['ROC'].iloc[-1]) else None
+            relative_volume = volume_series.iloc[-1] / volume_series[-10:].mean() if len(volume_series) >= 10 and volume_series[-10:].mean() != 0 else None
+            divergence = detect_momentum_divergences(price_series, df_slice['RSI']) if 'RSI' in df_slice else "none"
+            bb_position = get_bb_position(
+                current_price,
+                df_slice['BB_upper'].iloc[-1] if 'BB_upper' in df_slice and not pd.isna(df_slice['BB_upper'].iloc[-1]) else None,
+                df_slice['BB_middle'].iloc[-1] if 'BB_middle' in df_slice and not pd.isna(df_slice['BB_middle'].iloc[-1]) else None,
+                df_slice['BB_lower'].iloc[-1] if 'BB_lower' in df_slice and not pd.isna(df_slice['BB_lower'].iloc[-1]) else None
+            )
+            macd = df_slice['MACD'].iloc[-1] if 'MACD' in df_slice and not pd.isna(df_slice['MACD'].iloc[-1]) else None
+            macd_signal = df_slice['MACD_signal'].iloc[-1] if 'MACD_signal' in df_slice and not pd.isna(df_slice['MACD_signal'].iloc[-1]) else None
+            roc = df_slice['ROC'].iloc[-1] if 'ROC' in df_slice and not pd.isna(df_slice['ROC'].iloc[-1]) else None
 
-            macd_series = df_slice['MACD']
-            signal_series = df_slice['MACD_signal']
-            has_crossover, candles_since = has_recent_macd_crossover(macd_series, signal_series, lookback=5)
+            has_crossover, candles_since = has_recent_macd_crossover(
+                df_slice['MACD'] if 'MACD' in df_slice else pd.Series(),
+                df_slice['MACD_signal'] if 'MACD_signal' in df_slice else pd.Series(),
+                lookback=5
+            )
 
-            # Inicializar indicators con valores calculados
+            # Calcular tendencias con manejo de datos insuficientes
+            short_volume_trend = calculate_short_volume_trend(volume_series) if len(volume_series) >= 3 else "insufficient_data"
+            volume_trend = "insufficient_data"
+            price_trend = "insufficient_data"
+            if len(volume_series) >= 10:
+                last_10_volume = volume_series[-10:]
+                slope_volume, _, _, _, _ = linregress(range(10), last_10_volume)
+                volume_trend = "increasing" if slope_volume > 0.01 else "decreasing" if slope_volume < -0.01 else "stable"
+            if len(price_series) >= 10:
+                last_10_price = price_series[-10:]
+                slope_price, _, _, _, _ = linregress(range(10), last_10_price)
+                price_trend = "increasing" if slope_price > 0.01 else "decreasing" if slope_price < -0.01 else "stable"
+
+            short_price_trend = price_trend
+            short_volume_trend_1h = calculate_short_volume_trend(volume_series, window=1) if len(volume_series) >= 1 else "insufficient_data"
+
+            # Detectar nivel de soporte
+            support_level = detect_support_level(data, price_series, window=15, max_threshold_multiplier=3.0)
+            if support_level is None:
+                logging.warning(f"No se detectó nivel de soporte para {symbol}")
+                support_level = None  # Continuamos, no usamos continue
+
+            # Umbral dinámico basado en ATR
+            support_threshold = 1 + (atr * 3.0 / current_price) if atr and current_price > 0 else 1.10
+            support_threshold = min(support_threshold, 1.15)
+
+            # Validación de soporte (opcional, no interrumpimos el flujo)
+            if support_level and current_price > support_level * support_threshold:
+                logging.info(f"Precio de {symbol} ({current_price}) está por encima del umbral de soporte ({support_level * support_threshold:.3f})")
+
+            # Validación de volumen corto (opcional)
+            if short_volume_trend == "decreasing":
+                logging.info(f"Tendencia de volumen decreciente a corto plazo para {symbol}")
+
+            # Diccionario de indicadores
             indicators = {
                 "rsi": rsi,
                 "adx": adx,
@@ -772,85 +836,26 @@ def demo_trading(high_volume_symbols=None):
                 "spread": spread,
                 "imbalance": imbalance,
                 "depth": depth,
-                "volume_trend": "insufficient data",
-                "price_trend": "insufficient data",
-                "short_volume_trend": "insufficient data",
-                "support_level": None,
-                "short_price_trend": "insufficient data",
-                "short_volume_trend_1h": "insufficient data",
-                "roc": roc
-            }
-
-            # Detectar soporte potencial usando indicadores
-            support_level = detect_support_level(data, price_series, window=15, max_threshold_multiplier=3.0)  # Aumentar umbral para más flexibilidad
-            if support_level is None:
-                logging.warning(f"No se detectó nivel de soporte para {symbol}, omitiendo.")
-                continue
-
-            # Umbral dinámico basado en ATR, con un máximo de 15%
-            support_threshold = 1 + (indicators['atr'] * 3.0 / current_price) if indicators['atr'] and current_price > 0 else 1.10
-            support_threshold = min(support_threshold, 1.15)  # Máximo 15%
-
-            if current_price > support_level * support_threshold:
-                logging.info(f"Se omite {symbol} por no estar cerca de soporte: Precio={current_price}, Soporte={support_level}, Umbral={support_threshold:.3f}")
-                continue
-
-            # Calcular tendencias cortas y largas
-            short_volume_trend = calculate_short_volume_trend(volume_series)
-            if short_volume_trend == "decreasing":
-                logging.info(f"Se omite {symbol} por tendencia de volumen decreciente a corto plazo")
-                continue
-
-            if len(volume_series) >= 10:
-                last_10_volume = volume_series[-10:]
-                slope_volume, _, _, _, _ = linregress(range(10), last_10_volume)
-                if slope_volume > 0.01:
-                    volume_trend = "increasing"
-                elif slope_volume < -0.01:
-                    volume_trend = "decreasing"
-                else:
-                    volume_trend = "stable"
-            else:
-                volume_trend = "insufficient data"
-
-            if len(price_series) >= 10:
-                last_10_price = price_series[-10:]
-                slope_price, _, _, _, _ = linregress(range(10), last_10_price)
-                if slope_price > 0.01:
-                    price_trend = "increasing"
-                elif slope_price < -0.01:
-                    price_trend = "decreasing"
-                else:
-                    price_trend = "stable"
-            else:
-                price_trend = "insufficient data"
-
-            short_price_trend = price_trend
-            short_volume_trend_1h = calculate_short_volume_trend(volume_series, window=1)
-            if short_price_trend != "increasing" and short_volume_trend_1h != "increasing":
-                logging.info(f"Se omite {symbol} por falta de momentum a corto plazo: Precio={short_price_trend}, Volumen={short_volume_trend_1h}")
-                continue
-
-            # Actualizar indicators con tendencias calculadas
-            indicators.update({
                 "volume_trend": volume_trend,
                 "price_trend": price_trend,
                 "short_volume_trend": short_volume_trend,
                 "support_level": support_level,
                 "short_price_trend": short_price_trend,
-                "short_volume_trend_1h": short_volume_trend_1h
-            })
+                "short_volume_trend_1h": short_volume_trend_1h,
+                "roc": roc,
+                "current_price": current_price  # Añadido para GPT si lo usas
+            }
 
             logging.debug(f"Indicadores finales para {symbol}: {indicators}")
 
-            # Decisión basada en reglas o GPT
+            # Decisión de compra
             action, confidence, explanation = calculate_adaptive_strategy(indicators)
             if action == "mantener" and (rsi is None or 30 < rsi < 70) and (relative_volume is None or relative_volume < 0.5) and not has_crossover:
                 prepared_text = gpt_prepare_data(data, indicators)
                 action, confidence, explanation = gpt_decision_buy(prepared_text)
 
             if action == "comprar" and confidence >= 70:
-                amount = min(budget_per_trade / current_price, 0.005 * usdt_balance / current_price)  # Límite al 0.5% del capital
+                amount = min(budget_per_trade / current_price, 0.005 * usdt_balance / current_price)
                 if amount * current_price >= MIN_NOTIONAL:
                     order = execute_order_buy(symbol, amount, indicators, confidence)
                     if order:
@@ -860,10 +865,10 @@ def demo_trading(high_volume_symbols=None):
 
         # Liberar memoria después de cada batch
         del data
-        time.sleep(30)  # 30 segundos entre lotes para reducir API load y memory pressure
+        time.sleep(30)
 
     logging.info("Trading ejecutado correctamente en segundo plano para todos los activos USDT")
-    return True  # Indicate successful execution
+    return True
 
 def analyze_trade_outcome(trade_id):
     try:

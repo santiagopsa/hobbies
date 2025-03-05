@@ -39,6 +39,7 @@ exchange = ccxt.binance({
     'apiKey': os.getenv('BINANCE_API_KEY_REAL'),
     'secret': os.getenv('BINANCE_SECRET_KEY_REAL'),
     'enableRateLimit': True,
+    'timeout': 20000,  # en milisegundos
     'options': {
         'adjustForTimeDifference': True
     }
