@@ -691,7 +691,7 @@ def demo_trading(high_volume_symbols=None):
         logging.warning("Saldo insuficiente en USDT.")
         return False
 
-    reserve = 150
+    reserve = 150  # Reserva para comisiones y posibles pérdidas
     available_for_trading = usdt_balance - reserve
     logging.info(f"Disponible para trading: {available_for_trading}, se deja una reserva de {reserve}")
     daily_buys = get_daily_buys()
@@ -718,9 +718,10 @@ def demo_trading(high_volume_symbols=None):
                 logging.info(f"Se omite {symbol} porque ya tienes una posición abierta.")
                 continue
 
-            # Condiciones iniciales
+            # Diccionario para rastrear condiciones
             conditions = {}
 
+            # Condiciones iniciales
             daily_volume = fetch_volume(symbol)
             conditions['daily_volume >= 250000'] = daily_volume is not None and daily_volume >= 250000
             if not conditions['daily_volume >= 250000']:
@@ -728,10 +729,10 @@ def demo_trading(high_volume_symbols=None):
                 continue
 
             order_book_data = fetch_order_book_data(symbol)
-            if not order_book_data:
+            conditions['order_book_available'] = order_book_data is not None
+            if not conditions['order_book_available']:
                 logging.warning(f"Se omite {symbol} por fallo en datos del libro de órdenes")
                 continue
-            conditions['order_book_available'] = True
 
             conditions['depth >= 2000'] = order_book_data['depth'] >= 2000
             if not conditions['depth >= 2000']:
@@ -824,15 +825,14 @@ def demo_trading(high_volume_symbols=None):
             conditions['rsi <= RSI_THRESHOLD'] = rsi is not None and rsi <= RSI_THRESHOLD
             conditions['macd_crossover'] = has_crossover and macd is not None and macd_signal is not None and macd > macd_signal and macd_signal > 0
             conditions['roc > 0'] = roc is not None and roc > 0
-            conditions['rsi > 70'] = rsi is not None and rsi > 70
             conditions['rsi < 30 and bb_below_lower'] = rsi is not None and rsi < 30 and bb_position == "below_lower"
             conditions['rsi > 70 and bb_above_upper'] = rsi is not None and rsi > 70 and bb_position == "above_upper"
 
-            # Registrar todas las condiciones
+            # Registro de condiciones
             conditions_str = "\n".join([f"{k}: {'Sí' if v else 'No'}" for k, v in conditions.items()])
             logging.info(f"Condiciones evaluadas para {symbol}:\n{conditions_str}\nValores: RSI={rsi}, ADX={adx}, RelVol={relative_volume}, ShortVolTrend={short_volume_trend}, PriceTrend={price_trend}, Support={support_level}, MACD={macd}, Signal={macd_signal}, Crossover={has_crossover}")
 
-            # Indicadores para la decisión
+            # Indicadores
             indicators = {
                 "rsi": rsi,
                 "adx": adx,
@@ -857,7 +857,6 @@ def demo_trading(high_volume_symbols=None):
                 "current_price": current_price
             }
 
-            # Validaciones adicionales (registradas pero no interrumpen)
             if not conditions['support_near']:
                 logging.info(f"Precio de {symbol} ({current_price}) está por encima del umbral de soporte ({support_level * support_threshold:.3f})")
             if not conditions['short_volume_trend_increasing']:
@@ -865,12 +864,23 @@ def demo_trading(high_volume_symbols=None):
 
             # Decisión
             action, confidence, explanation = calculate_adaptive_strategy(indicators)
+            logging.info(f"Decisión inicial para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
+
             if action == "mantener" and (rsi is None or 30 < rsi < 70) and (relative_volume is None or relative_volume < 0.5) and not has_crossover:
                 prepared_text = gpt_prepare_data(data, indicators)
                 action, confidence, explanation = gpt_decision_buy(prepared_text)
+                logging.info(f"Resultado de gpt_decision_buy para {symbol}: Acción={action}, Confianza={confidence}%, Explicación={explanation}")
 
-            logging.info(f"Decisión para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
+            logging.info(f"Decisión final para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
 
+            # Resumen de condiciones cumplidas/no cumplidas
+            total_conditions = len(conditions)
+            passed_conditions = sum(1 for v in conditions.values() if v)
+            failed_conditions = [k for k, v in conditions.items() if not v]
+            failed_conditions_str = ", ".join(failed_conditions) if failed_conditions else "Ninguna"
+            logging.info(f"Resumen para {symbol}: Pasadas {passed_conditions} condiciones de {total_conditions}, no se cumplieron: {failed_conditions_str}")
+
+            # Ejecutar compra si aplica
             if action == "comprar" and confidence >= 70:
                 amount = min(budget_per_trade / current_price, 0.005 * usdt_balance / current_price)
                 if amount * current_price >= MIN_NOTIONAL:
