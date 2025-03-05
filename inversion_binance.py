@@ -650,13 +650,12 @@ def calculate_adaptive_strategy(indicators):
     macd = indicators.get('macd', None)
     macd_signal = indicators.get('macd_signal', None)
     roc = indicators.get('roc', None)
-    bb_position = indicators.get('bb_position', 'unknown')
     price_trend = indicators.get('price_trend', 'insufficient_data')
     short_volume_trend = indicators.get('short_volume_trend', 'insufficient_data')
 
     is_trending = adx > 25 if adx is not None else False
 
-    # Nueva regla basada en tendencia corta de volumen
+    # Regla basada en tendencia corta de volumen
     if short_volume_trend == "increasing" and price_trend != "decreasing" and relative_volume > VOLUME_GROWTH_THRESHOLD:
         return "comprar", 80, "Volumen creciente a corto plazo con tendencia de precio no bajista"
 
@@ -667,9 +666,13 @@ def calculate_adaptive_strategy(indicators):
             return "comprar", 75, "Compra en sobrecompra con volumen creciente y tendencia alcista"
         return "mantener", 50, "Sin señales claras de tendencia alcista"
     else:
-        if (rsi is not None and rsi < 30 and bb_position == "below_lower") or (rsi is not None and rsi > 70 and bb_position == "above_upper"):
-            return "comprar" if bb_position == "below_lower" else "mantener", 80 if bb_position == "below_lower" else 50, "Reversión media confirmada por RSI y Bollinger Bands" if bb_position == "below_lower" else "Sin oportunidad de reversión"
+        # Aquí se elimina la combinación de RSI y Bollinger Bands
+        if rsi is not None and rsi < 30:
+            return "comprar", 80, "Reversión confirmada por RSI en sobreventa"
+        elif rsi is not None and rsi > 70:
+            return "mantener", 50, "Evitar compra en sobrecompra extrema"
         return "mantener", 50, "Mercado en rango sin señales claras"
+
 
 def fetch_ohlcv_with_retry(symbol, timeframe, limit=50, max_retries=3):
     for attempt in range(max_retries):
@@ -1074,7 +1077,6 @@ def gpt_prepare_data(data, indicators):
     - Tendencia de precio: {indicators.get('price_trend', 'No disponible')}
     - Tendencia de volumen corto: {indicators.get('short_volume_trend', 'No disponible')}
     - Nivel de soporte: {indicators.get('support_level', 'No disponible')}
-    - Posición BB: {indicators.get('bb_position', 'No disponible')}
     - ROC: {indicators.get('roc', 'No disponible')}
     """
     return prompt
