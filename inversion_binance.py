@@ -708,41 +708,46 @@ def demo_trading(high_volume_symbols=None):
     balance = exchange.fetch_balance()['free']
     logging.info(f"Balance actual: {balance}")
 
+    # Diccionario para rastrear condiciones fallidas por símbolo
+    failed_conditions_count = {}
+    symbols_processed = 0
+
     # Batch processing
     for i in range(0, len(selected_cryptos), 10):
         batch = selected_cryptos[i:i+10]
         for symbol in batch:
             logging.info(f"Procesando {symbol}...")
             base_asset = symbol.split('/')[0]
-            if base_asset in balance and balance[base_asset] > 0:
+            if base_asset in balance and base_asset in balance and balance[base_asset] > 0:
                 logging.info(f"Se omite {symbol} porque ya tienes una posición abierta.")
                 continue
 
-            # Diccionario para rastrear condiciones
             conditions = {}
-
-            # Condiciones iniciales
             daily_volume = fetch_volume(symbol)
             conditions['daily_volume >= 250000'] = daily_volume is not None and daily_volume >= 250000
             if not conditions['daily_volume >= 250000']:
                 logging.info(f"Se omite {symbol} por volumen insuficiente: {daily_volume}")
+                failed_conditions_count['daily_volume >= 250000'] = failed_conditions_count.get('daily_volume >= 250000', 0) + 1
                 continue
 
             order_book_data = fetch_order_book_data(symbol)
             conditions['order_book_available'] = order_book_data is not None
             if not conditions['order_book_available']:
                 logging.warning(f"Se omite {symbol} por fallo en datos del libro de órdenes")
+                failed_conditions_count['order_book_available'] = failed_conditions_count.get('order_book_available', 0) + 1
                 continue
 
             conditions['depth >= 2000'] = order_book_data['depth'] >= 2000
             if not conditions['depth >= 2000']:
                 logging.info(f"Se omite {symbol} por profundidad insuficiente: {order_book_data['depth']}")
+                failed_conditions_count['depth >= 2000'] = failed_conditions_count.get('depth >= 2000', 0) + 1
                 continue
 
             current_price = fetch_price(symbol)
             conditions['price_available'] = current_price is not None
             if not conditions['price_available']:
                 logging.warning(f"Se omite {symbol} por no obtener precio")
+                failed_conditions_count['price_available'] = failed_conditions_count.get('price_available', 0) + 1
                 continue
 
             try:
@@ -757,28 +762,30 @@ def demo_trading(high_volume_symbols=None):
             conditions['spread <= 0.01 * price'] = spread <= 0.01 * current_price
             if not conditions['spread <= 0.01 * price']:
                 logging.info(f"Se omite {symbol} por spread alto: {spread}")
+                failed_conditions_count['spread <= 0.01 * price'] = failed_conditions_count.get('spread <= 0.01 * price', 0) + 1
                 continue
 
             conditions['imbalance >= 1.0'] = imbalance >= 1.0
             if not conditions['imbalance >= 1.0']:
                 logging.info(f"Se omite {symbol} por imbalance bajo: {imbalance}")
+                failed_conditions_count['imbalance >= 1.0'] = failed_conditions_count.get('imbalance >= 1.0', 0) + 1
                 continue
 
-            # Obtener datos OHLCV
             data, price_series = fetch_and_prepare_data(symbol)
             conditions['data_available'] = data is not None and price_series is not None
             if not conditions['data_available']:
                 logging.warning(f"Se omite {symbol} por datos insuficientes")
+                failed_conditions_count['data_available'] = failed_conditions_count.get('data_available', 0) + 1
                 continue
 
             df_slice = data.get('1h', data.get('4h', data.get('1d')))
             conditions['timeframe_available'] = not df_slice.empty
             if not conditions['timeframe_available']:
                 logging.warning(f"No hay datos válidos en ningún timeframe para {symbol}")
+                failed_conditions_count['timeframe_available'] = failed_conditions_count.get('timeframe_available', 0) + 1
                 continue
             df_slice = df_slice.iloc[-100:]
 
-            # Indicadores
             rsi = df_slice['RSI'].iloc[-1] if 'RSI' in df_slice and not pd.isna(df_slice['RSI'].iloc[-1]) else None
             adx = calculate_adx(df_slice) if not df_slice.empty else None
             atr = df_slice['ATR'].iloc[-1] if 'ATR' in df_slice and not pd.isna(df_slice['ATR'].iloc[-1]) else None
@@ -816,7 +823,6 @@ def demo_trading(high_volume_symbols=None):
             support_threshold = 1 + (atr * 3.0 / current_price) if atr and current_price > 0 else 1.10
             support_threshold = min(support_threshold, 1.15)
 
-            # Condiciones específicas
             conditions['support_near'] = support_level is not None and current_price <= support_level * support_threshold
             conditions['short_volume_trend_increasing'] = short_volume_trend == "increasing"
             conditions['price_trend_not_decreasing'] = price_trend != "decreasing"
@@ -828,11 +834,9 @@ def demo_trading(high_volume_symbols=None):
             conditions['rsi < 30 and bb_below_lower'] = rsi is not None and rsi < 30 and bb_position == "below_lower"
             conditions['rsi > 70 and bb_above_upper'] = rsi is not None and rsi > 70 and bb_position == "above_upper"
 
-            # Registro de condiciones
-            conditions_str = "\n".join([f"{k}: {'Sí' if v else 'No'}" for k, v in conditions.items()])
+            conditions_str = "\n".join([f"{k}: {'Sí' if v else 'No'}" for k in sorted(conditions.keys())])
             logging.info(f"Condiciones evaluadas para {symbol}:\n{conditions_str}\nValores: RSI={rsi}, ADX={adx}, RelVol={relative_volume}, ShortVolTrend={short_volume_trend}, PriceTrend={price_trend}, Support={support_level}, MACD={macd}, Signal={macd_signal}, Crossover={has_crossover}")
 
-            # Indicadores
             indicators = {
                 "rsi": rsi,
                 "adx": adx,
@@ -862,25 +866,42 @@ def demo_trading(high_volume_symbols=None):
             if not conditions['short_volume_trend_increasing']:
                 logging.info(f"Tendencia de volumen decreciente a corto plazo para {symbol}")
 
-            # Decisión
             action, confidence, explanation = calculate_adaptive_strategy(indicators)
             logging.info(f"Decisión inicial para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
 
-            if action == "mantener" and (rsi is None or 30 < rsi < 70) and (relative_volume is None or relative_volume < 0.5) and not has_crossover:
+            gpt_conditions = {
+                'action == "mantener"': action == "mantener",
+                'rsi is None or 30 < rsi < 70': rsi is None or (rsi is not None and 30 < rsi < 70),
+                'relative_volume is None or < 0.5': relative_volume is None or (relative_volume is not None and relative_volume < 0.5),
+                'no macd_crossover': not has_crossover
+            }
+            gpt_conditions_str = "\n".join([f"{k}: {'Sí' if v else 'No'}" for k in gpt_conditions.keys()])
+            total_gpt_conditions = len(gpt_conditions)
+            passed_gpt_conditions = sum(1 for v in gpt_conditions.values() if v)
+            failed_gpt_conditions = [k for k, v in gpt_conditions.items() if not v]
+            failed_gpt_conditions_str = ", ".join(failed_gpt_conditions) if failed_gpt_conditions else "Ninguna"
+            logging.info(f"Condiciones para llamar a gpt_decision_buy en {symbol}: Pasadas {passed_gpt_conditions} de {total_gpt_conditions}:\n{gpt_conditions_str}\nNo se cumplieron: {failed_gpt_conditions_str}")
+
+            if passed_gpt_conditions == total_gpt_conditions:
                 prepared_text = gpt_prepare_data(data, indicators)
                 action, confidence, explanation = gpt_decision_buy(prepared_text)
                 logging.info(f"Resultado de gpt_decision_buy para {symbol}: Acción={action}, Confianza={confidence}%, Explicación={explanation}")
+            else:
+                logging.info(f"No se llamó a gpt_decision_buy para {symbol} debido a condiciones excluyentes no cumplidas")
 
             logging.info(f"Decisión final para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
 
-            # Resumen de condiciones cumplidas/no cumplidas
             total_conditions = len(conditions)
             passed_conditions = sum(1 for v in conditions.values() if v)
             failed_conditions = [k for k, v in conditions.items() if not v]
             failed_conditions_str = ", ".join(failed_conditions) if failed_conditions else "Ninguna"
             logging.info(f"Resumen para {symbol}: Pasadas {passed_conditions} condiciones de {total_conditions}, no se cumplieron: {failed_conditions_str}")
 
-            # Ejecutar compra si aplica
+            # Actualizar conteo de condiciones fallidas
+            for condition in failed_conditions:
+                failed_conditions_count[condition] = failed_conditions_count.get(condition, 0) + 1
+            symbols_processed += 1
+
             if action == "comprar" and confidence >= 70:
                 amount = min(budget_per_trade / current_price, 0.005 * usdt_balance / current_price)
                 if amount * current_price >= MIN_NOTIONAL:
@@ -890,9 +911,26 @@ def demo_trading(high_volume_symbols=None):
                         send_telegram_message(f"✅ *Compra* `{symbol}`\nConfianza: `{confidence}%`\nExplicación: `{explanation}`")
                         dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], indicators)
 
-        # Liberar memoria
+        # Liberar memoria después de cada batch
         del data
         time.sleep(30)
+
+    # Resumen final de condiciones fallidas más comunes
+    if symbols_processed > 0 and failed_conditions_count:
+        most_common_condition = max(failed_conditions_count, key=failed_conditions_count.get)
+        most_common_count = failed_conditions_count[most_common_condition]
+        summary_message = (f"Resumen final: Después de procesar {symbols_processed} símbolos, "
+                           f"la condición más común que impidió operaciones fue '{most_common_condition}' "
+                           f"con {most_common_count} ocurrencias ({(most_common_count / symbols_processed) * 100:.1f}%).")
+        logging.info(summary_message)
+
+        # Escribir en un archivo
+        with open("trade_blockers_summary.txt", "a") as f:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"{timestamp} - {summary_message}\n")
+            f.write(f"Detalles de condiciones fallidas: {dict(failed_conditions_count)}\n\n")
+    else:
+        logging.info("No se procesaron símbolos o no hubo condiciones fallidas para analizar.")
 
     logging.info("Trading ejecutado correctamente en segundo plano para todos los activos USDT")
     return True
