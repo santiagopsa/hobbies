@@ -761,6 +761,7 @@ def fetch_ohlcv_with_retry(symbol, timeframe, limit=50, max_retries=3):
 buy_lock = threading.Lock()
 
 def demo_trading(high_volume_symbols=None):
+    reset_daily_buys()
     logging.info("Iniciando trading en segundo plano para todos los activos USDT relevantes...")
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
     logging.info(f"Saldo USDT disponible: {usdt_balance}")
@@ -1192,6 +1193,6 @@ def gpt_decision_buy(prepared_text):
         time.sleep(1)
 
 if __name__ == "__main__":
-    reset_daily_buys()
+    
     high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=100)
     demo_trading(high_volume_symbols)
