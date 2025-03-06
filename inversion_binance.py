@@ -686,7 +686,6 @@ def fetch_ohlcv_with_retry(symbol, timeframe, limit=50, max_retries=3):
 buy_lock = threading.Lock()
 
 def demo_trading(high_volume_symbols=None):
-    #reset_daily_buys()
     logging.info("Iniciando trading en segundo plano para todos los activos USDT relevantes...")
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
     logging.info(f"Saldo USDT disponible: {usdt_balance}")
@@ -719,217 +718,231 @@ def demo_trading(high_volume_symbols=None):
     for i in range(0, len(selected_cryptos), 10):
         batch = selected_cryptos[i:i+10]
         for symbol in batch:
-            daily_buys = get_daily_buys()
-            logging.info(f"Compras diarias realizadas antes de procesar {symbol}: {daily_buys}")
-            if daily_buys >= MAX_DAILY_BUYS:
-                logging.info("Límite diario de compras alcanzado.")
-                return False
-
-            logging.info(f"Procesando {symbol}...")
-            base_asset = symbol.split('/')[0]
-            if base_asset in balance and balance[base_asset] > 0:
-                logging.info(f"Se omite {symbol} porque ya tienes una posición abierta.")
-                continue
-
-            conditions = {}
-            daily_volume = fetch_volume(symbol)
-            conditions['daily_volume >= 250000'] = daily_volume is not None and daily_volume >= 250000
-            if not conditions['daily_volume >= 250000']:
-                logging.info(f"Se omite {symbol} por volumen insuficiente: {daily_volume}")
-                failed_conditions_count['daily_volume >= 250000'] = failed_conditions_count.get('daily_volume >= 250000', 0) + 1
-                continue
-
-            order_book_data = fetch_order_book_data(symbol)
-            conditions['order_book_available'] = order_book_data is not None
-            if not conditions['order_book_available']:
-                logging.warning(f"Se omite {symbol} por fallo en datos del libro de órdenes")
-                failed_conditions_count['order_book_available'] = failed_conditions_count.get('order_book_available', 0) + 1
-                continue
-
-            conditions['depth >= 5000'] = order_book_data['depth'] >= 5000
-            if not conditions['depth >= 5000']:
-                logging.info(f"Se omite {symbol} por profundidad insuficiente: {order_book_data['depth']}")
-                failed_conditions_count['depth >= 5000'] = failed_conditions_count.get('depth >= 5000', 0) + 1
-                continue
-
-            current_price = fetch_price(symbol)
-            conditions['price_available'] = current_price is not None
-            if not conditions['price_available']:
-                logging.warning(f"Se omite {symbol} por no obtener precio")
-                failed_conditions_count['price_available'] = failed_conditions_count.get('price_available', 0) + 1
-                continue
-
             try:
-                current_price = float(current_price)
-                spread = float(order_book_data['spread']) if order_book_data['spread'] is not None else float('inf')
-                imbalance = float(order_book_data['imbalance']) if order_book_data['imbalance'] is not None else 0
-                depth = float(order_book_data['depth'])
-            except (ValueError, TypeError) as e:
-                logging.error(f"Error al convertir datos numéricos para {symbol}: {e}")
-                continue
+                daily_buys = get_daily_buys()
+                logging.info(f"Compras diarias realizadas antes de procesar {symbol}: {daily_buys}")
+                if daily_buys >= MAX_DAILY_BUYS:
+                    logging.info("Límite diario de compras alcanzado.")
+                    return False
 
-            conditions['spread <= 0.005 * price'] = spread <= 0.005 * current_price
-            if not conditions['spread <= 0.005 * price']:
-                logging.info(f"Se omite {symbol} por spread alto: {spread}")
-                failed_conditions_count['spread <= 0.005 * price'] = failed_conditions_count.get('spread <= 0.005 * price', 0) + 1
-                continue
+                logging.info(f"Procesando {symbol}...")
+                base_asset = symbol.split('/')[0]
+                if base_asset in balance and balance[base_asset] > 0:
+                    logging.info(f"Se omite {symbol} porque ya tienes una posición abierta.")
+                    continue
 
-            conditions['imbalance >= 1.0'] = imbalance >= 1.0
-            if not conditions['imbalance >= 1.0']:
-                logging.info(f"Se omite {symbol} por imbalance bajo: {imbalance}")
-                failed_conditions_count['imbalance >= 1.0'] = failed_conditions_count.get('imbalance >= 1.0', 0) + 1
-                continue
+                conditions = {}
+                daily_volume = fetch_volume(symbol)
+                conditions['daily_volume >= 250000'] = daily_volume is not None and daily_volume >= 250000
+                if not conditions['daily_volume >= 250000']:
+                    logging.info(f"Se omite {symbol} por volumen insuficiente: {daily_volume}")
+                    failed_conditions_count['daily_volume >= 250000'] = failed_conditions_count.get('daily_volume >= 250000', 0) + 1
+                    continue
 
-            data, price_series = fetch_and_prepare_data(symbol)
-            conditions['data_available'] = data is not None and price_series is not None
-            if not conditions['data_available']:
-                logging.warning(f"Se omite {symbol} por datos insuficientes")
-                failed_conditions_count['data_available'] = failed_conditions_count.get('data_available', 0) + 1
-                continue
+                order_book_data = fetch_order_book_data(symbol)
+                conditions['order_book_available'] = order_book_data is not None
+                if not conditions['order_book_available']:
+                    logging.warning(f"Se omite {symbol} por fallo en datos del libro de órdenes")
+                    failed_conditions_count['order_book_available'] = failed_conditions_count.get('order_book_available', 0) + 1
+                    continue
 
-            df_slice = data.get('1h', data.get('4h', data.get('1d')))
-            conditions['timeframe_available'] = not df_slice.empty
-            if not conditions['timeframe_available']:
-                logging.warning(f"No hay datos válidos en ningún timeframe para {symbol}")
-                failed_conditions_count['timeframe_available'] = failed_conditions_count.get('timeframe_available', 0) + 1
-                continue
-            df_slice = df_slice.iloc[-100:]
+                conditions['depth >= 5000'] = order_book_data['depth'] >= 5000
+                if not conditions['depth >= 5000']:
+                    logging.info(f"Se omite {symbol} por profundidad insuficiente: {order_book_data['depth']}")
+                    failed_conditions_count['depth >= 5000'] = failed_conditions_count.get('depth >= 5000', 0) + 1
+                    continue
 
-            adx = calculate_adx(df_slice) if not df_slice.empty else None
-            atr = df_slice['ATR'].iloc[-1] if 'ATR' in df_slice and not pd.isna(df_slice['ATR'].iloc[-1]) else None
-            rsi = df_slice['RSI'].iloc[-1] if 'RSI' in df_slice and not pd.isna(df_slice['RSI'].iloc[-1]) else None
-            volume_series = df_slice['volume']
-            relative_volume = volume_series.iloc[-1] / volume_series[-10:].mean() if len(volume_series) >= 10 and volume_series[-10:].mean() != 0 else None
-            macd = df_slice['MACD'].iloc[-1] if 'MACD' in df_slice and not pd.isna(df_slice['MACD'].iloc[-1]) else None
-            macd_signal = df_slice['MACD_signal'].iloc[-1] if 'MACD_signal' in df_slice and not pd.isna(df_slice['MACD_signal'].iloc[-1]) else None
-            roc = df_slice['ROC'].iloc[-1] if 'ROC' in df_slice and not pd.isna(df_slice['ROC'].iloc[-1]) else None
-            has_crossover, candles_since = has_recent_macd_crossover(
-                df_slice['MACD'] if 'MACD' in df_slice else pd.Series(),
-                df_slice['MACD_signal'] if 'MACD_signal' in df_slice else pd.Series(),
-                lookback=5
-            )
-            short_volume_trend = calculate_short_volume_trend(volume_series) if len(volume_series) >= 3 else "insufficient_data"
-            volume_trend = "insufficient_data"
-            price_trend = "insufficient_data"
-            if len(volume_series) >= 10:
-                last_10_volume = volume_series[-10:]
-                slope_volume, _, _, _, _ = linregress(range(10), last_10_volume)
-                volume_trend = "increasing" if slope_volume > 0.01 else "decreasing" if slope_volume < -0.01 else "stable"
-            if len(price_series) >= 10:
-                last_10_price = price_series[-10:]
-                slope_price, _, _, _ = linregress(range(10), last_10_price)
-                price_trend = "increasing" if slope_price > 0.01 else "decreasing" if slope_price < -0.01 else "stable"
-            support_level = detect_support_level(data, price_series, window=15, max_threshold_multiplier=3.0)
+                current_price = fetch_price(symbol)
+                conditions['price_available'] = current_price is not None
+                if not conditions['price_available']:
+                    logging.warning(f"Se omite {symbol} por no obtener precio")
+                    failed_conditions_count['price_available'] = failed_conditions_count.get('price_available', 0) + 1
+                    continue
 
-            # Calculate support_distance locally
-            support_distance = None
-            if support_level is not None and current_price > 0:
-                support_distance = (current_price - support_level) / support_level
+                try:
+                    current_price = float(current_price)
+                    spread = float(order_book_data['spread']) if order_book_data['spread'] is not None else float('inf')
+                    imbalance = float(order_book_data['imbalance']) if order_book_data['imbalance'] is not None else 0
+                    depth = float(order_book_data['depth'])
+                except (ValueError, TypeError) as e:
+                    logging.error(f"Error al convertir datos numéricos para {symbol}: {e}")
+                    continue
 
-            indicators = {
-                "adx": adx,
-                "atr": atr,
-                "rsi": rsi,
-                "relative_volume": relative_volume,
-                "macd": macd,
-                "macd_signal": macd_signal,
-                "has_macd_crossover": has_crossover,
-                "candles_since_crossover": candles_since,
-                "spread": spread,
-                "imbalance": imbalance,
-                "depth": depth,
-                "volume_trend": volume_trend,
-                "price_trend": price_trend,
-                "short_volume_trend": short_volume_trend,
-                "support_level": support_level,
-                "roc": roc,
-                "current_price": current_price
-            }
+                conditions['spread <= 0.005 * price'] = spread <= 0.005 * current_price
+                if not conditions['spread <= 0.005 * price']:
+                    logging.info(f"Se omite {symbol} por spread alto: {spread}")
+                    failed_conditions_count['spread <= 0.005 * price'] = failed_conditions_count.get('spread <= 0.005 * price', 0) + 1
+                    continue
 
-            conditions_str = "\n".join([f"{key}: {'Sí' if value is True else 'No' if value is False else 'Desconocido'}" for key, value in sorted(conditions.items())])
-            logging.info(f"Condiciones evaluadas para {symbol}:\n{conditions_str}")
+                conditions['imbalance >= 1.0'] = imbalance >= 1.0
+                if not conditions['imbalance >= 1.0']:
+                    logging.info(f"Se omite {symbol} por imbalance bajo: {imbalance}")
+                    failed_conditions_count['imbalance >= 1.0'] = failed_conditions_count.get('imbalance >= 1.0', 0) + 1
+                    continue
 
-            # Verificación de tipos en conditions
-            for key, value in conditions.items():
-                logging.debug(f"Condición {key} para {symbol}: valor={value}, tipo={type(value)}")
+                data, price_series = fetch_and_prepare_data(symbol)
+                conditions['data_available'] = data is not None and price_series is not None
+                if not conditions['data_available']:
+                    logging.warning(f"Se omite {symbol} por datos insuficientes")
+                    failed_conditions_count['data_available'] = failed_conditions_count.get('data_available', 0) + 1
+                    continue
 
-            # Modificado: Pasar el diccionario 'data' a calculate_adaptive_strategy
-            action, confidence, explanation = calculate_adaptive_strategy(indicators, data=data)
-            logging.info(f"Decisión inicial para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
+                df_slice = data.get('1h', data.get('4h', data.get('1d')))
+                conditions['timeframe_available'] = not df_slice.empty
+                if not conditions['timeframe_available']:
+                    logging.warning(f"No hay datos válidos en ningún timeframe para {symbol}")
+                    failed_conditions_count['timeframe_available'] = failed_conditions_count.get('timeframe_available', 0) + 1
+                    continue
+                df_slice = df_slice.iloc[-100:]
 
-            gpt_conditions = {
-                'action is "mantener"': action == "mantener",
-                'Relative volume is None or low (< 1.8)': relative_volume is None or (relative_volume is not None and relative_volume < 1.8),
-                'No recent MACD crossover': not has_crossover,
-                'Far from support (> 0.03)': support_distance is None or support_distance > 0.03
-            }
+                adx = calculate_adx(df_slice) if not df_slice.empty else None
+                atr = df_slice['ATR'].iloc[-1] if 'ATR' in df_slice and not pd.isna(df_slice['ATR'].iloc[-1]) else None
+                rsi = df_slice['RSI'].iloc[-1] if 'RSI' in df_slice and not pd.isna(df_slice['RSI'].iloc[-1]) else None
+                volume_series = df_slice['volume']
+                relative_volume = volume_series.iloc[-1] / volume_series[-10:].mean() if len(volume_series) >= 10 and volume_series[-10:].mean() != 0 else None
+                macd = df_slice['MACD'].iloc[-1] if 'MACD' in df_slice and not pd.isna(df_slice['MACD'].iloc[-1]) else None
+                macd_signal = df_slice['MACD_signal'].iloc[-1] if 'MACD_signal' in df_slice and not pd.isna(df_slice['MACD_signal'].iloc[-1]) else None
+                roc = df_slice['ROC'].iloc[-1] if 'ROC' in df_slice and not pd.isna(df_slice['ROC'].iloc[-1]) else None
+                has_crossover, candles_since = has_recent_macd_crossover(
+                    df_slice['MACD'] if 'MACD' in df_slice else pd.Series(),
+                    df_slice['MACD_signal'] if 'MACD_signal' in df_slice else pd.Series(),
+                    lookback=5
+                )
+                short_volume_trend = calculate_short_volume_trend(volume_series) if len(volume_series) >= 3 else "insufficient_data"
+                volume_trend = "insufficient_data"
+                price_trend = "insufficient_data"
+                if len(volume_series) >= 10:
+                    last_10_volume = volume_series[-10:]
+                    try:
+                        slope_volume, _, _, _, _ = linregress(range(10), last_10_volume)
+                        volume_trend = "increasing" if slope_volume > 0.01 else "decreasing" if slope_volume < -0.01 else "stable"
+                    except Exception as e:
+                        logging.error(f"Error al calcular volume_trend para {symbol}: {e}", exc_info=True)
+                        volume_trend = "insufficient_data"
+                if len(price_series) >= 10:
+                    last_10_price = price_series[-10:]
+                    try:
+                        slope_price, _, _, _, _ = linregress(range(10), last_10_price)
+                        price_trend = "increasing" if slope_price > 0.01 else "decreasing" if slope_price < -0.01 else "stable"
+                    except Exception as e:
+                        logging.error(f"Error al calcular price_trend para {symbol}: {e}", exc_info=True)
+                        price_trend = "insufficient_data"
+                support_level = detect_support_level(data, price_series, window=15, max_threshold_multiplier=3.0)
 
-            gpt_conditions_str = "\n".join([f"{key}: {'Sí' if value else 'No'}" for key, value in gpt_conditions.items()])
-            total_gpt_conditions = len(gpt_conditions)
-            passed_gpt_conditions = sum(1 for value in gpt_conditions.values() if value)
-            failed_gpt_conditions = [key for key, value in gpt_conditions.items() if not value]
-            failed_gpt_conditions_str = ", ".join(failed_gpt_conditions) if failed_gpt_conditions else "Ninguna"
-            logging.info(f"Condiciones para llamar a gpt_decision_buy en {symbol}: Pasadas {passed_gpt_conditions} de {total_gpt_conditions}:\n{gpt_conditions_str}\nNo se cumplieron: {failed_gpt_conditions_str}")
+                # Calculate support_distance locally
+                support_distance = None
+                if support_level is not None and current_price > 0:
+                    support_distance = (current_price - support_level) / support_level
 
-            if passed_gpt_conditions == total_gpt_conditions:
-                prepared_text = gpt_prepare_data(data, indicators)
-                action, confidence, explanation = gpt_decision_buy(prepared_text)
-                logging.info(f"Resultado de gpt_decision_buy para {symbol}: Acción={action}, Confianza={confidence}%, Explicación={explanation}")
+                indicators = {
+                    "adx": adx,
+                    "atr": atr,
+                    "rsi": rsi,
+                    "relative_volume": relative_volume,
+                    "macd": macd,
+                    "macd_signal": macd_signal,
+                    "has_macd_crossover": has_crossover,
+                    "candles_since_crossover": candles_since,
+                    "spread": spread,
+                    "imbalance": imbalance,
+                    "depth": depth,
+                    "volume_trend": volume_trend,
+                    "price_trend": price_trend,
+                    "short_volume_trend": short_volume_trend,
+                    "support_level": support_level,
+                    "roc": roc,
+                    "current_price": current_price
+                }
 
-            logging.info(f"Decisión final para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
+                conditions_str = "\n".join([f"{key}: {'Sí' if value is True else 'No' if value is False else 'Desconocido'}" for key, value in sorted(conditions.items())])
+                logging.info(f"Condiciones evaluadas para {symbol}:\n{conditions_str}")
 
-            # Verificación de variables antes de proceder
-            logging.debug(f"Verificación post-decisión para {symbol}: action={action}, confidence={confidence}, explanation={explanation}, conditions={conditions}")
+                # Verificación de tipos en conditions
+                for key, value in conditions.items():
+                    logging.debug(f"Condición {key} para {symbol}: valor={value}, tipo={type(value)}")
 
-            if action == "comprar" and confidence >= 70:
-                with buy_lock:
-                    daily_buys = get_daily_buys()
-                    if daily_buys >= MAX_DAILY_BUYS:
-                        logging.info(f"Límite diario de compras alcanzado, no se ejecuta compra para {symbol}.")
-                        return False
+                # Modificado: Pasar el diccionario 'data' a calculate_adaptive_strategy
+                action, confidence, explanation = calculate_adaptive_strategy(indicators, data=data)
+                logging.info(f"Decisión inicial para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
 
-                    # Dynamic sizing based on confidence and volatility
-                    confidence_factor = confidence / 100
-                    if current_price is None or current_price <= 0:
-                        logging.error(f"Precio actual inválido para {symbol} ({current_price}), omitiendo operación")
-                        continue
+                gpt_conditions = {
+                    'action is "mantener"': action == "mantener",
+                    'Relative volume is None or low (< 1.8)': relative_volume is None or (relative_volume is not None and relative_volume < 1.8),
+                    'No recent MACD crossover': not has_crossover,
+                    'Far from support (> 0.03)': support_distance is None or support_distance > 0.03
+                }
 
-                    atr_value = atr if atr is not None else 0.02 * current_price
-                    if atr_value <= 0 or current_price <= 0:
-                        volatility_factor = 1.0
-                        logging.warning(f"ATR o precio inválido para {symbol}, usando volatility_factor por defecto: {volatility_factor}")
-                    else:
-                        volatility_factor = min(2.0, (atr_value / current_price * 100))
-                    size_multiplier = confidence_factor * volatility_factor
-                    adjusted_budget = budget_per_trade * size_multiplier
-                    min_amount_for_notional = MIN_NOTIONAL / current_price
-                    target_amount = max(adjusted_budget / current_price, min_amount_for_notional)
-                    amount = min(target_amount, 0.10 * usdt_balance / current_price)
-                    trade_value = amount * current_price
+                gpt_conditions_str = "\n".join([f"{key}: {'Sí' if value else 'No'}" for key, value in gpt_conditions.items()])
+                total_gpt_conditions = len(gpt_conditions)
+                passed_gpt_conditions = sum(1 for value in gpt_conditions.values() if value)
+                failed_gpt_conditions = [key for key, value in gpt_conditions.items() if not value]
+                failed_gpt_conditions_str = ", ".join(failed_gpt_conditions) if failed_gpt_conditions else "Ninguna"
+                logging.info(f"Condiciones para llamar a gpt_decision_buy en {symbol}: Pasadas {passed_gpt_conditions} de {total_gpt_conditions}:\n{gpt_conditions_str}\nNo se cumplieron: {failed_gpt_conditions_str}")
 
-                    logging.info(f"Intentando compra para {symbol}: amount={amount}, trade_value={trade_value}, confidence={confidence}%, volatility_factor={volatility_factor:.2f}x")
-                    if trade_value >= MIN_NOTIONAL or (trade_value < MIN_NOTIONAL and trade_value >= usdt_balance):
-                        order = execute_order_buy(symbol, amount, indicators, confidence)
-                        if order:
-                            logging.info(f"Compra ejecutada para {symbol}: {explanation}")
-                            send_telegram_message(f"✅ *Compra* `{symbol}`\nConfianza: `{confidence}%`\nCantidad: `{amount}`\nExplicación: `{explanation}`")
-                            dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], indicators)
+                if passed_gpt_conditions == total_gpt_conditions:
+                    prepared_text = gpt_prepare_data(data, indicators)
+                    action, confidence, explanation = gpt_decision_buy(prepared_text)
+                    logging.info(f"Resultado de gpt_decision_buy para {symbol}: Acción={action}, Confianza={confidence}%, Explicación={explanation}")
+
+                logging.info(f"Decisión final para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
+
+                # Verificación de variables antes de proceder
+                logging.debug(f"Verificación post-decisión para {symbol}: action={action}, confidence={confidence}, explanation={explanation}, conditions={conditions}")
+
+                if action == "comprar" and confidence >= 70:
+                    with buy_lock:
+                        daily_buys = get_daily_buys()
+                        if daily_buys >= MAX_DAILY_BUYS:
+                            logging.info(f"Límite diario de compras alcanzado, no se ejecuta compra para {symbol}.")
+                            return False
+
+                        # Dynamic sizing based on confidence and volatility
+                        confidence_factor = confidence / 100
+                        if current_price is None or current_price <= 0:
+                            logging.error(f"Precio actual inválido para {symbol} ({current_price}), omitiendo operación")
+                            continue
+
+                        atr_value = atr if atr is not None else 0.02 * current_price
+                        if atr_value <= 0 or current_price <= 0:
+                            volatility_factor = 1.0
+                            logging.warning(f"ATR o precio inválido para {symbol}, usando volatility_factor por defecto: {volatility_factor}")
                         else:
-                            logging.error(f"Error al ejecutar compra para {symbol}: orden no completada")
-                    else:
-                        logging.info(f"Compra no ejecutada para {symbol}: valor de la operación ({trade_value}) < MIN_NOTIONAL ({MIN_NOTIONAL}) y saldo insuficiente")
+                            volatility_factor = min(2.0, (atr_value / current_price * 100))
+                        size_multiplier = confidence_factor * volatility_factor
+                        adjusted_budget = budget_per_trade * size_multiplier
+                        min_amount_for_notional = MIN_NOTIONAL / current_price
+                        target_amount = max(adjusted_budget / current_price, min_amount_for_notional)
+                        amount = min(target_amount, 0.10 * usdt_balance / current_price)
+                        trade_value = amount * current_price
 
-            # Verificación antes de actualizar contadores
-            logging.debug(f"Verificación antes de contadores para {symbol}: failed_conditions_count={failed_conditions_count}, symbols_processed={symbols_processed}")
+                        logging.info(f"Intentando compra para {symbol}: amount={amount}, trade_value={trade_value}, confidence={confidence}%, volatility_factor={volatility_factor:.2f}x")
+                        if trade_value >= MIN_NOTIONAL or (trade_value < MIN_NOTIONAL and trade_value >= usdt_balance):
+                            order = execute_order_buy(symbol, amount, indicators, confidence)
+                            if order:
+                                logging.info(f"Compra ejecutada para {symbol}: {explanation}")
+                                send_telegram_message(f"✅ *Compra* `{symbol}`\nConfianza: `{confidence}%`\nCantidad: `{amount}`\nExplicación: `{explanation}`")
+                                dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], indicators)
+                            else:
+                                logging.error(f"Error al ejecutar compra para {symbol}: orden no completada")
+                        else:
+                            logging.info(f"Compra no ejecutada para {symbol}: valor de la operación ({trade_value}) < MIN_NOTIONAL ({MIN_NOTIONAL}) y saldo insuficiente")
 
-            failed_conditions = [key for key, value in conditions.items() if not value]
-            for condition in failed_conditions:
-                failed_conditions_count[condition] = failed_conditions_count.get(condition, 0) + 1
-            symbols_processed += 1
+                # Verificación antes de actualizar contadores
+                logging.debug(f"Verificación antes de contadores para {symbol}: failed_conditions_count={failed_conditions_count}, symbols_processed={symbols_processed}")
 
-            logging.debug(f"Contadores actualizados para {symbol}: failed_conditions_count={failed_conditions_count}, symbols_processed={symbols_processed}")
+                failed_conditions = [key for key, value in conditions.items() if not value]
+                for condition in failed_conditions:
+                    failed_conditions_count[condition] = failed_conditions_count.get(condition, 0) + 1
+                symbols_processed += 1
 
-        del data
+                logging.debug(f"Contadores actualizados para {symbol}: failed_conditions_count={failed_conditions_count}, symbols_processed={symbols_processed}")
+
+            except Exception as e:
+                logging.error(f"Error en demo_trading para {symbol}: {e}", exc_info=True)
+                continue
+
+        if 'data' in locals():
+            del data
         time.sleep(30)
 
     if symbols_processed > 0 and failed_conditions_count:
