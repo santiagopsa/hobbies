@@ -703,41 +703,37 @@ def calculate_adaptive_strategy(indicators):
     spread = indicators.get('spread', float('inf'))
     current_price = indicators.get('current_price', 0)
     support_level = indicators.get('support_level', None)
-    adx = indicators.get('adx', None)  # Optional
-    has_macd_crossover = indicators.get('has_macd_crossover', False)  # Optional
+    adx = indicators.get('adx', None)
+    has_macd_crossover = indicators.get('has_macd_crossover', False)
 
     support_distance = None
     if support_level is not None and current_price > 0:
         support_distance = (current_price - support_level) / support_level
     support_near_threshold = 0.05
 
+    # Avoid ranging markets
+    if adx is not None and adx < 25:
+        return "mantener", 50, "Weak trend (ADX < 25), avoiding ranging market"
+
     # Core Signals
     core_signals = [
         short_volume_trend == "increasing",
         price_trend == "increasing",
-        relative_volume > 1.5 if relative_volume else False,
-        roc > 0.5 if roc else False,
+        relative_volume > 2.5 if relative_volume else False,  # Tighter volume
+        roc > 1.0 if roc else False,  # Tighter momentum
         depth >= 5000,
         spread <= 0.005 * current_price,
         support_distance is not None and support_distance <= support_near_threshold
     ]
     signals_met = sum(core_signals)
 
-    # Early Momentum (RSI 65-75)
-    if (rsi and 65 <= rsi <= 75 and
-        relative_volume > 2.0 and roc > 1.0 and signals_met >= 5):
-        return "comprar", 80, "Early momentum: RSI 65-75, strong volume (>2.0), and momentum (ROC > 1.0) near support"
-
-    # Peak Momentum (RSI > 80)
-    if (rsi and rsi > 80 and signals_met >= 5):
-        return "comprar", 85, "Peak momentum: RSI > 80 with strong core signals near support"
-
-    # Boost with Optional Signals (ADX or MACD)
-    if signals_met >= 4 and (adx > 35 or has_macd_crossover):
-        return "comprar", 80, "Core signals strong with trend (ADX > 35) or MACD crossover near support"
+    # Peak Momentum (RSI > 75, tightened)
+    if (rsi and rsi > 75 and signals_met >= 6):  # Require 6/7 signals
+        if adx > 35 and has_macd_crossover:  # Mandatory ADX and MACD
+            return "comprar", 90, "Strong peak momentum: RSI > 75, ADX > 35, MACD crossover, and 6/7 signals near support"
+        return "mantener", 50, "Insufficient trend confirmation"
 
     return "mantener", 50, "Insufficient momentum or support proximity"
-
 
 def fetch_ohlcv_with_retry(symbol, timeframe, limit=50, max_retries=3):
     for attempt in range(max_retries):
@@ -811,7 +807,7 @@ def demo_trading(high_volume_symbols=None):
                 failed_conditions_count['order_book_available'] = failed_conditions_count.get('order_book_available', 0) + 1
                 continue
 
-            conditions['depth >= 5000'] = order_book_data['depth'] >= 5000
+            conditions['depth >= 5000'] = order_book_data['depth'] >= (50 if symbol in ['BTC/USDT', 'ETH/USDT'] else 5000)
             if not conditions['depth >= 5000']:
                 logging.info(f"Se omite {symbol} por profundidad insuficiente: {order_book_data['depth']}")
                 failed_conditions_count['depth >= 5000'] = failed_conditions_count.get('depth >= 5000', 0) + 1
@@ -952,7 +948,7 @@ def demo_trading(high_volume_symbols=None):
 
                 # Dynamic sizing based on confidence and volatility
                 confidence_factor = confidence / 100
-                volatility_factor = min(2.0, (atr or 0.02 * current_price) / current_price * 100)
+                volatility_factor = min(1.5, (atr or 0.01 * current_price) / current_price * 100)  # Lower default to 1%
                 size_multiplier = confidence_factor * volatility_factor
                 adjusted_budget = budget_per_trade * size_multiplier
                 min_amount_for_notional = MIN_NOTIONAL / current_price
