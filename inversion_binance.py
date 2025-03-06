@@ -761,7 +761,7 @@ def fetch_ohlcv_with_retry(symbol, timeframe, limit=50, max_retries=3):
 buy_lock = threading.Lock()
 
 def demo_trading(high_volume_symbols=None):
-    reset_daily_buys()
+    #reset_daily_buys()
     logging.info("Iniciando trading en segundo plano para todos los activos USDT relevantes...")
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
     logging.info(f"Saldo USDT disponible: {usdt_balance}")
