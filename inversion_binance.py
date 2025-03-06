@@ -1146,25 +1146,37 @@ def gpt_prepare_data(data, indicators):
     """
     return prompt
 
+import asyncio
+
 def gpt_decision_buy(prepared_text):
     prompt = f"""
     Eres un experto en trading de criptomonedas de alto riesgo. Basándote en los datos para cualquier activo USDT en Binance:
     {prepared_text}
-    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza activos con alta volatilidad, volumen creciente (>1.5), y momentum fuerte (ROC > 0.5), solo si están muy cerca de un nivel de soporte (distancia relativa al soporte <= 0.05). Acepta riesgos moderados si el volumen y momentum a corto plazo son fuertes, especialmente cuando short_volume_trend es 'increasing' y price_trend es 'increasing'. Responde SOLO con un JSON válido sin '''json''' asi:
-    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen creciente a corto plazo (>1.5), momentum fuerte (ROC > 0.5), y cerca de soporte indican oportunidad de ganancia rápida"}}
+    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza activos con alta volatilidad, volumen creciente (>2.5), y momentum fuerte (ROC > 1.0), solo si están muy cerca de un nivel de soporte (distancia relativa al soporte <= 0.03) y short_volume_trend es 'increasing'. Acepta riesgos moderados solo si short_volume_trend es 'increasing', price_trend es 'increasing', y volumen relativo supera 2.5 significativamente. Responde SOLO con un JSON válido sin '''json''' asi:
+    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen creciente (>2.5), momentum fuerte (ROC > 1.0), short_volume_trend 'increasing', cerca de soporte (<=0.03), indican oportunidad de ganancia rápida"}}
     Criterios:
-    - Compra si volumen relativo > 1.5, short_volume_trend es 'increasing', precio tendencia es 'increasing', ROC > 0.5, distancia relativa al soporte <= 0.05, profundidad > 5000, y spread < 0.5% del precio.
-    - Mantener si las señales son débiles o negativas (e.g., short_volume_trend 'decreasing', price_trend 'decreasing', volumen relativo < 1.5, lejos del soporte).
+    - Compra si volumen relativo > 2.5, short_volume_trend es 'increasing', price_trend es 'increasing', ROC > 1.0, distancia relativa al soporte <= 0.03, profundidad > 5000, y spread < 0.5% del precio.
+    - Mantener si short_volume_trend no es 'increasing', volumen relativo < 2.5, price_trend es 'decreasing', ROC <= 1.0, o lejos del soporte (>0.03).
     - Evalúa profundidad (>5000) y spread (<0.5% del precio) para garantizar liquidez.
     - Ignora tendencias largas si short_volume_trend y volumen relativo indican momentum fuerte.
+    - Asigna confianza >80 solo si todas las condiciones principales (volumen, momentum, soporte, short_volume_trend) se cumplen.
     """
     max_retries = 2
+    timeout = 5  # Add a 5-second timeout
+
     for attempt in range(max_retries + 1):
         try:
-            response = client.chat.completions.create(
-                model=GPT_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0
+            # Use asyncio for timeout
+            loop = asyncio.get_event_loop()
+            response = loop.run_until_complete(
+                asyncio.wait_for(
+                    client.chat.completions.create(
+                        model=GPT_MODEL,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0
+                    ),
+                    timeout=timeout
+                )
             )
             raw_response = response.choices[0].message.content.strip()
             decision = json.loads(raw_response)
@@ -1175,20 +1187,30 @@ def gpt_decision_buy(prepared_text):
 
             if accion not in ["comprar", "mantener"]:
                 accion = "mantener"
-            if not isinstance(confianza, (int, float)) or not 0 <= confianza <= 100:
+            if not isinstance(confianza, (int, float)) or not 80 <= confianza <= 100:  # Raise minimum to 80
                 confianza = 50
-                explicacion = "Confianza inválida, ajustada a 50"
+                explicacion = "Confianza inválida o insuficiente, ajustada a 50"
+
+            # Validate key conditions from prepared_text if possible
+            if "short_volume_trend" in prepared_text and "increasing" not in prepared_text:
+                return "mantener", 50, "Short volume trend not increasing, overriding GPT"
+            if "relative_volume" in prepared_text and float(prepared_text.split("Volumen relativo: ")[1].split("\n")[0]) <= 2.5:
+                return "mantener", 50, "Relative volume too low, overriding GPT"
 
             return accion, confianza, explicacion
         except json.JSONDecodeError as e:
             logging.error(f"Intento {attempt + 1} fallido: Respuesta de GPT no es JSON válido - {raw_response}")
             if attempt == max_retries:
                 return "mantener", 50, f"Error en formato JSON tras {max_retries + 1} intentos"
+        except asyncio.TimeoutError:
+            logging.error(f"Intento {attempt + 1} fallido: Timeout de {timeout} segundos en GPT")
+            if attempt == max_retries:
+                return "mantener", 50, f"Timeout tras {max_retries + 1} intentos"
         except Exception as e:
             logging.error(f"Error en GPT (intento {attempt + 1}): {e}")
             if attempt == max_retries:
                 return "mantener", 50, "Error al procesar respuesta de GPT"
-        time.sleep(1)
+        time.sleep(1)  # Exponential backoff could be better, e.g., 2**attempt
 
 if __name__ == "__main__":
     
