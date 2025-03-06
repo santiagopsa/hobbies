@@ -875,7 +875,7 @@ def demo_trading(high_volume_symbols=None):
             logging.info(f"Decisión final para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
 
             if action == "comprar" and confidence >= 70:
-                with buy_lock:  # Synchronize buy execution
+                with buy_lock:
                     daily_buys = get_daily_buys()
                     if daily_buys >= MAX_DAILY_BUYS:
                         logging.info(f"Límite diario de compras alcanzado, no se ejecuta compra para {symbol}.")
@@ -883,12 +883,17 @@ def demo_trading(high_volume_symbols=None):
 
                     # Dynamic sizing based on confidence and volatility
                     confidence_factor = confidence / 100
-                    # Asegurarse de que current_price no sea None y usar un valor por defecto si atr es None
-                    if current_price is None or current_price == 0:
-                        logging.error(f"Precio actual no disponible para {symbol}, omitiendo operación")
+                    if current_price is None or current_price <= 0:
+                        logging.error(f"Precio actual inválido para {symbol} ({current_price}), omitiendo operación")
                         continue
-                    default_atr = 0.02 * current_price if current_price else 0.01  # Valor por defecto si current_price es 0 o None
-                    volatility_factor = min(2.0, ((atr if atr is not None else default_atr) / current_price * 100) if current_price else 1.0)
+
+                    # Calcular volatility_factor con manejo explícito
+                    atr_value = atr if atr is not None else 0.02 * current_price
+                    if atr_value <= 0 or current_price <= 0:
+                        volatility_factor = 1.0
+                        logging.warning(f"ATR o precio inválido para {symbol}, usando volatility_factor por defecto: {volatility_factor}")
+                    else:
+                        volatility_factor = min(2.0, (atr_value / current_price * 100))
                     size_multiplier = confidence_factor * volatility_factor
                     adjusted_budget = budget_per_trade * size_multiplier
                     min_amount_for_notional = MIN_NOTIONAL / current_price
@@ -897,7 +902,6 @@ def demo_trading(high_volume_symbols=None):
                     trade_value = amount * current_price
 
                     logging.info(f"Intentando compra para {symbol}: amount={amount}, trade_value={trade_value}, confidence={confidence}%, volatility_factor={volatility_factor:.2f}x")
-
                     if trade_value >= MIN_NOTIONAL or (trade_value < MIN_NOTIONAL and trade_value >= usdt_balance):
                         order = execute_order_buy(symbol, amount, indicators, confidence)
                         if order:
@@ -909,7 +913,6 @@ def demo_trading(high_volume_symbols=None):
                     else:
                         logging.info(f"Compra no ejecutada para {symbol}: valor de la operación ({trade_value}) < MIN_NOTIONAL ({MIN_NOTIONAL}) y saldo insuficiente")
 
-            # Define failed_conditions here
             failed_conditions = [key for key, value in conditions.items() if not value]
             for condition in failed_conditions:
                 failed_conditions_count[condition] = failed_conditions_count.get(condition, 0) + 1
