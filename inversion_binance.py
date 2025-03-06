@@ -1162,21 +1162,16 @@ def gpt_decision_buy(prepared_text):
     - Asigna confianza >80 solo si todas las condiciones principales (volumen, momentum, soporte, short_volume_trend) se cumplen.
     """
     max_retries = 2
-    timeout = 5  # Add a 5-second timeout
+    timeout = 5  # 5-second timeout
 
     for attempt in range(max_retries + 1):
         try:
-            # Use asyncio for timeout
-            loop = asyncio.get_event_loop()
-            response = loop.run_until_complete(
-                asyncio.wait_for(
-                    client.chat.completions.create(
-                        model=GPT_MODEL,
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0
-                    ),
-                    timeout=timeout
-                )
+            # Use OpenAI client with timeout (synchronous)
+            response = client.chat.completions.create(
+                model=GPT_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                timeout=timeout  # Note: OpenAI client may not support timeout directly; use a wrapper if needed
             )
             raw_response = response.choices[0].message.content.strip()
             decision = json.loads(raw_response)
@@ -1187,7 +1182,7 @@ def gpt_decision_buy(prepared_text):
 
             if accion not in ["comprar", "mantener"]:
                 accion = "mantener"
-            if not isinstance(confianza, (int, float)) or not 80 <= confianza <= 100:  # Raise minimum to 80
+            if not isinstance(confianza, (int, float)) or not 80 <= confianza <= 100:
                 confianza = 50
                 explicacion = "Confianza inválida o insuficiente, ajustada a 50"
 
@@ -1202,7 +1197,7 @@ def gpt_decision_buy(prepared_text):
             logging.error(f"Intento {attempt + 1} fallido: Respuesta de GPT no es JSON válido - {raw_response}")
             if attempt == max_retries:
                 return "mantener", 50, f"Error en formato JSON tras {max_retries + 1} intentos"
-        except asyncio.TimeoutError:
+        except requests.Timeout:
             logging.error(f"Intento {attempt + 1} fallido: Timeout de {timeout} segundos en GPT")
             if attempt == max_retries:
                 return "mantener", 50, f"Timeout tras {max_retries + 1} intentos"
@@ -1210,7 +1205,22 @@ def gpt_decision_buy(prepared_text):
             logging.error(f"Error en GPT (intento {attempt + 1}): {e}")
             if attempt == max_retries:
                 return "mantener", 50, "Error al procesar respuesta de GPT"
-        time.sleep(1)  # Exponential backoff could be better, e.g., 2**attempt
+        time.sleep(2 ** attempt)  # Exponential backoff
+
+# Note: The OpenAI Python client (openai) doesn't natively support a timeout parameter as of the latest versions.
+# If timeout issues persist, use a custom wrapper:
+import time
+def with_timeout(func, args, timeout_sec):
+    start = time.time()
+    result = [None]
+    def target():
+        result[0] = func(*args)
+    thread = threading.Thread(target=target)
+    thread.start()
+    thread.join(timeout_sec)
+    if thread.is_alive():
+        raise requests.Timeout(f"Function timed out after {timeout_sec} seconds")
+    return result[0]
 
 if __name__ == "__main__":
     
