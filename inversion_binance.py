@@ -488,9 +488,15 @@ def has_recent_macd_crossover(macd_series, signal_series, lookback=5):
 def get_daily_buys():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    today = datetime.now().strftime('%Y-%m-%d')
-    cursor.execute("SELECT COUNT(*) FROM transactions_new WHERE action='buy' AND timestamp LIKE ?", (f"{today}%",))
+    colombia_tz = pytz.timezone("America/Bogota")  # Asegura la zona horaria de Colombia
+    today = datetime.now(colombia_tz).strftime('%Y-%m-%d')
+    query = "SELECT COUNT(*) FROM transactions_new WHERE action='buy' AND timestamp LIKE ?"
+    cursor.execute(query, (f"{today}%",))
     count = cursor.fetchone()[0]
+    # Log adicional para depuración
+    cursor.execute("SELECT timestamp FROM transactions_new WHERE action='buy' AND timestamp LIKE ?", (f"{today}%",))
+    timestamps = cursor.fetchall()
+    logging.info(f"Compras contadas para hoy ({today}): {count}. Timestamps: {timestamps}")
     conn.close()
     return count
 
@@ -715,11 +721,14 @@ def demo_trading(high_volume_symbols=None):
     reserve = 150  # Reserva para comisiones y posibles pérdidas
     available_for_trading = max(usdt_balance - reserve, 0)  # Aseguramos que no sea negativo
     logging.info(f"Disponible para trading: {available_for_trading}, se deja una reserva de {reserve}")
+
+    # Verificar el límite de compras diarias al inicio
     daily_buys = get_daily_buys()
     logging.info(f"Compras diarias realizadas: {daily_buys}")
     if daily_buys >= MAX_DAILY_BUYS:
         logging.info("Límite diario de compras alcanzado.")
         return False
+
     if high_volume_symbols is None:
         high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=100)
 
@@ -735,6 +744,13 @@ def demo_trading(high_volume_symbols=None):
     for i in range(0, len(selected_cryptos), 10):
         batch = selected_cryptos[i:i+10]
         for symbol in batch:
+            # Verificar el límite de compras antes de procesar cada símbolo
+            daily_buys = get_daily_buys()
+            logging.info(f"Compras diarias realizadas antes de procesar {symbol}: {daily_buys}")
+            if daily_buys >= MAX_DAILY_BUYS:
+                logging.info("Límite diario de compras alcanzado.")
+                return False
+
             logging.info(f"Procesando {symbol}...")
             base_asset = symbol.split('/')[0]
             if base_asset in balance and balance[base_asset] > 0:
@@ -756,10 +772,10 @@ def demo_trading(high_volume_symbols=None):
                 failed_conditions_count['order_book_available'] = failed_conditions_count.get('order_book_available', 0) + 1
                 continue
 
-            conditions['depth >= 2000'] = order_book_data['depth'] >= 2000
-            if not conditions['depth >= 2000']:
+            conditions['depth >= 5000'] = order_book_data['depth'] >= 5000  # Ajustado a 5000 para mayor liquidez
+            if not conditions['depth >= 5000']:
                 logging.info(f"Se omite {symbol} por profundidad insuficiente: {order_book_data['depth']}")
-                failed_conditions_count['depth >= 2000'] = failed_conditions_count.get('depth >= 2000', 0) + 1
+                failed_conditions_count['depth >= 5000'] = failed_conditions_count.get('depth >= 5000', 0) + 1
                 continue
 
             current_price = fetch_price(symbol)
@@ -778,10 +794,10 @@ def demo_trading(high_volume_symbols=None):
                 logging.error(f"Error al convertir datos numéricos para {symbol}: {e}")
                 continue
 
-            conditions['spread <= 0.01 * price'] = spread <= 0.01 * current_price
-            if not conditions['spread <= 0.01 * price']:
+            conditions['spread <= 0.005 * price'] = spread <= 0.005 * current_price  # Ajustado a 0.5% para mayor liquidez
+            if not conditions['spread <= 0.005 * price']:
                 logging.info(f"Se omite {symbol} por spread alto: {spread}")
-                failed_conditions_count['spread <= 0.01 * price'] = failed_conditions_count.get('spread <= 0.01 * price', 0) + 1
+                failed_conditions_count['spread <= 0.005 * price'] = failed_conditions_count.get('spread <= 0.005 * price', 0) + 1
                 continue
 
             conditions['imbalance >= 1.0'] = imbalance >= 1.0
@@ -805,18 +821,10 @@ def demo_trading(high_volume_symbols=None):
                 continue
             df_slice = df_slice.iloc[-100:]
 
-            rsi = df_slice['RSI'].iloc[-1] if 'RSI' in df_slice and not pd.isna(df_slice['RSI'].iloc[-1]) else None
             adx = calculate_adx(df_slice) if not df_slice.empty else None
             atr = df_slice['ATR'].iloc[-1] if 'ATR' in df_slice and not pd.isna(df_slice['ATR'].iloc[-1]) else None
             volume_series = df_slice['volume']
             relative_volume = volume_series.iloc[-1] / volume_series[-10:].mean() if len(volume_series) >= 10 and volume_series[-10:].mean() != 0 else None
-            divergence = detect_momentum_divergences(price_series, df_slice['RSI']) if 'RSI' in df_slice else "none"
-            bb_position = get_bb_position(
-                current_price,
-                df_slice['BB_upper'].iloc[-1] if 'BB_upper' in df_slice and not pd.isna(df_slice['BB_upper'].iloc[-1]) else None,
-                df_slice['BB_middle'].iloc[-1] if 'BB_middle' in df_slice and not pd.isna(df_slice['BB_middle'].iloc[-1]) else None,
-                df_slice['BB_lower'].iloc[-1] if 'BB_lower' in df_slice and not pd.isna(df_slice['BB_lower'].iloc[-1]) else None
-            )
             macd = df_slice['MACD'].iloc[-1] if 'MACD' in df_slice and not pd.isna(df_slice['MACD'].iloc[-1]) else None
             macd_signal = df_slice['MACD_signal'].iloc[-1] if 'MACD_signal' in df_slice and not pd.isna(df_slice['MACD_signal'].iloc[-1]) else None
             roc = df_slice['ROC'].iloc[-1] if 'ROC' in df_slice and not pd.isna(df_slice['ROC'].iloc[-1]) else None
@@ -839,28 +847,26 @@ def demo_trading(high_volume_symbols=None):
             short_price_trend = price_trend
             short_volume_trend_1h = calculate_short_volume_trend(volume_series, window=1) if len(volume_series) >= 1 else "insufficient_data"
             support_level = detect_support_level(data, price_series, window=15, max_threshold_multiplier=3.0)
-            support_threshold = 1 + (atr * 3.0 / current_price) if atr and current_price > 0 else 1.10
-            support_threshold = min(support_threshold, 1.15)
 
-            conditions['support_near'] = support_level is not None and current_price <= support_level * support_threshold
+            # Calcular la distancia relativa al soporte
+            support_distance = None
+            if support_level is not None and current_price > 0:
+                support_distance = (current_price - support_level) / support_level
+            conditions['support_near'] = support_distance is not None and support_distance <= 0.03  # Ajustado a 0.03
             conditions['short_volume_trend_increasing'] = short_volume_trend == "increasing"
             conditions['price_trend_not_decreasing'] = price_trend != "decreasing"
             conditions['relative_volume > VOLUME_GROWTH_THRESHOLD'] = relative_volume is not None and relative_volume > VOLUME_GROWTH_THRESHOLD
-            conditions['adx > 25'] = adx is not None and adx > 25
-            conditions['rsi <= RSI_THRESHOLD'] = rsi is not None and rsi <= RSI_THRESHOLD
+            conditions['adx > 40'] = adx is not None and adx > 40  # Ajustado a 40
             conditions['macd_crossover'] = has_crossover and macd is not None and macd_signal is not None and macd > macd_signal and macd_signal > 0
-            conditions['roc > 0'] = roc is not None and roc > 0
+            conditions['roc > 1.0'] = roc is not None and roc > 1.0  # Ajustado a 1.0
 
             conditions_str = "\n".join([f"{key}: {'Sí' if value else 'No'}" for key, value in sorted(conditions.items())])
-            logging.info(f"Condiciones evaluadas para {symbol}:\n{conditions_str}\nValores: RSI={rsi}, ADX={adx}, RelVol={relative_volume}, ShortVolTrend={short_volume_trend}, PriceTrend={price_trend}, Support={support_level}, MACD={macd}, Signal={macd_signal}, Crossover={has_crossover}")
+            logging.info(f"Condiciones evaluadas para {symbol}:\n{conditions_str}\nValores: ADX={adx}, RelVol={relative_volume}, ShortVolTrend={short_volume_trend}, PriceTrend={price_trend}, Support={support_level}, SupportDistance={support_distance}, MACD={macd}, Signal={macd_signal}, Crossover={has_crossover}, ROC={roc}")
 
             indicators = {
-                "rsi": rsi,
                 "adx": adx,
                 "atr": atr,
                 "relative_volume": relative_volume,
-                "divergence": divergence,
-                "bb_position": bb_position,
                 "macd": macd,
                 "macd_signal": macd_signal,
                 "has_macd_crossover": has_crossover,
@@ -879,7 +885,7 @@ def demo_trading(high_volume_symbols=None):
             }
 
             if not conditions['support_near']:
-                logging.info(f"Precio de {symbol} ({current_price}) está por encima del umbral de soporte ({support_level * support_threshold:.3f})")
+                logging.info(f"Precio de {symbol} ({current_price}) está por encima del umbral de soporte (distancia relativa: {support_distance:.4f})")
             if not conditions['short_volume_trend_increasing']:
                 logging.info(f"Tendencia de volumen decreciente a corto plazo para {symbol}")
 
@@ -888,9 +894,9 @@ def demo_trading(high_volume_symbols=None):
 
             gpt_conditions = {
                 'action is "mantener"': action == "mantener",
-                'RSI is None or neutral (30 < RSI < 70)': rsi is None or (rsi is not None and 30 < rsi < 70),
-                'Relative volume is None or low (< 0.5)': relative_volume is None or (relative_volume is not None and relative_volume < 0.5),
-                'No recent MACD crossover': not has_crossover
+                'Relative volume is None or low (< 1.8)': relative_volume is None or (relative_volume is not None and relative_volume < 1.8),
+                'No recent MACD crossover': not has_crossover,
+                'Far from support (> 0.03)': support_distance is None or support_distance > 0.03
             }
 
             gpt_conditions_str = "\n".join([f"{key}: {'Sí' if value else 'No'}" for key, value in gpt_conditions.items()])
@@ -917,16 +923,17 @@ def demo_trading(high_volume_symbols=None):
 
             # Ejecución de la compra ajustada para comprar al menos MIN_NOTIONAL si es posible
             if action == "comprar" and confidence >= 70:
-                # Calcular amount mínimo para MIN_NOTIONAL
+                # Verificar el límite de compras justo antes de ejecutar la orden
+                daily_buys = get_daily_buys()
+                logging.info(f"Compras diarias realizadas antes de ejecutar orden para {symbol}: {daily_buys}")
+                if daily_buys >= MAX_DAILY_BUYS:
+                    logging.info(f"Límite diario de compras alcanzado, no se ejecuta compra para {symbol}.")
+                    return False
+
+                # Calcular amount basado en budget_per_trade, pero asegurar MIN_NOTIONAL
                 min_amount_for_notional = MIN_NOTIONAL / current_price
-                # Priorizar budget_per_trade, pero asegurar al menos MIN_NOTIONAL
                 target_amount = max(budget_per_trade / current_price, min_amount_for_notional)
-                # Limitar al 5% del saldo USDT como máximo, pero permitir al menos MIN_NOTIONAL si el saldo lo soporta
-                max_amount = 0.05 * usdt_balance / current_price
-                if usdt_balance >= MIN_NOTIONAL:
-                    amount = max(min_amount_for_notional, min(target_amount, max_amount))
-                else:
-                    amount = min(target_amount, max_amount)  # Si no alcanza MIN_NOTIONAL, usa lo disponible
+                amount = min(target_amount, 0.10 * usdt_balance / current_price)  # Límite del 10% del saldo
                 trade_value = amount * current_price
                 logging.info(f"Intentando compra para {symbol}: amount={amount}, trade_value={trade_value}, MIN_NOTIONAL={MIN_NOTIONAL}, usdt_balance={usdt_balance}, budget_per_trade={budget_per_trade}")
                 if trade_value >= MIN_NOTIONAL or (trade_value < MIN_NOTIONAL and trade_value >= usdt_balance):
@@ -1113,12 +1120,12 @@ def gpt_decision_buy(prepared_text):
     prompt = f"""
     Eres un experto en trading de criptomonedas de alto riesgo. Basándote en los datos para cualquier activo USDT en Binance:
     {prepared_text}
-    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza activos con alta volatilidad, volumen creciente (>0.2), o cruces alcistas recientes de MACD, incluso si RSI es > 70. Acepta riesgos moderados si el volumen y momentum a corto plazo son fuertes, especialmente cuando short_volume_trend es 'increasing' y price_trend no es 'decreasing'. Responde SOLO con un JSON válido sin '''json''' asi:
-    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen creciente a corto plazo (>0.2) y tendencia de precio no bajista indican oportunidad de ganancia rápida en alta volatilidad"}}
+    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza activos con alta volatilidad, volumen creciente (>1.5), y momentum fuerte (ROC > 0.5), solo si están muy cerca de un nivel de soporte (distancia relativa al soporte <= 0.05). Acepta riesgos moderados si el volumen y momentum a corto plazo son fuertes, especialmente cuando short_volume_trend es 'increasing' y price_trend es 'increasing'. Responde SOLO con un JSON válido sin '''json''' asi:
+    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen creciente a corto plazo (>1.5), momentum fuerte (ROC > 0.5), y cerca de soporte indican oportunidad de ganancia rápida"}}
     Criterios:
-    - Compra si volumen relativo > 0.2, short_volume_trend es 'increasing', precio tendencia 'increasing' o 'stable', o cruce alcista MACD reciente, incluso con RSI > 70.
-    - Mantener solo si todas las señales son débiles, negativas (e.g., short_volume_trend 'decreasing' o price_trend 'decreasing'), o hay sobre venta extrema (RSI < 20).
-    - Evalúa profundidad (>2000) y spread (<1% del precio) para liquidez.
+    - Compra si volumen relativo > 1.5, short_volume_trend es 'increasing', precio tendencia es 'increasing', ROC > 0.5, distancia relativa al soporte <= 0.05, profundidad > 5000, y spread < 0.5% del precio.
+    - Mantener si las señales son débiles o negativas (e.g., short_volume_trend 'decreasing', price_trend 'decreasing', volumen relativo < 1.5, lejos del soporte).
+    - Evalúa profundidad (>5000) y spread (<0.5% del precio) para garantizar liquidez.
     - Ignora tendencias largas si short_volume_trend y volumen relativo indican momentum fuerte.
     """
     max_retries = 2
