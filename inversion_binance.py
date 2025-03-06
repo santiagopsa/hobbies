@@ -966,6 +966,8 @@ def demo_trading(high_volume_symbols=None):
                     else:
                         logging.info(f"Compra no ejecutada para {symbol}: valor de la operación ({trade_value}) < MIN_NOTIONAL ({MIN_NOTIONAL}) y saldo insuficiente")
 
+            # Define failed_conditions here
+            failed_conditions = [key for key, value in conditions.items() if not value]
             for condition in failed_conditions:
                 failed_conditions_count[condition] = failed_conditions_count.get(condition, 0) + 1
             symbols_processed += 1
