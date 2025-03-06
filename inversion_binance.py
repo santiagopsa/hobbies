@@ -92,19 +92,29 @@ def reset_daily_buys():
         cursor = conn.cursor()
         colombia_tz = pytz.timezone("America/Bogota")
         today = datetime.now(colombia_tz).strftime('%Y-%m-%d')
-        
-        # Eliminar transacciones de compra del día actual
+        logging.info(f"Attempting to reset daily buys for {today}")
+
+        # Verify table exists and structure
+        cursor.execute("PRAGMA table_info(transactions_new)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'action' not in columns or 'timestamp' not in columns:
+            raise ValueError("Invalid table schema for transactions_new")
+
+        # Delete buys from today
         cursor.execute("DELETE FROM transactions_new WHERE action='buy' AND timestamp LIKE ?", (f"{today}%",))
         conn.commit()
         
-        # Contar cuántas transacciones se eliminaron (para logging)
+        # Log deleted count
         deleted_count = cursor.rowcount
         logging.info(f"Reinicio de compras diarias: {deleted_count} transacciones eliminadas para el día {today}.")
-        
-        # Verificar que el conteo de daily_buys sea 0 después del reinicio
+
+        # Verify reset
         cursor.execute("SELECT COUNT(*) FROM transactions_new WHERE action='buy' AND timestamp LIKE ?", (f"{today}%",))
         count = cursor.fetchone()[0]
-        logging.info(f"Conteo de compras diarias después del reinicio: {count}")
+        if count > 0:
+            logging.warning(f"Reset incomplete: {count} buys still present for {today}")
+        else:
+            logging.info(f"Conteo de compras diarias después del reinicio: {count}")
         
         conn.close()
         return True
