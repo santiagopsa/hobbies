@@ -874,6 +874,9 @@ def demo_trading(high_volume_symbols=None):
 
             logging.info(f"Decisión final para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
 
+            # Verificación de variables antes de proceder
+            logging.debug(f"Verificación post-decisión para {symbol}: action={action}, confidence={confidence}, explanation={explanation}, conditions={conditions}")
+
             if action == "comprar" and confidence >= 70:
                 with buy_lock:
                     daily_buys = get_daily_buys()
@@ -887,7 +890,6 @@ def demo_trading(high_volume_symbols=None):
                         logging.error(f"Precio actual inválido para {symbol} ({current_price}), omitiendo operación")
                         continue
 
-                    # Calcular volatility_factor con manejo explícito
                     atr_value = atr if atr is not None else 0.02 * current_price
                     if atr_value <= 0 or current_price <= 0:
                         volatility_factor = 1.0
@@ -913,10 +915,15 @@ def demo_trading(high_volume_symbols=None):
                     else:
                         logging.info(f"Compra no ejecutada para {symbol}: valor de la operación ({trade_value}) < MIN_NOTIONAL ({MIN_NOTIONAL}) y saldo insuficiente")
 
+            # Verificación antes de actualizar contadores
+            logging.debug(f"Verificación antes de contadores para {symbol}: failed_conditions_count={failed_conditions_count}, symbols_processed={symbols_processed}")
+
             failed_conditions = [key for key, value in conditions.items() if not value]
             for condition in failed_conditions:
                 failed_conditions_count[condition] = failed_conditions_count.get(condition, 0) + 1
             symbols_processed += 1
+
+            logging.debug(f"Contadores actualizados para {symbol}: failed_conditions_count={failed_conditions_count}, symbols_processed={symbols_processed}")
 
         del data
         time.sleep(30)
