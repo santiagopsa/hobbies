@@ -76,16 +76,42 @@ logging.basicConfig(
 )
 
 # Constantes actualizadas
-MAX_DAILY_BUYS = 5  # Reducido de 10 para memoria baja
+MAX_DAILY_BUYS = 10  # Reducido de 10 para memoria baja
 MIN_NOTIONAL = 10
 RSI_THRESHOLD = 80  # Aumentado para permitir compras en sobrecompra (cryptos alcistas)
 ADX_THRESHOLD = 15
-VOLUME_GROWTH_THRESHOLD = 0.3  # Reducido para capturar volumen moderado en criptos
+VOLUME_GROWTH_THRESHOLD = 0.5  # Reducido para capturar volumen moderado en criptos
 
 # Cache de decisiones
 decision_cache = {}
 CACHE_EXPIRATION = 300  # Reducido a 5 minutos para volatilidad
 
+def reset_daily_buys():
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        colombia_tz = pytz.timezone("America/Bogota")
+        today = datetime.now(colombia_tz).strftime('%Y-%m-%d')
+        
+        # Eliminar transacciones de compra del día actual
+        cursor.execute("DELETE FROM transactions_new WHERE action='buy' AND timestamp LIKE ?", (f"{today}%",))
+        conn.commit()
+        
+        # Contar cuántas transacciones se eliminaron (para logging)
+        deleted_count = cursor.rowcount
+        logging.info(f"Reinicio de compras diarias: {deleted_count} transacciones eliminadas para el día {today}.")
+        
+        # Verificar que el conteo de daily_buys sea 0 después del reinicio
+        cursor.execute("SELECT COUNT(*) FROM transactions_new WHERE action='buy' AND timestamp LIKE ?", (f"{today}%",))
+        count = cursor.fetchone()[0]
+        logging.info(f"Conteo de compras diarias después del reinicio: {count}")
+        
+        conn.close()
+        return True
+    except Exception as e:
+        logging.error(f"Error al reiniciar compras diarias: {e}")
+        return False
+    
 def detect_support_level(data, price_series, window=15, max_threshold_multiplier=2.5):
     """
     Detecta un nivel de soporte usando precios históricos y ajusta con ATR para la volatilidad.
@@ -1161,5 +1187,6 @@ def gpt_decision_buy(prepared_text):
         time.sleep(1)
 
 if __name__ == "__main__":
+    reset_daily_buys()
     high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=100)
     demo_trading(high_volume_symbols)
