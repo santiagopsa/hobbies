@@ -643,7 +643,6 @@ def get_cached_decision(symbol, indicators):
     return None
 
 def calculate_adaptive_strategy(indicators):
-    rsi = indicators.get('rsi', None)
     adx = indicators.get('adx', None)
     relative_volume = indicators.get('relative_volume', None)
     has_macd_crossover = indicators.get('has_macd_crossover', False)
@@ -652,26 +651,43 @@ def calculate_adaptive_strategy(indicators):
     roc = indicators.get('roc', None)
     price_trend = indicators.get('price_trend', 'insufficient_data')
     short_volume_trend = indicators.get('short_volume_trend', 'insufficient_data')
+    depth = indicators.get('depth', 0)
+    spread = indicators.get('spread', float('inf'))
+    current_price = indicators.get('current_price', 0)
+    support_level = indicators.get('support_level', None)
 
-    is_trending = adx > 25 if adx is not None else False
+    is_trending = adx > 30 if adx is not None else False  # Tendencia fuerte con ADX > 30
+    volume_threshold = 1.2  # Umbral para relative_volume
 
-    # Regla basada en tendencia corta de volumen
-    if short_volume_trend == "increasing" and price_trend != "decreasing" and relative_volume > VOLUME_GROWTH_THRESHOLD:
-        return "comprar", 80, "Volumen creciente a corto plazo con tendencia de precio no bajista"
+    # Calcular la distancia relativa al soporte (en porcentaje)
+    support_distance = None
+    if support_level is not None and current_price > 0:
+        support_distance = (current_price - support_level) / support_level  # Distancia relativa (positiva si está por encima)
+    support_near_threshold = 0.10  # El precio debe estar dentro del 10% del soporte
+
+    # Regla basada en volumen y momentum, con filtro de soporte
+    if (short_volume_trend == "increasing" and price_trend == "increasing" and 
+        relative_volume > volume_threshold and depth >= 5000 and spread <= 0.005 * current_price and
+        support_distance is not None and support_distance <= support_near_threshold):
+        return "comprar", 85, "Volumen y momentum fuertes cerca de soporte con liquidez alta"
 
     if is_trending:
-        if (rsi is not None and rsi <= RSI_THRESHOLD) or (has_macd_crossover and macd > macd_signal and macd_signal > 0) or (roc is not None and roc > 0):
-            return "comprar", 85, "Tendencia alcista confirmada por RSI bajo, cruce MACD, o ROC positivo"
-        if rsi is not None and rsi > 70 and relative_volume > VOLUME_GROWTH_THRESHOLD and price_trend == "increasing":
-            return "comprar", 75, "Compra en sobrecompra con volumen creciente y tendencia alcista"
-        return "mantener", 50, "Sin señales claras de tendencia alcista"
+        signals = [
+            has_macd_crossover and macd > macd_signal and macd_signal > 0,
+            roc is not None and roc > 0,
+            short_volume_trend == "increasing"
+        ]
+        if (sum(signals) >= 2 and relative_volume > volume_threshold and 
+            depth >= 5000 and spread <= 0.005 * current_price and
+            support_distance is not None and support_distance <= support_near_threshold):
+            return "comprar", 90, "Tendencia alcista confirmada por múltiples señales cerca de soporte con liquidez alta"
+        return "mantener", 50, "Sin señales claras de tendencia alcista o lejos del soporte"
     else:
-        # Aquí se elimina la combinación de RSI y Bollinger Bands
-        if rsi is not None and rsi < 30:
-            return "comprar", 80, "Reversión confirmada por RSI en sobreventa"
-        elif rsi is not None and rsi > 70:
-            return "mantener", 50, "Evitar compra en sobrecompra extrema"
-        return "mantener", 50, "Mercado en rango sin señales claras"
+        if (short_volume_trend == "increasing" and relative_volume > volume_threshold * 1.5 and 
+            price_trend == "increasing" and depth >= 5000 and spread <= 0.005 * current_price and
+            support_distance is not None and support_distance <= support_near_threshold):
+            return "comprar", 85, "Reversión potencial con volumen extremo y momentum cerca de soporte en mercado lateral"
+        return "mantener", 50, "Mercado en rango sin señales claras o lejos del soporte"
 
 
 def fetch_ohlcv_with_retry(symbol, timeframe, limit=50, max_retries=3):
@@ -691,11 +707,11 @@ def demo_trading(high_volume_symbols=None):
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
     logging.info(f"Saldo USDT disponible: {usdt_balance}")
     if usdt_balance < MIN_NOTIONAL:
-        logging.warning("Saldo insuficiente en USDT.")
+        logging.warning("Saldo insuficiente en USDT para alcanzar MIN_NOTIONAL.")
         return False
 
     reserve = 150  # Reserva para comisiones y posibles pérdidas
-    available_for_trading = usdt_balance - reserve
+    available_for_trading = max(usdt_balance - reserve, 0)  # Aseguramos que no sea negativo
     logging.info(f"Disponible para trading: {available_for_trading}, se deja una reserva de {reserve}")
     daily_buys = get_daily_buys()
     logging.info(f"Compras diarias realizadas: {daily_buys}")
@@ -705,17 +721,15 @@ def demo_trading(high_volume_symbols=None):
     if high_volume_symbols is None:
         high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=100)
 
-    budget_per_trade = available_for_trading / (MAX_DAILY_BUYS - daily_buys)
+    budget_per_trade = available_for_trading / (MAX_DAILY_BUYS - daily_buys) if (MAX_DAILY_BUYS - daily_buys) > 0 else available_for_trading
     selected_cryptos = high_volume_symbols
     logging.info(f"Presupuesto por operación: {budget_per_trade}")
     balance = exchange.fetch_balance()['free']
     logging.info(f"Balance actual: {balance}")
 
-    # Diccionario para rastrear condiciones fallidas por símbolo
     failed_conditions_count = {}
     symbols_processed = 0
 
-    # Batch processing
     for i in range(0, len(selected_cryptos), 10):
         batch = selected_cryptos[i:i+10]
         for symbol in batch:
@@ -826,7 +840,6 @@ def demo_trading(high_volume_symbols=None):
             support_threshold = 1 + (atr * 3.0 / current_price) if atr and current_price > 0 else 1.10
             support_threshold = min(support_threshold, 1.15)
 
-            # Condiciones completas
             conditions['support_near'] = support_level is not None and current_price <= support_level * support_threshold
             conditions['short_volume_trend_increasing'] = short_volume_trend == "increasing"
             conditions['price_trend_not_decreasing'] = price_trend != "decreasing"
@@ -900,12 +913,21 @@ def demo_trading(high_volume_symbols=None):
             failed_conditions_str = ", ".join(failed_conditions) if failed_conditions else "Ninguna"
             logging.info(f"Resumen para {symbol}: Pasadas {passed_conditions} condiciones de {total_conditions}, no se cumplieron: {failed_conditions_str}")
 
-            # Ejecución de la compra con logs detallados
+            # Ejecución de la compra ajustada para comprar al menos MIN_NOTIONAL si es posible
             if action == "comprar" and confidence >= 70:
-                amount = min(budget_per_trade / current_price, 0.005 * usdt_balance / current_price)
+                # Calcular amount mínimo para MIN_NOTIONAL
+                min_amount_for_notional = MIN_NOTIONAL / current_price
+                # Priorizar budget_per_trade, pero asegurar al menos MIN_NOTIONAL
+                target_amount = max(budget_per_trade / current_price, min_amount_for_notional)
+                # Limitar al 5% del saldo USDT como máximo, pero permitir al menos MIN_NOTIONAL si el saldo lo soporta
+                max_amount = 0.05 * usdt_balance / current_price
+                if usdt_balance >= MIN_NOTIONAL:
+                    amount = max(min_amount_for_notional, min(target_amount, max_amount))
+                else:
+                    amount = min(target_amount, max_amount)  # Si no alcanza MIN_NOTIONAL, usa lo disponible
                 trade_value = amount * current_price
                 logging.info(f"Intentando compra para {symbol}: amount={amount}, trade_value={trade_value}, MIN_NOTIONAL={MIN_NOTIONAL}, usdt_balance={usdt_balance}, budget_per_trade={budget_per_trade}")
-                if trade_value >= MIN_NOTIONAL:
+                if trade_value >= MIN_NOTIONAL or (trade_value < MIN_NOTIONAL and trade_value >= usdt_balance):
                     order = execute_order_buy(symbol, amount, indicators, confidence)
                     if order:
                         logging.info(f"Compra ejecutada para {symbol}: {explanation}")
@@ -914,20 +936,17 @@ def demo_trading(high_volume_symbols=None):
                     else:
                         logging.error(f"Error al ejecutar compra para {symbol}: orden no completada")
                 else:
-                    logging.info(f"Compra no ejecutada para {symbol}: valor de la operación ({trade_value}) < MIN_NOTIONAL ({MIN_NOTIONAL})")
+                    logging.info(f"Compra no ejecutada para {symbol}: valor de la operación ({trade_value}) < MIN_NOTIONAL ({MIN_NOTIONAL}) y saldo insuficiente")
             else:
                 logging.info(f"Compra no intentada para {symbol}: action={action}, confidence={confidence} no cumple criterios (action='comprar' y confidence>=70)")
 
-            # Actualizar conteo de condiciones fallidas
             for condition in failed_conditions:
                 failed_conditions_count[condition] = failed_conditions_count.get(condition, 0) + 1
             symbols_processed += 1
 
-        # Liberar memoria
         del data
         time.sleep(30)
 
-    # Resumen final de condiciones fallidas más comunes
     if symbols_processed > 0 and failed_conditions_count:
         most_common_condition = max(failed_conditions_count, key=failed_conditions_count.get)
         most_common_count = failed_conditions_count[most_common_condition]
@@ -936,7 +955,6 @@ def demo_trading(high_volume_symbols=None):
                            f"con {most_common_count} ocurrencias ({(most_common_count / symbols_processed) * 100:.1f}%).")
         logging.info(summary_message)
 
-        # Escribir en un archivo
         with open("trade_blockers_summary.txt", "a") as f:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             f.write(f"{timestamp} - {summary_message}\n")
