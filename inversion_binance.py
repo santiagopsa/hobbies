@@ -591,16 +591,6 @@ def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, indicators):
     threading.Thread(target=trailing_logic, daemon=True).start()
 
 def calculate_adaptive_strategy(indicators, data=None):
-    """
-    Calcula una estrategia adaptativa para comprar cerca de soportes con tendencia alcista.
-    
-    Args:
-        indicators: Diccionario con indicadores como 'rsi', 'roc', 'support_level', etc.
-        data: Diccionario opcional con DataFrames para timeframes '1h', '4h', '1d'.
-    
-    Returns:
-        tuple: (acción: str, confianza: int, motivo: str)
-    """
     # Extraer indicadores
     rsi = indicators.get('rsi', None)
     relative_volume = indicators.get('relative_volume', None)
@@ -616,7 +606,7 @@ def calculate_adaptive_strategy(indicators, data=None):
 
     # Calcular distancia al soporte
     support_distance = None
-    if support_level and current_price > 0:
+    if support_level is not None and current_price > 0:
         support_distance = (current_price - support_level) / support_level
 
     # Umbral de proximidad al soporte: 3%
@@ -650,7 +640,9 @@ def calculate_adaptive_strategy(indicators, data=None):
         return "mantener", 50, f"Tendencia alcista o volumen no confirmados (ROC: {roc_4h}, Tendencia: {tendencia_alcista}, MACD: {macd_4h}, Volumen: {volumen_creciente})"
 
     # Verificar proximidad al soporte
-    if support_distance is None or support_distance > support_near_threshold:
+    if support_distance is None:
+        return "mantener", 50, "No se pudo calcular la distancia al soporte (soporte no detectado o precio inválido)"
+    if support_distance > support_near_threshold:
         return "mantener", 50, f"Lejos del soporte (distancia: {support_distance:.2%})"
 
     # Puntuación ponderada de señales
@@ -811,25 +803,35 @@ def demo_trading(high_volume_symbols=None):
                 short_volume_trend = calculate_short_volume_trend(volume_series) if len(volume_series) >= 3 else "insufficient_data"
                 volume_trend = "insufficient_data"
                 price_trend = "insufficient_data"
+
+                # Calcular volume_trend con manejo seguro de linregress
                 if len(volume_series) >= 10:
                     last_10_volume = volume_series[-10:]
                     try:
-                        slope_volume, _, _, _, _ = linregress(range(10), last_10_volume)
+                        slope_volume, intercept, r_value, p_value, std_err = linregress(range(10), last_10_volume)
                         volume_trend = "increasing" if slope_volume > 0.01 else "decreasing" if slope_volume < -0.01 else "stable"
+                        logging.debug(f"Volume trend calculado para {symbol}: slope={slope_volume}, trend={volume_trend}")
                     except Exception as e:
                         logging.error(f"Error al calcular volume_trend para {symbol}: {e}", exc_info=True)
                         volume_trend = "insufficient_data"
+                else:
+                    logging.debug(f"No hay suficientes datos para calcular volume_trend para {symbol}: {len(volume_series)} velas")
+
+                # Calcular price_trend con manejo seguro de linregress
                 if len(price_series) >= 10:
                     last_10_price = price_series[-10:]
                     try:
-                        slope_price, _, _, _, _ = linregress(range(10), last_10_price)
+                        slope_price, intercept, r_value, p_value, std_err = linregress(range(10), last_10_price)
                         price_trend = "increasing" if slope_price > 0.01 else "decreasing" if slope_price < -0.01 else "stable"
+                        logging.debug(f"Price trend calculado para {symbol}: slope={slope_price}, trend={price_trend}")
                     except Exception as e:
                         logging.error(f"Error al calcular price_trend para {symbol}: {e}", exc_info=True)
                         price_trend = "insufficient_data"
+                else:
+                    logging.debug(f"No hay suficientes datos para calcular price_trend para {symbol}: {len(price_series)} velas")
+
                 support_level = detect_support_level(data, price_series, window=15, max_threshold_multiplier=3.0)
 
-                # Calculate support_distance locally
                 support_distance = None
                 if support_level is not None and current_price > 0:
                     support_distance = (current_price - support_level) / support_level
@@ -857,11 +859,9 @@ def demo_trading(high_volume_symbols=None):
                 conditions_str = "\n".join([f"{key}: {'Sí' if value is True else 'No' if value is False else 'Desconocido'}" for key, value in sorted(conditions.items())])
                 logging.info(f"Condiciones evaluadas para {symbol}:\n{conditions_str}")
 
-                # Verificación de tipos en conditions
                 for key, value in conditions.items():
                     logging.debug(f"Condición {key} para {symbol}: valor={value}, tipo={type(value)}")
 
-                # Modificado: Pasar el diccionario 'data' a calculate_adaptive_strategy
                 action, confidence, explanation = calculate_adaptive_strategy(indicators, data=data)
                 logging.info(f"Decisión inicial para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
 
@@ -886,7 +886,6 @@ def demo_trading(high_volume_symbols=None):
 
                 logging.info(f"Decisión final para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
 
-                # Verificación de variables antes de proceder
                 logging.debug(f"Verificación post-decisión para {symbol}: action={action}, confidence={confidence}, explanation={explanation}, conditions={conditions}")
 
                 if action == "comprar" and confidence >= 70:
@@ -896,7 +895,6 @@ def demo_trading(high_volume_symbols=None):
                             logging.info(f"Límite diario de compras alcanzado, no se ejecuta compra para {symbol}.")
                             return False
 
-                        # Dynamic sizing based on confidence and volatility
                         confidence_factor = confidence / 100
                         if current_price is None or current_price <= 0:
                             logging.error(f"Precio actual inválido para {symbol} ({current_price}), omitiendo operación")
@@ -927,7 +925,6 @@ def demo_trading(high_volume_symbols=None):
                         else:
                             logging.info(f"Compra no ejecutada para {symbol}: valor de la operación ({trade_value}) < MIN_NOTIONAL ({MIN_NOTIONAL}) y saldo insuficiente")
 
-                # Verificación antes de actualizar contadores
                 logging.debug(f"Verificación antes de contadores para {symbol}: failed_conditions_count={failed_conditions_count}, symbols_processed={symbols_processed}")
 
                 failed_conditions = [key for key, value in conditions.items() if not value]
@@ -962,7 +959,7 @@ def demo_trading(high_volume_symbols=None):
 
     logging.info("Trading ejecutado correctamente en segundo plano para todos los activos USDT")
     return True
-
+    
 def analyze_trade_outcome(trade_id):
     try:
         conn = sqlite3.connect(DB_NAME)
