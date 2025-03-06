@@ -725,25 +725,23 @@ def calculate_adaptive_strategy(indicators):
     if adx is not None and adx < 25:
         return "mantener", 50, "Weak trend (ADX < 25), avoiding ranging market"
 
-    # Core Signals
-    core_signals = [
-        short_volume_trend == "increasing",
-        price_trend == "increasing",
-        relative_volume > 2.5 if relative_volume else False,  # Tighter volume
-        roc > 1.0 if roc else False,  # Tighter momentum
-        depth >= 5000,
-        spread <= 0.005 * current_price,
-        support_distance is not None and support_distance <= support_near_threshold
+    # Weighted Core Signals
+    weighted_signals = [
+        3 * (short_volume_trend == "increasing"),  # High weight (3) for short-term volume trend
+        2 * (price_trend == "increasing"),        # Moderate weight (2) for price trend
+        2 * (relative_volume > 2.5 if relative_volume else False),  # Moderate weight (2) for volume
+        2 * (roc > 1.0 if roc else False),        # Moderate weight (2) for momentum
+        1 * (depth >= 5000),                      # Low weight (1) for liquidity
+        1 * (spread <= 0.005 * current_price),    # Low weight (1) for spread
+        1 * (support_distance is not None and support_distance <= support_near_threshold)  # Low weight (1) for support
     ]
-    signals_met = sum(core_signals)
+    signals_score = sum(weighted_signals)  # Total weighted score (max 11)
 
-    # Peak Momentum (RSI > 75, tightened)
-    if (rsi and rsi > 75 and signals_met >= 6):  # Require 6/7 signals
-        if adx > 35 and has_macd_crossover:  # Mandatory ADX and MACD
-            return "comprar", 90, "Strong peak momentum: RSI > 75, ADX > 35, MACD crossover, and 6/7 signals near support"
-        return "mantener", 50, "Insufficient trend confirmation"
+    # Buy Condition with Minimum Weighted Score
+    if (rsi and rsi > 75 and signals_score >= 9 and adx > 35 and has_macd_crossover):
+        return "comprar", 90, f"Strong buy: RSI > 75, weighted score {signals_score}/11, ADX > 35, MACD crossover"
+    return "mantener", 50, f"Insufficient momentum or support proximity (score: {signals_score}/11)"
 
-    return "mantener", 50, "Insufficient momentum or support proximity"
 
 def fetch_ohlcv_with_retry(symbol, timeframe, limit=50, max_retries=3):
     for attempt in range(max_retries):
