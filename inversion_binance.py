@@ -883,7 +883,12 @@ def demo_trading(high_volume_symbols=None):
 
                     # Dynamic sizing based on confidence and volatility
                     confidence_factor = confidence / 100
-                    volatility_factor = min(2.0, (atr or 0.02 * current_price) / current_price * 100)
+                    # Asegurarse de que current_price no sea None y usar un valor por defecto si atr es None
+                    if current_price is None or current_price == 0:
+                        logging.error(f"Precio actual no disponible para {symbol}, omitiendo operación")
+                        continue
+                    default_atr = 0.02 * current_price if current_price else 0.01  # Valor por defecto si current_price es 0 o None
+                    volatility_factor = min(2.0, ((atr if atr is not None else default_atr) / current_price * 100) if current_price else 1.0)
                     size_multiplier = confidence_factor * volatility_factor
                     adjusted_budget = budget_per_trade * size_multiplier
                     min_amount_for_notional = MIN_NOTIONAL / current_price
@@ -892,6 +897,7 @@ def demo_trading(high_volume_symbols=None):
                     trade_value = amount * current_price
 
                     logging.info(f"Intentando compra para {symbol}: amount={amount}, trade_value={trade_value}, confidence={confidence}%, volatility_factor={volatility_factor:.2f}x")
+
                     if trade_value >= MIN_NOTIONAL or (trade_value < MIN_NOTIONAL and trade_value >= usdt_balance):
                         order = execute_order_buy(symbol, amount, indicators, confidence)
                         if order:
