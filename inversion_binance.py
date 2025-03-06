@@ -721,7 +721,6 @@ def demo_trading(high_volume_symbols=None):
         for symbol in batch:
             logging.info(f"Procesando {symbol}...")
             base_asset = symbol.split('/')[0]
-            # Corrección: Eliminamos la duplicación en la condición
             if base_asset in balance and balance[base_asset] > 0:
                 logging.info(f"Se omite {symbol} porque ya tienes una posición abierta.")
                 continue
@@ -827,6 +826,7 @@ def demo_trading(high_volume_symbols=None):
             support_threshold = 1 + (atr * 3.0 / current_price) if atr and current_price > 0 else 1.10
             support_threshold = min(support_threshold, 1.15)
 
+            # Condiciones completas
             conditions['support_near'] = support_level is not None and current_price <= support_level * support_threshold
             conditions['short_volume_trend_increasing'] = short_volume_trend == "increasing"
             conditions['price_trend_not_decreasing'] = price_trend != "decreasing"
@@ -835,7 +835,6 @@ def demo_trading(high_volume_symbols=None):
             conditions['rsi <= RSI_THRESHOLD'] = rsi is not None and rsi <= RSI_THRESHOLD
             conditions['macd_crossover'] = has_crossover and macd is not None and macd_signal is not None and macd > macd_signal and macd_signal > 0
             conditions['roc > 0'] = roc is not None and roc > 0
-
 
             conditions_str = "\n".join([f"{key}: {'Sí' if value else 'No'}" for key, value in sorted(conditions.items())])
             logging.info(f"Condiciones evaluadas para {symbol}:\n{conditions_str}\nValores: RSI={rsi}, ADX={adx}, RelVol={relative_volume}, ShortVolTrend={short_volume_trend}, PriceTrend={price_trend}, Support={support_level}, MACD={macd}, Signal={macd_signal}, Crossover={has_crossover}")
@@ -901,19 +900,28 @@ def demo_trading(high_volume_symbols=None):
             failed_conditions_str = ", ".join(failed_conditions) if failed_conditions else "Ninguna"
             logging.info(f"Resumen para {symbol}: Pasadas {passed_conditions} condiciones de {total_conditions}, no se cumplieron: {failed_conditions_str}")
 
-            # Actualizar conteo de condiciones fallidas
-            for condition in failed_conditions:
-                failed_conditions_count[condition] = failed_conditions_count.get(condition, 0) + 1
-            symbols_processed += 1
-
+            # Ejecución de la compra con logs detallados
             if action == "comprar" and confidence >= 70:
                 amount = min(budget_per_trade / current_price, 0.005 * usdt_balance / current_price)
-                if amount * current_price >= MIN_NOTIONAL:
+                trade_value = amount * current_price
+                logging.info(f"Intentando compra para {symbol}: amount={amount}, trade_value={trade_value}, MIN_NOTIONAL={MIN_NOTIONAL}, usdt_balance={usdt_balance}, budget_per_trade={budget_per_trade}")
+                if trade_value >= MIN_NOTIONAL:
                     order = execute_order_buy(symbol, amount, indicators, confidence)
                     if order:
                         logging.info(f"Compra ejecutada para {symbol}: {explanation}")
                         send_telegram_message(f"✅ *Compra* `{symbol}`\nConfianza: `{confidence}%`\nExplicación: `{explanation}`")
                         dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], indicators)
+                    else:
+                        logging.error(f"Error al ejecutar compra para {symbol}: orden no completada")
+                else:
+                    logging.info(f"Compra no ejecutada para {symbol}: valor de la operación ({trade_value}) < MIN_NOTIONAL ({MIN_NOTIONAL})")
+            else:
+                logging.info(f"Compra no intentada para {symbol}: action={action}, confidence={confidence} no cumple criterios (action='comprar' y confidence>=70)")
+
+            # Actualizar conteo de condiciones fallidas
+            for condition in failed_conditions:
+                failed_conditions_count[condition] = failed_conditions_count.get(condition, 0) + 1
+            symbols_processed += 1
 
         # Liberar memoria
         del data
