@@ -656,37 +656,39 @@ def calculate_adaptive_strategy(indicators):
     current_price = indicators.get('current_price', 0)
     support_level = indicators.get('support_level', None)
 
-    is_trending = adx > 30 if adx is not None else False  # Tendencia fuerte con ADX > 30
-    volume_threshold = 1.2  # Umbral para relative_volume
+    is_trending = adx > 35 if adx is not None else False  # Tendencia muy fuerte con ADX > 35
+    volume_threshold = 1.5  # Más estricto (volumen 50% mayor al promedio)
 
-    # Calcular la distancia relativa al soporte (en porcentaje)
+    # Calcular la distancia relativa al soporte
     support_distance = None
     if support_level is not None and current_price > 0:
-        support_distance = (current_price - support_level) / support_level  # Distancia relativa (positiva si está por encima)
-    support_near_threshold = 0.10  # El precio debe estar dentro del 10% del soporte
+        support_distance = (current_price - support_level) / support_level
+    support_near_threshold = 0.05  # Más estricto (5% del soporte)
 
-    # Regla basada en volumen y momentum, con filtro de soporte
+    # Regla basada en volumen y momentum, con soporte muy cercano
     if (short_volume_trend == "increasing" and price_trend == "increasing" and 
-        relative_volume > volume_threshold and depth >= 5000 and spread <= 0.005 * current_price and
+        relative_volume > volume_threshold and roc is not None and roc > 0.5 and  # ROC más estricto
+        depth >= 5000 and spread <= 0.005 * current_price and
         support_distance is not None and support_distance <= support_near_threshold):
-        return "comprar", 85, "Volumen y momentum fuertes cerca de soporte con liquidez alta"
+        return "comprar", 85, "Volumen y momentum muy fuertes muy cerca de soporte con liquidez alta"
 
     if is_trending:
         signals = [
             has_macd_crossover and macd > macd_signal and macd_signal > 0,
-            roc is not None and roc > 0,
+            roc is not None and roc > 0.5,  # ROC más estricto
             short_volume_trend == "increasing"
         ]
-        if (sum(signals) >= 2 and relative_volume > volume_threshold and 
+        if (sum(signals) >= 3 and relative_volume > volume_threshold and  # Requiere las 3 señales
             depth >= 5000 and spread <= 0.005 * current_price and
             support_distance is not None and support_distance <= support_near_threshold):
-            return "comprar", 90, "Tendencia alcista confirmada por múltiples señales cerca de soporte con liquidez alta"
+            return "comprar", 90, "Tendencia alcista confirmada por todas las señales muy cerca de soporte con liquidez alta"
         return "mantener", 50, "Sin señales claras de tendencia alcista o lejos del soporte"
     else:
         if (short_volume_trend == "increasing" and relative_volume > volume_threshold * 1.5 and 
-            price_trend == "increasing" and depth >= 5000 and spread <= 0.005 * current_price and
+            price_trend == "increasing" and roc is not None and roc > 0.5 and
+            depth >= 5000 and spread <= 0.005 * current_price and
             support_distance is not None and support_distance <= support_near_threshold):
-            return "comprar", 85, "Reversión potencial con volumen extremo y momentum cerca de soporte en mercado lateral"
+            return "comprar", 85, "Reversión potencial con volumen extremo y momentum muy cerca de soporte en mercado lateral"
         return "mantener", 50, "Mercado en rango sin señales claras o lejos del soporte"
 
 
