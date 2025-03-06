@@ -78,8 +78,8 @@ logging.basicConfig(
 # Constantes actualizadas
 MAX_DAILY_BUYS = 10  # Reducido de 10 para memoria baja
 MIN_NOTIONAL = 10
-RSI_THRESHOLD = 80  # Aumentado para permitir compras en sobrecompra (cryptos alcistas)
-ADX_THRESHOLD = 15
+RSI_THRESHOLD = 70  # Aumentado para permitir compras en sobrecompra (cryptos alcistas)
+ADX_THRESHOLD = 25
 VOLUME_GROWTH_THRESHOLD = 0.5  # Reducido para capturar volumen moderado en criptos
 
 # Cache de decisiones
@@ -124,12 +124,13 @@ def reset_daily_buys():
     
 def detect_support_level(data, price_series, window=15, max_threshold_multiplier=2.5):
     """
-    Detecta un nivel de soporte usando precios históricos y ajusta con ATR para la volatilidad.
+    Detecta un nivel de soporte robusto usando mínimos locales y ajusta con ATR para volatilidad.
     
     Args:
-        data: Diccionario con DataFrames para timeframes '1h', '4h' y '1d' (resultado de fetch_and_prepare_data).
+        data: Diccionario con DataFrames para timeframes '1h', '4h', '1d'.
         price_series: Serie de precios de cierre ('close') para análisis.
-        window: Ventana para detectar el mínimo (por defecto 15).
+        window: Ventana para detectar mínimos (por defecto 15).
+        max_threshold_multiplier: Multiplicador del ATR para el umbral (por defecto 2.5).
         
     Returns:
         float con el nivel de soporte o None si no se detecta.
@@ -139,86 +140,39 @@ def detect_support_level(data, price_series, window=15, max_threshold_multiplier
         return None
 
     recent_prices = price_series[-window:]
-    min_price = recent_prices.min()
+    local_mins = [
+        recent_prices.iloc[i] for i in range(1, len(recent_prices) - 1)
+        if recent_prices.iloc[i] < recent_prices.iloc[i - 1] and recent_prices.iloc[i] < recent_prices.iloc[i + 1]
+    ]
+
+    if not local_mins:
+        logging.warning(f"No local minima found in the last {window} candles for {price_series.name}")
+        return None
+
+    support_level = min(local_mins)
     current_price = price_series.iloc[-1]
 
-    # Se intentará calcular ATR usando distintos timeframes
-    timeframes = ['1h', '4h', '1d']
+    # Calcular ATR en múltiples timeframes
     atr_value = None
-    used_tf = None
-
-    for tf in timeframes:
-        if tf not in data or data[tf].empty:
-            logging.warning(f"No hay datos en {tf} para {price_series.name}")
-            continue
-
-        df = data[tf]
-        if len(df) < 14:  # ATR requiere al menos 14 velas
-            logging.warning(f"Datos insuficientes para ATR en {price_series.name} ({tf}): {len(df)} < 14")
-            continue
-
-        try:
-            # Ordenar y eliminar duplicados si es necesario
-            if not df.index.is_monotonic_increasing:
-                df = df.sort_index()
-            if df.index.duplicated().any():
-                df = df[~df.index.duplicated(keep='first')]
-                if len(df) < 14:
-                    logging.warning(f"Datos insuficientes tras limpiar duplicados en {price_series.name} en {tf}")
-                    continue
-
-            # Para timeframes intradía, rellenar gaps
-            if tf != '1d':
-                expected_freq = pd.Timedelta('1h') if tf == '1h' else pd.Timedelta('4h')
-                expected_index = pd.date_range(start=df.index[0], end=df.index[-1], freq=expected_freq)
-                if len(expected_index) > len(df.index):
-                    logging.warning(
-                        f"Gaps detectados en {price_series.name} en {tf}: "
-                        f"esperados={len(expected_index)}, reales={len(df.index)}"
-                    )
-                    df = df.reindex(expected_index, method='ffill').dropna(how='all')
-                    if len(df) < 14:
-                        logging.warning(
-                            f"Datos insuficientes al llenar gaps para {price_series.name} en {tf}"
-                        )
-                        continue
-
-            # Calcular ATR y rellenar NaN tanto hacia adelante como hacia atrás
-            atr_series = ta.atr(df['high'], df['low'], df['close'], length=14)
-
-            # *** AQUÍ ESTÁ LA DIFERENCIA: usamos ffill() y bfill() en vez de solo ffill() ***
-            atr_series_filled = atr_series.ffill().bfill()
-
-            logging.debug(
-                f"Serie ATR para {price_series.name} en {tf} (después de ffill & bfill):\n{atr_series_filled}"
-            )
-
-            if atr_series_filled.isna().all():
-                logging.error(f"ATR no calculado para {price_series.name} en {tf}: {atr_series}")
-                continue
-
-            atr_value = atr_series_filled.iloc[-1]
-            used_tf = tf
-            logging.debug(f"ATR calculado para {price_series.name} en {tf}: {atr_value}")
-            break  # Usamos el primer timeframe con datos válidos
-
-        except Exception as e:
-            logging.error(f"Error al calcular ATR para {price_series.name} en {tf}: {e}")
-            continue
+    for tf in ['1h', '4h', '1d']:
+        if tf in data and not data[tf].empty and len(data[tf]) >= 14:
+            df = data[tf].sort_index().drop_duplicates(keep='first').dropna(subset=['high', 'low', 'close'])
+            atr_series = ta.atr(df['high'], df['low'], df['close'], length=14).ffill().bfill()
+            if not atr_series.isna().all():
+                atr_value = atr_series.iloc[-1]
+                break
 
     if atr_value is None:
-        logging.warning(f"No se pudo calcular ATR para {price_series.name} en ningún timeframe, usando 2% por defecto")
-        atr_value = current_price * 0.02
+        # Fallback a volatilidad estimada
+        atr_value = price_series.pct_change().std() * current_price if len(price_series) > 10 else current_price * 0.02
+        logging.warning(f"No ATR calculado para {price_series.name}, usando volatilidad estimada: {atr_value}")
 
-    # Umbral dinámico basado en ATR (capado a 5%)
+    # Umbral dinámico basado en ATR, capado al 3%
     threshold = 1 + (atr_value * max_threshold_multiplier / current_price) if current_price > 0 else 1.02
-    threshold = min(threshold, 1.05)
+    threshold = min(threshold, 1.03)  # Límite del 3%
 
-    logging.debug(
-        f"Umbral soporte {price_series.name}: precio={current_price}, min_reciente={min_price}, "
-        f"umbral={threshold:.3f}, timeframe={used_tf}"
-    )
-    return min_price if min_price < current_price * threshold else None
+    logging.debug(f"Soporte detectado: precio={current_price}, soporte={support_level}, umbral={threshold:.3f}")
+    return support_level if current_price <= support_level * threshold else None
 
 def calculate_short_volume_trend(volume_series, window=3):
     if len(volume_series) < window:
@@ -327,150 +281,105 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
                 logging.warning(f"Datos insuficientes (<5 velas) para {symbol} en {tf}")
                 continue
 
-            # Rellenar gaps en el índice
+            # Rellenar gaps en el índice con límite del 10%
             expected_freq = pd.Timedelta('1h') if tf == '1h' else pd.Timedelta('4h') if tf == '4h' else pd.Timedelta('1d')
             expected_index = pd.date_range(start=df.index[0], end=df.index[-1], freq=expected_freq)
             if len(expected_index) > len(df.index):
-                logging.warning(f"Gaps detectados en {symbol} en {tf}: esperados={len(expected_index)}, reales={len(df.index)}")
-                df = df.reindex(expected_index, method='ffill').dropna(how='all')
-                if len(df) < 5:
-                    logging.warning(f"Datos insuficientes tras rellenar gaps para {symbol} en {tf}")
+                gap_ratio = (len(expected_index) - len(df.index)) / len(expected_index)
+                if gap_ratio > 0.1:  # Más del 10% de datos faltantes
+                    logging.error(f"Demasiados gaps en {symbol} en {tf} (ratio: {gap_ratio:.2f}), omitiendo timeframe")
                     continue
+                df = df.reindex(expected_index, method='ffill').dropna(how='all')
 
             # Convertir columnas a numérico y manejar valores inválidos
             for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')  # NaN si no es numérico
+                df[col] = pd.to_numeric(df[col], errors='coerce')
                 if df[col].isna().any():
-                    logging.warning(f"Valores NaN detectados en {col} para {symbol} en {tf}, rellenando")
-                    df[col] = df[col].ffill().bfill()  # Rellenar hacia adelante y atrás
+                    df[col] = df[col].ffill().bfill()
 
             # Asegurar índices únicos y ordenados
             if not df.index.is_unique:
-                logging.warning(f"Índices duplicados para {symbol} en {tf}: {df.index[df.index.duplicated()].tolist()}")
                 df = df[~df.index.duplicated(keep='first')]
-                if len(df) < 5:
-                    logging.warning(f"Datos insuficientes tras eliminar duplicados para {symbol} en {tf}")
-                    continue
             if not df.index.is_monotonic_increasing:
-                logging.warning(f"Índices no monótonos para {symbol} en {tf}, ordenando")
                 df = df.sort_index()
-                if len(df) < 5:
-                    logging.warning(f"Datos insuficientes tras ordenar índices para {symbol} en {tf}")
-                    continue
 
-            logging.debug(f"Calculando indicadores para {symbol} en {tf}")
-
-            # Calcular ATR
+            # Calcular ATR, RSI, Bollinger Bands, MACD, ROC
             if len(df) >= atr_length:
-                atr_series = ta.atr(df['high'], df['low'], df['close'], length=atr_length)
-                if atr_series is None or atr_series.isna().all():
-                    logging.warning(f"ATR no calculado para {symbol} en {tf}, asignando NaN")
-                    df['ATR'] = np.nan
-                else:
-                    df['ATR'] = atr_series.ffill().bfill()
-                    logging.debug(f"ATR para {symbol} en {tf}: {df['ATR'].iloc[-1]}")
+                df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=atr_length).ffill().bfill()
             else:
-                logging.warning(f"Datos insuficientes para ATR (<{atr_length} velas) para {symbol} en {tf}")
                 df['ATR'] = np.nan
 
-            # Calcular RSI
             if len(df) >= rsi_length:
-                rsi_series = ta.rsi(df['close'], length=rsi_length)
-                if rsi_series is None or rsi_series.isna().all():
-                    logging.warning(f"RSI no calculado para {symbol} en {tf}, asignando NaN")
-                    df['RSI'] = np.nan
-                else:
-                    df['RSI'] = rsi_series.ffill().bfill()
-                    logging.debug(f"RSI para {symbol} en {tf}: {df['RSI'].iloc[-1]}")
+                df['RSI'] = ta.rsi(df['close'], length=rsi_length).ffill().bfill()
             else:
-                logging.warning(f"Datos insuficientes para RSI (<{rsi_length} velas) para {symbol} en {tf}")
                 df['RSI'] = np.nan
 
-            # Calcular Bollinger Bands
             if len(df) >= bb_length:
                 bb = ta.bbands(df['close'], length=bb_length, std=2)
-                if bb is None or bb.empty:
-                    logging.warning(f"Bollinger Bands no calculadas para {symbol} en {tf}")
-                    df['BB_upper'] = df['BB_middle'] = df['BB_lower'] = np.nan
-                else:
-                    df['BB_upper'] = bb.get(f'BBU_{bb_length}_2.0', pd.Series(np.nan, index=df.index))
-                    df['BB_middle'] = bb.get(f'BBM_{bb_length}_2.0', pd.Series(np.nan, index=df.index))
-                    df['BB_lower'] = bb.get(f'BBL_{bb_length}_2.0', pd.Series(np.nan, index=df.index))
-                    if df['BB_upper'].isna().all() or df['BB_lower'].isna().all():
-                        logging.warning(f"Bollinger Bands sin valores válidos para {symbol} en {tf}")
-                        df['BB_upper'] = df['BB_middle'] = df['BB_lower'] = np.nan
-                    else:
-                        logging.debug(f"Bollinger Bands para {symbol} en {tf}: Upper={df['BB_upper'].iloc[-1]}, Middle={df['BB_middle'].iloc[-1]}, Lower={df['BB_lower'].iloc[-1]}")
+                df['BB_upper'] = bb.get(f'BBU_{bb_length}_2.0', pd.Series(np.nan, index=df.index))
+                df['BB_middle'] = bb.get(f'BBM_{bb_length}_2.0', pd.Series(np.nan, index=df.index))
+                df['BB_lower'] = bb.get(f'BBL_{bb_length}_2.0', pd.Series(np.nan, index=df.index))
             else:
-                logging.warning(f"Datos insuficientes para Bollinger Bands (<{bb_length} velas) para {symbol} en {tf}")
                 df['BB_upper'] = df['BB_middle'] = df['BB_lower'] = np.nan
 
-            # Calcular MACD
             macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
-            if macd is None or macd.empty:
-                logging.warning(f"MACD no calculado para {symbol} en {tf}")
-                df['MACD'] = df['MACD_signal'] = np.nan
-            else:
+            if macd is not None and not macd.empty:
                 df['MACD'] = macd.get('MACD_12_26_9', pd.Series(np.nan, index=df.index))
                 df['MACD_signal'] = macd.get('MACDs_12_26_9', pd.Series(np.nan, index=df.index))
-                if df['MACD'].isna().all() or df['MACD_signal'].isna().all():
-                    logging.warning(f"MACD sin valores válidos para {symbol} en {tf}")
-                    df['MACD'] = df['MACD_signal'] = np.nan
-                else:
-                    logging.debug(f"MACD para {symbol} en {tf}: MACD={df['MACD'].iloc[-1]}, Signal={df['MACD_signal'].iloc[-1]}")
-
-            # Calcular ROC
-            if len(df) >= roc_length:
-                roc_series = ta.roc(df['close'], length=roc_length)
-                if roc_series is None or roc_series.isna().all():
-                    logging.warning(f"ROC no calculado para {symbol} en {tf}, asignando NaN")
-                    df['ROC'] = np.nan
-                else:
-                    df['ROC'] = roc_series.ffill().bfill()
-                    logging.debug(f"ROC para {symbol} en {tf}: {df['ROC'].iloc[-1]}")
             else:
-                logging.warning(f"Datos insuficientes para ROC (<{roc_length} velas) para {symbol} en {tf}")
+                df['MACD'] = df['MACD_signal'] = np.nan
+
+            if len(df) >= roc_length:
+                df['ROC'] = ta.roc(df['close'], length=5 if tf == '4h' else roc_length).ffill().bfill()
+            else:
                 df['ROC'] = np.nan
 
+            # Nuevos cálculos para '4h'
+            if tf == '4h':
+                if len(df) >= 7:
+                    df['SMA_7'] = ta.sma(df['close'], length=7)
+                    df['tendencia_alcista'] = df['close'] > df['SMA_7']
+                else:
+                    df['SMA_7'] = np.nan
+                    df['tendencia_alcista'] = False
+
+                if len(df) >= 10:
+                    last_10_volume = df['volume'].iloc[-10:]
+                    slope, _, _, _, _ = linregress(range(10), last_10_volume)
+                    df['volume_slope'] = slope
+                    df['volumen_creciente'] = slope > 0.01
+                else:
+                    df['volume_slope'] = np.nan
+                    df['volumen_creciente'] = False
+
             data[tf] = df
-            logging.debug(f"{symbol} en {tf}: DataFrame final con {len(df)} velas obtenido.")
 
         except Exception as e:
             logging.error(f"Error procesando {symbol} en {tf}: {e}")
-            continue  # Continúa con el siguiente timeframe
+            continue
 
     if not data:
-        last_ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=limit)
-        logging.error(f"No se obtuvieron datos válidos para {symbol} en ningún timeframe. Última respuesta OHLCV: {last_ohlcv[:2] if last_ohlcv else 'None'}")
+        logging.error(f"No se obtuvieron datos válidos para {symbol} en ningún timeframe")
         return None, None
 
-    # Verificar si hay suficientes datos para al menos un indicador útil
-    has_valid_data = any(
-        len(df) >= max(atr_length, rsi_length, bb_length, roc_length) and 
-        not df[['ATR', 'RSI', 'BB_upper', 'MACD', 'ROC']].isna().all().all() 
+    # Validar que haya al menos un indicador útil
+    has_valid_indicators = any(
+        not df[['RSI', 'ATR', 'MACD']].isna().all().all()
         for df in data.values()
     )
-    if not has_valid_data:
-        logging.warning(f"Datos insuficientes para indicadores en {symbol} a pesar de timeframes válidos")
+    if not has_valid_indicators:
+        logging.error(f"No hay indicadores válidos para {symbol}")
         return None, None
 
     # Seleccionar serie de precios preferida
-    logging.debug(f"Seleccionando serie de precios para {symbol}: se prefiere '1h'")
-    if '1h' in data and not data['1h'].empty:
-        price_series = data['1h']['close']
-    elif '4h' in data and not data['4h'].empty:
-        price_series = data['4h']['close']
-    elif '1d' in data and not data['1d'].empty:
-        price_series = data['1d']['close']
+    for tf in ['1h', '4h', '1d']:
+        if tf in data and not data[tf].empty:
+            price_series = data[tf]['close']
+            break
     else:
         logging.error(f"No se pudieron obtener series de precios para {symbol}")
         return None, None
 
-    if price_series.empty or price_series.isna().all():
-        logging.warning(f"Serie de precios vacía o inválida para {symbol} después de procesar timeframes")
-        return None, None
-
-    logging.debug(f"Datos finales para {symbol}: Último volumen={data[list(data.keys())[0]]['volume'].iloc[-1]}, Último precio={price_series.iloc[-1]}")
     return data, price_series
 
 def calculate_adx(df):
@@ -628,82 +537,71 @@ def sell_symbol(symbol, amount, trade_id):
         logging.error(f"Error al vender {symbol}: {e}")
 
 def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, indicators):
+    """
+    Implementa un trailing stop dinámico ajustado por volatilidad y proximidad al soporte.
+    
+    Args:
+        symbol: Símbolo del activo (e.g., 'BTC/USDT').
+        amount: Cantidad a vender.
+        purchase_price: Precio de compra.
+        trade_id: Identificador del trade.
+        indicators: Diccionario con indicadores como 'support_level'.
+    """
     def trailing_logic():
         try:
             highest_price = purchase_price
-            activated = False
             data, price_series = fetch_and_prepare_data(symbol)
-            if data is None:
-                logging.error(f"No data for trailing stop of {symbol}")
-                sell_symbol(symbol, amount, trade_id)
+            if data is None or price_series is None:
+                logging.error(f"No data para trailing stop de {symbol}, reintentando en 60s")
+                time.sleep(60)
                 return
-            
-            atr = data['1h']['ATR'].iloc[-1] if not pd.isna(data['1h']['ATR'].iloc[-1]) else 0
-            volatility = atr / purchase_price * 100 if purchase_price else 0
-            trailing_percent = max(1, min(5, volatility * 1.0))
-            stop_loss_percent = trailing_percent * 0.5
 
-            entry_msg = f"🔄 *Trailing Stop* `{symbol}`\nBuy: `{purchase_price}`\nTrailing: `{trailing_percent:.2f}%`\nStop Loss: `{stop_loss_percent:.2f}%`"
-            logging.info(entry_msg)
-            send_telegram_message(entry_msg)
+            atr = data['1h']['ATR'].iloc[-1] if 'ATR' in data['1h'] and not pd.isna(data['1h']['ATR'].iloc[-1]) else purchase_price * 0.02
+            volatility = atr / purchase_price * 100 if purchase_price > 0 else 2
+            support_level = indicators.get('support_level', None)
 
             while True:
                 current_price = fetch_price(symbol)
-                if not current_price:
-                    time.sleep(5)
+                if current_price is None:
+                    logging.warning(f"No se pudo obtener precio para {symbol}, reintentando en 60s")
+                    time.sleep(60)
                     continue
 
-                # Fetch updated data periodically (e.g., every 5 iterations)
-                data, price_series = fetch_and_prepare_data(symbol)
-                if data is None:
-                    continue
+                support_distance = (current_price - support_level) / support_level if support_level else float('inf')
+                if support_distance < 0.02:
+                    trailing_percent = max(1, min(3, volatility * 0.5))
+                else:
+                    trailing_percent = max(2, min(5, volatility * 1.5))
 
-                rsi = data['1h']['RSI'].iloc[-1] if 'RSI' in data['1h'] else None
-                divergence = detect_momentum_divergences(price_series[-10:], data['1h']['RSI'][-10:])
+                if current_price > highest_price:
+                    highest_price = current_price
+                trailing_stop_price = highest_price * (1 - trailing_percent / 100)
 
-                # New Sell Signal: RSI > 90 or Bearish Divergence
-                if rsi and rsi > 90:
+                logging.info(f"Trailing stop {symbol}: precio actual={current_price}, máximo={highest_price}, stop={trailing_stop_price}")
+
+                if current_price <= trailing_stop_price:
                     sell_symbol(symbol, amount, trade_id)
-                    logging.info(f"RSI > 90 triggered sell for {symbol} at {current_price}")
                     break
-                if divergence == "bearish":
-                    sell_symbol(symbol, amount, trade_id)
-                    logging.info(f"Bearish divergence triggered sell for {symbol} at {current_price}")
-                    break
+                time.sleep(60)
 
-                # Existing Trailing Stop Logic
-                if not activated and current_price < purchase_price * (1 - stop_loss_percent / 100):
-                    sell_symbol(symbol, amount, trade_id)
-                    logging.info(f"Stop loss hit for {symbol} at {current_price}")
-                    break
-
-                if current_price >= purchase_price * 1.01:
-                    activated = True
-
-                if activated:
-                    if current_price > highest_price:
-                        highest_price = current_price
-                    stop_price = highest_price * (1 - trailing_percent / 100)
-                    if current_price < stop_price:
-                        sell_symbol(symbol, amount, trade_id)
-                        logging.info(f"Trailing stop hit for {symbol} at {current_price}")
-                        break
-                time.sleep(5)
         except Exception as e:
-            logging.error(f"Error in trailing stop for {symbol}: {e}")
+            logging.error(f"Error en trailing stop para {symbol}: {e}")
             sell_symbol(symbol, amount, trade_id)
 
     threading.Thread(target=trailing_logic, daemon=True).start()
 
-def get_cached_decision(symbol, indicators):
-    if symbol in decision_cache:
-        cached_time, cached_decision, cached_indicators = decision_cache[symbol]
-        if time.time() - cached_time < CACHE_EXPIRATION:
-            if all(abs(indicators.get(key, 0) - cached_indicators.get(key, 0)) / (cached_indicators.get(key, 1) or 1) < 0.05 for key in indicators):
-                return cached_decision
-    return None
-
-def calculate_adaptive_strategy(indicators):
+def calculate_adaptive_strategy(indicators, data=None):
+    """
+    Calcula una estrategia adaptativa para comprar cerca de soportes con tendencia alcista.
+    
+    Args:
+        indicators: Diccionario con indicadores como 'rsi', 'roc', 'support_level', etc.
+        data: Diccionario opcional con DataFrames para timeframes '1h', '4h', '1d'.
+    
+    Returns:
+        tuple: (acción: str, confianza: int, motivo: str)
+    """
+    # Extraer indicadores
     rsi = indicators.get('rsi', None)
     relative_volume = indicators.get('relative_volume', None)
     roc = indicators.get('roc', None)
@@ -716,32 +614,61 @@ def calculate_adaptive_strategy(indicators):
     adx = indicators.get('adx', None)
     has_macd_crossover = indicators.get('has_macd_crossover', False)
 
+    # Calcular distancia al soporte
     support_distance = None
-    if support_level is not None and current_price > 0:
+    if support_level and current_price > 0:
         support_distance = (current_price - support_level) / support_level
-    support_near_threshold = 0.05
 
-    # Avoid ranging markets
-    if adx is not None and adx < 25:
-        return "mantener", 50, "Weak trend (ADX < 25), avoiding ranging market"
+    # Umbral de proximidad al soporte: 3%
+    support_near_threshold = 0.03
 
-    # Weighted Core Signals
+    # Evitar mercados sin tendencia (ADX < 25)
+    if adx is None or adx < 25:
+        return "mantener", 50, "Tendencia débil (ADX < 25), evitando mercado sin dirección"
+
+    # Confirmar tendencia alcista y volumen
+    roc_4h = None
+    tendencia_alcista = False
+    macd_4h = None
+    volumen_creciente = False
+
+    if data and '4h' in data and not data['4h'].empty:
+        roc_4h = data['4h']['ROC'].iloc[-1] if 'ROC' in data['4h'] and not pd.isna(data['4h']['ROC'].iloc[-1]) else None
+        tendencia_alcista = data['4h']['tendencia_alcista'].iloc[-1] if 'tendencia_alcista' in data['4h'] else False
+        macd_4h = data['4h']['MACD'].iloc[-1] if 'MACD' in data['4h'] and not pd.isna(data['4h']['MACD'].iloc[-1]) else None
+        volumen_creciente = data['4h']['volumen_creciente'].iloc[-1] if 'volumen_creciente' in data['4h'] else False
+    else:
+        logging.warning("Datos '4h' no disponibles, usando '1h' como fallback")
+        if '1h' in data and not data['1h'].empty:
+            roc_4h = data['1h']['ROC'].iloc[-1] if 'ROC' in data['1h'] else None
+            tendencia_alcista = data['1h']['close'].iloc[-1] > data['1h']['close'].mean() if 'close' in data['1h'] else False
+            macd_4h = data['1h']['MACD'].iloc[-1] if 'MACD' in data['1h'] else None
+            volumen_creciente = data['1h']['volume'].iloc[-1] > data['1h']['volume'].mean() if 'volume' in data['1h'] else False
+
+    # Condiciones obligatorias
+    if (roc_4h is None or roc_4h <= 0.5 or not tendencia_alcista or macd_4h <= 0 or not volumen_creciente):
+        return "mantener", 50, f"Tendencia alcista o volumen no confirmados (ROC: {roc_4h}, Tendencia: {tendencia_alcista}, MACD: {macd_4h}, Volumen: {volumen_creciente})"
+
+    # Verificar proximidad al soporte
+    if support_distance is None or support_distance > support_near_threshold:
+        return "mantener", 50, f"Lejos del soporte (distancia: {support_distance:.2%})"
+
+    # Puntuación ponderada de señales
     weighted_signals = [
-        3 * (short_volume_trend == "increasing"),  # High weight (3) for short-term volume trend
-        2 * (price_trend == "increasing"),        # Moderate weight (2) for price trend
-        2 * (relative_volume > 2.5 if relative_volume else False),  # Moderate weight (2) for volume
-        2 * (roc > 1.0 if roc else False),        # Moderate weight (2) for momentum
-        1 * (depth >= 5000),                      # Low weight (1) for liquidity
-        1 * (spread <= 0.005 * current_price),    # Low weight (1) for spread
-        1 * (support_distance is not None and support_distance <= support_near_threshold)  # Low weight (1) for support
+        3 * (short_volume_trend == "increasing"),
+        2 * (price_trend == "increasing"),
+        2 * (relative_volume > 1.5 if relative_volume else False),
+        2 * (roc > 1.0 if roc else False),
+        1 * (depth >= 5000),
+        1 * (spread <= 0.005 * current_price),
+        1 * (support_distance <= support_near_threshold)
     ]
-    signals_score = sum(weighted_signals)  # Total weighted score (max 11)
+    signals_score = sum(weighted_signals)
 
-    # Buy Condition with Minimum Weighted Score
-    if (rsi and rsi > 75 and signals_score >= 9 and adx > 35 and has_macd_crossover):
-        return "comprar", 90, f"Strong buy: RSI > 75, weighted score {signals_score}/11, ADX > 35, MACD crossover"
-    return "mantener", 50, f"Insufficient momentum or support proximity (score: {signals_score}/11)"
-
+    # Condición de compra
+    if (rsi and rsi > 70 and signals_score >= 9 and adx > 35 and has_macd_crossover):
+        return "comprar", 90, f"Compra fuerte: RSI > 70, puntaje {signals_score}/11, ADX > 35, cruce MACD, cerca del soporte"
+    return "mantener", 50, f"Condiciones insuficientes para comprar (puntaje: {signals_score}/11)"
 
 def fetch_ohlcv_with_retry(symbol, timeframe, limit=50, max_retries=3):
     for attempt in range(max_retries):
@@ -922,7 +849,8 @@ def demo_trading(high_volume_symbols=None):
             conditions_str = "\n".join([f"{key}: {'Sí' if value else 'No'}" for key, value in sorted(conditions.items())])
             logging.info(f"Condiciones evaluadas para {symbol}:\n{conditions_str}")
 
-            action, confidence, explanation = calculate_adaptive_strategy(indicators)
+            # Modificado: Pasar el diccionario 'data' a calculate_adaptive_strategy
+            action, confidence, explanation = calculate_adaptive_strategy(indicators, data=data)
             logging.info(f"Decisión inicial para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
 
             gpt_conditions = {
@@ -1099,6 +1027,7 @@ def analyze_trade_outcome(trade_id):
             temperature=0
         )
         raw_response = response.choices[0].message.content.strip()
+        send_telegram_message(raw_response)
         outcome = json.loads(raw_response)
         
         resultado = outcome.get("resultado", "desconocido").lower()
@@ -1209,7 +1138,7 @@ def gpt_decision_buy(prepared_text):
 
 # Note: The OpenAI Python client (openai) doesn't natively support a timeout parameter as of the latest versions.
 # If timeout issues persist, use a custom wrapper:
-import time
+
 def with_timeout(func, args, timeout_sec):
     start = time.time()
     result = [None]
