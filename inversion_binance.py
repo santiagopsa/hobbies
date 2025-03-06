@@ -817,7 +817,7 @@ def demo_trading(high_volume_symbols=None):
                 volume_trend = "increasing" if slope_volume > 0.01 else "decreasing" if slope_volume < -0.01 else "stable"
             if len(price_series) >= 10:
                 last_10_price = price_series[-10:]
-                slope_price, _, _, _, _ = linregress(range(10), last_10_price)
+                slope_price, _, _, _ = linregress(range(10), last_10_price)
                 price_trend = "increasing" if slope_price > 0.01 else "decreasing" if slope_price < -0.01 else "stable"
             support_level = detect_support_level(data, price_series, window=15, max_threshold_multiplier=3.0)
 
@@ -846,8 +846,12 @@ def demo_trading(high_volume_symbols=None):
                 "current_price": current_price
             }
 
-            conditions_str = "\n".join([f"{key}: {'Sí' if value else 'No'}" for key, value in sorted(conditions.items())])
+            conditions_str = "\n".join([f"{key}: {'Sí' if value is True else 'No' if value is False else 'Desconocido'}" for key, value in sorted(conditions.items())])
             logging.info(f"Condiciones evaluadas para {symbol}:\n{conditions_str}")
+
+            # Verificación de tipos en conditions
+            for key, value in conditions.items():
+                logging.debug(f"Condición {key} para {symbol}: valor={value}, tipo={type(value)}")
 
             # Modificado: Pasar el diccionario 'data' a calculate_adaptive_strategy
             action, confidence, explanation = calculate_adaptive_strategy(indicators, data=data)
