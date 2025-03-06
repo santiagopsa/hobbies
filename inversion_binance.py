@@ -1187,6 +1187,6 @@ def gpt_decision_buy(prepared_text):
         time.sleep(1)
 
 if __name__ == "__main__":
-    reset_daily_buys()
+    #reset_daily_buys()
     high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=100)
     demo_trading(high_volume_symbols)
