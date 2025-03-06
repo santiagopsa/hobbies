@@ -747,6 +747,9 @@ def fetch_ohlcv_with_retry(symbol, timeframe, limit=50, max_retries=3):
         time.sleep(2 ** attempt)  # Exponential backoff
     return None
 
+# Global lock for buy synchronization
+buy_lock = threading.Lock()
+
 def demo_trading(high_volume_symbols=None):
     logging.info("Iniciando trading en segundo plano para todos los activos USDT relevantes...")
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
@@ -807,7 +810,7 @@ def demo_trading(high_volume_symbols=None):
                 failed_conditions_count['order_book_available'] = failed_conditions_count.get('order_book_available', 0) + 1
                 continue
 
-            conditions['depth >= 5000'] = order_book_data['depth'] >= (50 if symbol in ['BTC/USDT', 'ETH/USDT'] else 5000)
+            conditions['depth >= 5000'] = order_book_data['depth'] >= 5000
             if not conditions['depth >= 5000']:
                 logging.info(f"Se omite {symbol} por profundidad insuficiente: {order_book_data['depth']}")
                 failed_conditions_count['depth >= 5000'] = failed_conditions_count.get('depth >= 5000', 0) + 1
@@ -934,39 +937,34 @@ def demo_trading(high_volume_symbols=None):
 
             logging.info(f"Decisión final para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
 
-            total_conditions = len(conditions)
-            passed_conditions = sum(1 for value in conditions.values() if value)
-            failed_conditions = [key for key, value in conditions.items() if not value]
-            failed_conditions_str = ", ".join(failed_conditions) if failed_conditions else "Ninguna"
-            logging.info(f"Resumen para {symbol}: Pasadas {passed_conditions} condiciones de {total_conditions}, no se cumplieron: {failed_conditions_str}")
-
             if action == "comprar" and confidence >= 70:
-                daily_buys = get_daily_buys()
-                if daily_buys >= MAX_DAILY_BUYS:
-                    logging.info(f"Límite diario de compras alcanzado, no se ejecuta compra para {symbol}.")
-                    return False
+                with buy_lock:  # Synchronize buy execution
+                    daily_buys = get_daily_buys()
+                    if daily_buys >= MAX_DAILY_BUYS:
+                        logging.info(f"Límite diario de compras alcanzado, no se ejecuta compra para {symbol}.")
+                        return False
 
-                # Dynamic sizing based on confidence and volatility
-                confidence_factor = confidence / 100
-                volatility_factor = min(1.5, (atr or 0.01 * current_price) / current_price * 100)  # Lower default to 1%
-                size_multiplier = confidence_factor * volatility_factor
-                adjusted_budget = budget_per_trade * size_multiplier
-                min_amount_for_notional = MIN_NOTIONAL / current_price
-                target_amount = max(adjusted_budget / current_price, min_amount_for_notional)
-                amount = min(target_amount, 0.10 * usdt_balance / current_price)
-                trade_value = amount * current_price
+                    # Dynamic sizing based on confidence and volatility
+                    confidence_factor = confidence / 100
+                    volatility_factor = min(2.0, (atr or 0.02 * current_price) / current_price * 100)
+                    size_multiplier = confidence_factor * volatility_factor
+                    adjusted_budget = budget_per_trade * size_multiplier
+                    min_amount_for_notional = MIN_NOTIONAL / current_price
+                    target_amount = max(adjusted_budget / current_price, min_amount_for_notional)
+                    amount = min(target_amount, 0.10 * usdt_balance / current_price)
+                    trade_value = amount * current_price
 
-                logging.info(f"Intentando compra para {symbol}: amount={amount}, trade_value={trade_value}, confidence={confidence}%, volatility_factor={volatility_factor:.2f}x")
-                if trade_value >= MIN_NOTIONAL or (trade_value < MIN_NOTIONAL and trade_value >= usdt_balance):
-                    order = execute_order_buy(symbol, amount, indicators, confidence)
-                    if order:
-                        logging.info(f"Compra ejecutada para {symbol}: {explanation}")
-                        send_telegram_message(f"✅ *Compra* `{symbol}`\nConfianza: `{confidence}%`\nCantidad: `{amount}`\nExplicación: `{explanation}`")
-                        dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], indicators)
+                    logging.info(f"Intentando compra para {symbol}: amount={amount}, trade_value={trade_value}, confidence={confidence}%, volatility_factor={volatility_factor:.2f}x")
+                    if trade_value >= MIN_NOTIONAL or (trade_value < MIN_NOTIONAL and trade_value >= usdt_balance):
+                        order = execute_order_buy(symbol, amount, indicators, confidence)
+                        if order:
+                            logging.info(f"Compra ejecutada para {symbol}: {explanation}")
+                            send_telegram_message(f"✅ *Compra* `{symbol}`\nConfianza: `{confidence}%`\nCantidad: `{amount}`\nExplicación: `{explanation}`")
+                            dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], indicators)
+                        else:
+                            logging.error(f"Error al ejecutar compra para {symbol}: orden no completada")
                     else:
-                        logging.error(f"Error al ejecutar compra para {symbol}: orden no completada")
-                else:
-                    logging.info(f"Compra no ejecutada para {symbol}: valor de la operación ({trade_value}) < MIN_NOTIONAL ({MIN_NOTIONAL}) y saldo insuficiente")
+                        logging.info(f"Compra no ejecutada para {symbol}: valor de la operación ({trade_value}) < MIN_NOTIONAL ({MIN_NOTIONAL}) y saldo insuficiente")
 
             for condition in failed_conditions:
                 failed_conditions_count[condition] = failed_conditions_count.get(condition, 0) + 1
@@ -1182,6 +1180,6 @@ def gpt_decision_buy(prepared_text):
         time.sleep(1)
 
 if __name__ == "__main__":
-    #reset_daily_buys()
+    reset_daily_buys()
     high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=100)
     demo_trading(high_volume_symbols)
