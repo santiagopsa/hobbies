@@ -1108,56 +1108,105 @@ def gpt_prepare_data(data, indicators):
 import asyncio
 
 def gpt_decision_buy(prepared_text):
-    prompt = f"""
-    Eres un experto en trading de criptomonedas de alto riesgo. Basándote en los datos para cualquier activo USDT en Binance:
-    {prepared_text}
-    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza activos con alta volatilidad, volumen creciente (>2.5), y momentum fuerte (ROC > 1.0), solo si están muy cerca de un nivel de soporte (distancia relativa al soporte <= 0.03) y short_volume_trend es 'increasing'. Acepta riesgos moderados solo si short_volume_trend es 'increasing', price_trend es 'increasing', y volumen relativo supera 2.5 significativamente. Responde SOLO con un JSON válido sin '''json''' asi:
-    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen creciente (>2.5), momentum fuerte (ROC > 1.0), short_volume_trend 'increasing', cerca de soporte (<=0.03), indican oportunidad de ganancia rápida"}}
-    Criterios:
-    - Compra si volumen relativo > 2.5, short_volume_trend es 'increasing', price_trend es 'increasing', ROC > 1.0, distancia relativa al soporte <= 0.03, profundidad > 5000, y spread < 0.5% del precio.
-    - Mantener si short_volume_trend no es 'increasing', volumen relativo < 2.5, price_trend es 'decreasing', ROC <= 1.0, o lejos del soporte (>0.03).
-    - Evalúa profundidad (>5000) y spread (<0.5% del precio) para garantizar liquidez.
-    - Ignora tendencias largas si short_volume_trend y volumen relativo indican momentum fuerte.
-    - Asigna confianza >80 solo si todas las condiciones principales (volumen, momentum, soporte, short_volume_trend) se cumplen.
     """
+    Consulta a GPT para decidir si comprar o mantener un activo USDT en Binance,
+    basándose en indicadores y datos preparados. Incluye manejo robusto de errores
+    y validación de condiciones clave.
+
+    Args:
+        prepared_text (str): Texto preparado con datos e indicadores del activo.
+
+    Returns:
+        tuple(str, int, str): (acción, confianza, explicación) donde
+        - acción: "comprar" o "mantener"
+        - confianza: entero entre 50 y 100
+        - explicación: cadena con la razón de la decisión
+    """
+    # Construir prompt con criterios claros y consistentes
+    prompt = f"""
+    Eres un experto en trading de criptomonedas de alto riesgo. Basándote en los datos para un activo USDT en Binance:
+    {prepared_text}
+    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Responde SOLO con un JSON válido sin '''json''' asi:
+    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen relativo > 2.5, short_volume_trend 'increasing', price_trend 'increasing', ROC > 1.0, distancia al soporte <= 0.03, indican oportunidad de ganancia rápida"}}
+    Criterios:
+    - Compra si: volumen relativo > 2.5, short_volume_trend es 'increasing', price_trend es 'increasing', ROC > 1.0, distancia relativa al soporte <= 0.03, profundidad > 5000, y spread <= 0.5% del precio (0.005 * precio).
+    - Mantener si: short_volume_trend no es 'increasing', volumen relativo <= 2.5, price_trend es 'decreasing', ROC <= 1.0, distancia relativa al soporte > 0.03, profundidad <= 5000, o spread > 0.5% del precio.
+    - Evalúa liquidez con profundidad (>5000) y spread (<=0.5% del precio).
+    - Asigna confianza >80 solo si todas las condiciones de compra se cumplen; usa 60-79 para riesgos moderados (al menos 3 condiciones); de lo contrario, usa 50.
+    - Ignora tendencias largas si short_volume_trend y volumen relativo indican momentum fuerte.
+    """
+
     max_retries = 2
-    timeout = 5  # 5-second timeout
+    timeout_sec = 5  # Tiempo de espera por intento
 
     for attempt in range(max_retries + 1):
         try:
-            # Use OpenAI client with timeout (synchronous)
-            response = client.chat.completions.create(
-                model=GPT_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                timeout=timeout  # Note: OpenAI client may not support timeout directly; use a wrapper if needed
+            # Usar wrapper personalizado para manejar timeout
+            response = with_timeout(
+                client.chat.completions.create,
+                args=({"model": GPT_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0},),
+                timeout_sec=timeout_sec
             )
             raw_response = response.choices[0].message.content.strip()
             decision = json.loads(raw_response)
-            
+
+            # Validar y extraer valores
             accion = decision.get("accion", "mantener").lower()
             confianza = decision.get("confianza", 50)
             explicacion = decision.get("explicacion", "Respuesta incompleta")
 
+            # Validar tipos y rangos
             if accion not in ["comprar", "mantener"]:
                 accion = "mantener"
-            if not isinstance(confianza, (int, float)) or not 80 <= confianza <= 100:
+            if not isinstance(confianza, (int, float)) or confianza < 50 or confianza > 100:
                 confianza = 50
-                explicacion = "Confianza inválida o insuficiente, ajustada a 50"
+                explicacion = "Confianza fuera de rango, ajustada a 50"
 
-            # Validate key conditions from prepared_text if possible
-            if "short_volume_trend" in prepared_text and "increasing" not in prepared_text:
-                return "mantener", 50, "Short volume trend not increasing, overriding GPT"
-            if "relative_volume" in prepared_text and float(prepared_text.split("Volumen relativo: ")[1].split("\n")[0]) <= 2.5:
-                return "mantener", 50, "Relative volume too low, overriding GPT"
+            # Validar condiciones clave desde prepared_text (método más robusto)
+            try:
+                if "short_volume_trend" in prepared_text and "increasing" not in prepared_text.lower():
+                    return "mantener", 50, "Short volume trend not increasing, overriding GPT"
+                if "relative_volume" in prepared_text:
+                    rel_vol_str = prepared_text.split("Volumen relativo: ")[1].split("\n")[0]
+                    relative_volume = float(rel_vol_str) if rel_vol_str.replace('.', '').replace('-', '').isdigit() else 0
+                    if relative_volume <= 2.5:
+                        return "mantener", 50, "Relative volume too low (<= 2.5), overriding GPT"
+                if "price_trend" in prepared_text and "increasing" not in prepared_text.lower():
+                    return "mantener", 50, "Price trend not increasing, overriding GPT"
+                if "ROC" in prepared_text:
+                    roc_str = prepared_text.split("ROC: ")[1].split("\n")[0]
+                    roc = float(roc_str) if roc_str.replace('.', '').replace('-', '').isdigit() else 0
+                    if roc <= 1.0:
+                        return "mantener", 50, "ROC too low (<= 1.0), overriding GPT"
+                if "distancia relativa al soporte" in prepared_text.lower():
+                    dist_str = prepared_text.split("distancia relativa al soporte: ")[1].split("\n")[0] if "distancia relativa al soporte: " in prepared_text.lower() else "1.0"
+                    support_distance = float(dist_str) if dist_str.replace('.', '').replace('-', '').isdigit() else 1.0
+                    if support_distance > 0.03:
+                        return "mantener", 50, "Far from support (> 0.03), overriding GPT"
+                if "profundidad" in prepared_text:
+                    depth_str = prepared_text.split("Profundidad del libro: ")[1].split("\n")[0]
+                    depth = float(depth_str) if depth_str.replace('.', '').replace('-', '').isdigit() else 0
+                    if depth <= 5000:
+                        return "mantener", 50, "Depth too low (<= 5000), overriding GPT"
+                if "spread" in prepared_text:
+                    spread_str = prepared_text.split("Spread: ")[1].split("\n")[0]
+                    spread = float(spread_str) if spread_str.replace('.', '').replace('-', '').isdigit() else float('inf')
+                    current_price_str = prepared_text.split("Precio actual: ")[1].split("\n")[0]
+                    current_price = float(current_price_str) if current_price_str.replace('.', '').replace('-', '').isdigit() else 1
+                    if spread > 0.005 * current_price:
+                        return "mantener", 50, "Spread too high (> 0.5% of price), overriding GPT"
+            except (ValueError, IndexError) as e:
+                logging.warning(f"Error al validar condiciones en prepared_text: {e}, usando decisión predeterminada")
+                return "mantener", 50, "Error en validación de condiciones, manteniendo por seguridad"
 
             return accion, confianza, explicacion
+
         except json.JSONDecodeError as e:
             logging.error(f"Intento {attempt + 1} fallido: Respuesta de GPT no es JSON válido - {raw_response}")
             if attempt == max_retries:
                 return "mantener", 50, f"Error en formato JSON tras {max_retries + 1} intentos"
         except requests.Timeout:
-            logging.error(f"Intento {attempt + 1} fallido: Timeout de {timeout} segundos en GPT")
+            logging.error(f"Intento {attempt + 1} fallido: Timeout de {timeout_sec} segundos en GPT")
             if attempt == max_retries:
                 return "mantener", 50, f"Timeout tras {max_retries + 1} intentos"
         except Exception as e:
