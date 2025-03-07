@@ -635,7 +635,7 @@ def calculate_adaptive_strategy(indicators, data=None):
             macd_4h = data['1h']['MACD'].iloc[-1] if 'MACD' in data['1h'] else None
             volumen_creciente = data['1h']['volume'].iloc[-1] > data['1h']['volume'].mean() if 'volume' in data['1h'] else False
 
-    # Condiciones obligatorias
+    # Condiciones obligatorias mínimas
     if (roc_4h is None or roc_4h <= 0.5 or not tendencia_alcista or macd_4h <= 0 or not volumen_creciente):
         return "mantener", 50, f"Tendencia alcista o volumen no confirmados (ROC: {roc_4h}, Tendencia: {tendencia_alcista}, MACD: {macd_4h}, Volumen: {volumen_creciente})"
 
@@ -645,29 +645,32 @@ def calculate_adaptive_strategy(indicators, data=None):
     if support_distance > support_near_threshold:
         return "mantener", 50, f"Lejos del soporte (distancia: {support_distance:.2%})"
 
-    # Puntuación ponderada de señales
+    # Puntuación ponderada priorizando volumen relativo alto
     weighted_signals = [
+        4 * (relative_volume > 3.0 if relative_volume else False),  # Prioridad alta para volumen fuerte
         3 * (short_volume_trend == "increasing"),
         2 * (price_trend == "increasing"),
-        2 * (relative_volume > 1.5 if relative_volume else False),
         2 * (roc > 1.0 if roc else False),
         1 * (depth >= 5000),
         1 * (spread <= 0.005 * current_price),
-        1 * (support_distance <= support_near_threshold)
+        1 * (support_distance <= support_near_threshold),
+        2 * (rsi > 70 if rsi else False) if rsi else 0  # Bono opcional por RSI > 70
     ]
     signals_score = sum(weighted_signals)
 
     # Ajuste de confianza basado en MACD crossover (opcional)
     base_confidence = 50
-    if signals_score >= 9 and rsi and rsi > 70 and adx and adx > 35:
-        base_confidence = 70  # Condiciones base para compra
+    if signals_score >= 10 and adx and adx > 25:  # Umbral más bajo con volumen fuerte
+        base_confidence = 70  # Compra si volumen y soporte son fuertes
         if has_macd_crossover:
             base_confidence = 90  # Bono por cruce MACD
+        elif rsi and rsi > 70:
+            base_confidence = 85  # Bono por RSI > 70
 
     # Explicación y decisión
     if base_confidence >= 70:
-        return "comprar", base_confidence, f"Compra fuerte: RSI > 70, puntaje {signals_score}/11, ADX > 35, {'con cruce MACD' if has_macd_crossover else 'sin cruce MACD'}, cerca del soporte"
-    return "mantener", 50, f"Condiciones insuficientes para comprar (puntaje: {signals_score}/11)"
+        return "comprar", base_confidence, f"Compra fuerte: Volumen relativo > 3.0, puntaje {signals_score}/14, ADX > 25, {'con cruce MACD' if has_macd_crossover else 'sin cruce MACD'}, cerca del soporte{' y RSI > 70' if rsi and rsi > 70 else ''}"
+    return "mantener", 50, f"Condiciones insuficientes para comprar (puntaje: {signals_score}/14)"
 
 def fetch_ohlcv_with_retry(symbol, timeframe, limit=50, max_retries=3):
     for attempt in range(max_retries):
@@ -1117,8 +1120,7 @@ import asyncio
 def gpt_decision_buy(prepared_text):
     """
     Consulta a GPT para decidir si comprar o mantener un activo USDT en Binance,
-    basándose en indicadores y datos preparados. Incluye manejo robusto de errores
-    y validación de condiciones clave.
+    basándose en indicadores y datos preparados. Prioriza volumen fuerte y soporte.
 
     Args:
         prepared_text (str): Texto preparado con datos e indicadores del activo.
@@ -1133,13 +1135,13 @@ def gpt_decision_buy(prepared_text):
     prompt = f"""
     Eres un experto en trading de criptomonedas de alto riesgo. Basándote en los datos para un activo USDT en Binance:
     {prepared_text}
-    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Responde SOLO con un JSON válido sin '''json''' asi:
-    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen relativo > 1.5, short_volume_trend 'increasing', price_trend 'increasing', ROC > 1.0, distancia al soporte <= 0.03, indican oportunidad de ganancia rápida"}}
+    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza tendencias fuertes con volumen relativo alto (> 3.0) y proximidad al soporte. Responde SOLO con un JSON válido sin '''json''' asi:
+    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen relativo > 3.0, short_volume_trend 'increasing', price_trend 'increasing', distancia al soporte <= 0.03, indican oportunidad de ganancia rápida"}}
     Criterios:
-    - Compra si: volumen relativo > 1.5, short_volume_trend es 'increasing', price_trend es 'increasing', ROC > 1.0, distancia relativa al soporte <= 0.03, profundidad > 5000, y spread <= 0.5% del precio (0.005 * precio).
-    - Mantener si: short_volume_trend no es 'increasing', volumen relativo <= 1.5, price_trend es 'decreasing', ROC <= 1.0, distancia relativa al soporte > 0.03, profundidad <= 5000, o spread > 0.5% del precio.
+    - Compra si: volumen relativo > 3.0, short_volume_trend es 'increasing', price_trend es 'increasing', distancia relativa al soporte <= 0.03, profundidad > 5000, y spread <= 0.5% del precio (0.005 * precio). RSI > 70 es un bono, no un requisito.
+    - Mantener si: volumen relativo <= 3.0, short_volume_trend no es 'increasing', price_trend es 'decreasing', distancia relativa al soporte > 0.03, profundidad <= 5000, o spread > 0.5% del precio.
     - Evalúa liquidez con profundidad (>5000) y spread (<=0.5% del precio).
-    - Asigna confianza >80 solo si todas las condiciones de compra se cumplen; usa 60-79 para riesgos moderados (al menos 3 condiciones); de lo contrario, usa 50.
+    - Asigna confianza >80 solo si volumen relativo > 3.0, soporte cercano, y al menos 3 condiciones se cumplen; usa 60-79 para riesgos moderados (al menos 2 condiciones); de lo contrario, usa 50.
     - Ignora el cruce MACD como requisito; prioriza momentum y soporte.
     """
 
@@ -1180,15 +1182,10 @@ def gpt_decision_buy(prepared_text):
                 if "relative_volume" in prepared_text:
                     rel_vol_str = prepared_text.split("Volumen relativo: ")[1].split("\n")[0]
                     relative_volume = float(rel_vol_str) if rel_vol_str.replace('.', '').replace('-', '').isdigit() else 0
-                    if relative_volume <= 1.5:
-                        return "mantener", 50, "Relative volume too low (<= 1.5), overriding GPT"
+                    if relative_volume <= 3.0:
+                        return "mantener", 50, "Relative volume too low (<= 3.0), overriding GPT"
                 if "price_trend" in prepared_text and "increasing" not in prepared_text.lower():
                     return "mantener", 50, "Price trend not increasing, overriding GPT"
-                if "ROC" in prepared_text:
-                    roc_str = prepared_text.split("ROC: ")[1].split("\n")[0]
-                    roc = float(roc_str) if roc_str.replace('.', '').replace('-', '').isdigit() else 0
-                    if roc <= 1.0:
-                        return "mantener", 50, "ROC too low (<= 1.0), overriding GPT"
                 if "distancia relativa al soporte" in prepared_text.lower():
                     dist_str = prepared_text.split("distancia relativa al soporte: ")[1].split("\n")[0] if "distancia relativa al soporte: " in prepared_text.lower() else "1.0"
                     support_distance = float(dist_str) if dist_str.replace('.', '').replace('-', '').isdigit() else 1.0
