@@ -610,7 +610,7 @@ def calculate_adaptive_strategy(indicators, data=None):
         support_distance = (current_price - support_level) / support_level
 
     # Umbral de proximidad al soporte: 3%
-    support_near_threshold = 0.05
+    support_near_threshold = 0.07
 
     # Evitar mercados sin tendencia (ADX < 25)
     if adx is None or adx < 25:
@@ -748,7 +748,7 @@ def demo_trading(high_volume_symbols=None):
                     failed_conditions_count['order_book_available'] = failed_conditions_count.get('order_book_available', 0) + 1
                     continue
 
-                conditions['depth >= 5000'] = order_book_data['depth'] >= 5000
+                conditions['depth >= 5000'] = order_book_data['depth'] >= 3000
                 if not conditions['depth >= 5000']:
                     logging.info(f"Se omite {symbol} por profundidad insuficiente: {order_book_data['depth']}")
                     failed_conditions_count['depth >= 5000'] = failed_conditions_count.get('depth >= 5000', 0) + 1
@@ -1135,13 +1135,13 @@ def gpt_decision_buy(prepared_text):
     prompt = f"""
     Eres un experto en trading de criptomonedas de alto riesgo. Basándote en los datos para un activo USDT en Binance:
     {prepared_text}
-    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza tendencias fuertes con volumen relativo alto (> 3.0) y proximidad al soporte. Responde SOLO con un JSON válido sin '''json''' asi:
-    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen relativo > 3.0, short_volume_trend 'increasing', price_trend 'increasing', distancia al soporte <= 0.03, indican oportunidad de ganancia rápida"}}
+    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza tendencias fuertes con volumen relativo alto (> 3.0) y proximidad al soporte (<= 0.07). Responde SOLO con un JSON válido sin '''json''' asi:
+    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen relativo > 3.0, short_volume_trend 'increasing', price_trend 'increasing', distancia al soporte <= 0.07, indican oportunidad de ganancia rápida"}}
     Criterios:
-    - Compra si: volumen relativo > 3.0, short_volume_trend es 'increasing', price_trend es 'increasing', distancia relativa al soporte <= 0.03, profundidad > 5000, y spread <= 0.5% del precio (0.005 * precio). RSI > 70 es un bono, no un requisito.
-    - Mantener si: volumen relativo <= 3.0, short_volume_trend no es 'increasing', price_trend es 'decreasing', distancia relativa al soporte > 0.03, profundidad <= 5000, o spread > 0.5% del precio.
-    - Evalúa liquidez con profundidad (>5000) y spread (<=0.5% del precio).
-    - Asigna confianza >80 solo si volumen relativo > 3.0, soporte cercano, y al menos 3 condiciones se cumplen; usa 60-79 para riesgos moderados (al menos 2 condiciones); de lo contrario, usa 50.
+    - Compra si: volumen relativo > 3.0, short_volume_trend es 'increasing', price_trend es 'increasing', distancia relativa al soporte <= 0.07, profundidad > 3000, y spread <= 0.5% del precio (0.005 * precio). RSI > 70 es un bono, no un requisito.
+    - Mantener si: volumen relativo <= 3.0, short_volume_trend no es 'increasing', price_trend es 'decreasing', distancia relativa al soporte > 0.07, profundidad <= 3000, o spread > 0.5% del precio.
+    - Evalúa liquidez con profundidad (>3000) y spread (<=0.5% del precio).
+    - Asigna confianza >80 solo si volumen relativo > 3.0, soporte cercano (<= 0.07), y al menos 3 condiciones se cumplen; usa 60-79 para riesgos moderados (al menos 2 condiciones); de lo contrario, usa 50. Suma 10 a la confianza si RSI > 70.
     - Ignora el cruce MACD como requisito; prioriza momentum y soporte.
     """
 
@@ -1189,13 +1189,13 @@ def gpt_decision_buy(prepared_text):
                 if "distancia relativa al soporte" in prepared_text.lower():
                     dist_str = prepared_text.split("distancia relativa al soporte: ")[1].split("\n")[0] if "distancia relativa al soporte: " in prepared_text.lower() else "1.0"
                     support_distance = float(dist_str) if dist_str.replace('.', '').replace('-', '').isdigit() else 1.0
-                    if support_distance > 0.03:
-                        return "mantener", 50, "Far from support (> 0.03), overriding GPT"
+                    if support_distance > 0.07:
+                        return "mantener", 50, "Far from support (> 0.07), overriding GPT"
                 if "profundidad" in prepared_text:
                     depth_str = prepared_text.split("Profundidad del libro: ")[1].split("\n")[0]
                     depth = float(depth_str) if depth_str.replace('.', '').replace('-', '').isdigit() else 0
-                    if depth <= 5000:
-                        return "mantener", 50, "Depth too low (<= 5000), overriding GPT"
+                    if depth <= 3000:
+                        return "mantener", 50, "Depth too low (<= 3000), overriding GPT"
                 if "spread" in prepared_text:
                     spread_str = prepared_text.split("Spread: ")[1].split("\n")[0]
                     spread = float(spread_str) if spread_str.replace('.', '').replace('-', '').isdigit() else float('inf')
