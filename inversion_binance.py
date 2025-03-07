@@ -610,7 +610,7 @@ def calculate_adaptive_strategy(indicators, data=None):
         support_distance = (current_price - support_level) / support_level
 
     # Umbral de proximidad al soporte: 3%
-    support_near_threshold = 0.03
+    support_near_threshold = 0.05
 
     # Evitar mercados sin tendencia (ADX < 25)
     if adx is None or adx < 25:
