@@ -1144,7 +1144,11 @@ def gpt_decision_buy(prepared_text):
             # Usar wrapper personalizado para manejar timeout
             response = with_timeout(
                 client.chat.completions.create,
-                args=({"model": GPT_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0},),
+                kwargs={
+                    "model": GPT_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0
+                },
                 timeout_sec=timeout_sec
             )
             raw_response = response.choices[0].message.content.strip()
@@ -1215,14 +1219,25 @@ def gpt_decision_buy(prepared_text):
                 return "mantener", 50, "Error al procesar respuesta de GPT"
         time.sleep(2 ** attempt)  # Exponential backoff
 
-# Note: The OpenAI Python client (openai) doesn't natively support a timeout parameter as of the latest versions.
-# If timeout issues persist, use a custom wrapper:
+def with_timeout(func, kwargs, timeout_sec):
+    """
+    Ejecuta una función con un tiempo de espera definido usando un hilo.
 
-def with_timeout(func, args, timeout_sec):
+    Args:
+        func: La función a ejecutar.
+        kwargs: Diccionario de argumentos de la función.
+        timeout_sec: Tiempo de espera en segundos.
+
+    Returns:
+        El resultado de la función o None si falla por timeout.
+
+    Raises:
+        requests.Timeout: Si la función no termina dentro del tiempo de espera.
+    """
     start = time.time()
     result = [None]
     def target():
-        result[0] = func(*args)
+        result[0] = func(**kwargs)
     thread = threading.Thread(target=target)
     thread.start()
     thread.join(timeout_sec)
