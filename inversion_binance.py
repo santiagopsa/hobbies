@@ -452,6 +452,7 @@ def execute_order_buy(symbol, amount, indicators, confidence):
         executed_amount = order.get("filled", amount)
         if price is None:
             logging.error(f"No se pudo obtener precio para {symbol} después de la orden")
+            send_telegram_message(f"❌ *Error en Compra* `{symbol}`\nNo se obtuvo precio tras la orden.")
             return None
         timestamp = datetime.now(timezone.utc).isoformat()
         trade_id = f"{symbol}_{timestamp.replace(':', '-')}"
@@ -479,9 +480,11 @@ def execute_order_buy(symbol, amount, indicators, confidence):
         conn.close()
         
         logging.info(f"Compra ejecutada: {symbol} a {price} por {executed_amount} (ID: {trade_id})")
+        send_telegram_message(f"✅ *Compra* `{symbol}`\nPrecio: `{price}`\nCantidad: `{executed_amount}`\nConfianza: `{confidence}%`")
         return {"price": price, "filled": executed_amount, "trade_id": trade_id, "indicators": indicators}
     except Exception as e:
         logging.error(f"Error al ejecutar orden de compra para {symbol}: {e}")
+        send_telegram_message(f"❌ *Fallo en Compra* `{symbol}`\nError: `{str(e)}`\nCantidad intentada: `{amount}`")
         return None
 
 def sell_symbol(symbol, amount, trade_id):
@@ -1249,7 +1252,29 @@ def with_timeout(func, kwargs, timeout_sec):
         raise requests.Timeout(f"Function timed out after {timeout_sec} seconds")
     return result[0]
 
+def send_periodic_summary():
+    while True:
+        try:
+            with open("trading_real.log", "r") as log_file:
+                lines = log_file.readlines()[-100:]  # Últimas 100 líneas para no cargar demasiado
+                buys_attempted = sum(1 for line in lines if "Intentando compra para" in line)
+                buys_executed = sum(1 for line in lines if "Compra ejecutada para" in line)
+                errors = sum(1 for line in lines if "Error" in line)
+                symbols = set(line.split("para ")[1].split(":")[0] for line in lines if "Procesando" in line)
+
+            message = (f"📈 *Resumen del Bot* ({get_colombia_timestamp()})\n"
+                      f"Compras intentadas: `{buys_attempted}`\n"
+                      f"Compras ejecutadas: `{buys_executed}`\n"
+                      f"Errores recientes: `{errors}`\n"
+                      f"Símbolos evaluados: `{len(symbols)}` (e.g., {', '.join(list(symbols)[:3])}...)")
+            send_telegram_message(message)
+        except Exception as e:
+            logging.error(f"Error en resumen periódico: {e}")
+            send_telegram_message(f"⚠️ *Error en Resumen* `{str(e)}`")
+        time.sleep(3600)  # Cada hora
+
+# Iniciar el hilo al final de if __name__ == "__main__":
 if __name__ == "__main__":
-    
     high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=100)
+    threading.Thread(target=send_periodic_summary, daemon=True).start()
     demo_trading(high_volume_symbols)
