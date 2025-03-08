@@ -174,14 +174,39 @@ def detect_support_level(data, price_series, window=15, max_threshold_multiplier
     logging.debug(f"Soporte detectado: precio={current_price}, soporte={support_level}, umbral={threshold:.3f}")
     return support_level if current_price <= support_level * threshold else None
 
-def calculate_short_volume_trend(volume_series, window=3):
-    if len(volume_series) < window:
+def calculate_short_volume_trend(data, window=3):
+    """
+    Calcula la tendencia de volumen corto usando exclusivamente el timeframe de 15m.
+    
+    Args:
+        data: Diccionario con DataFrames para diferentes timeframes.
+        window: Número de velas a considerar (default 3).
+        
+    Returns:
+        str: "increasing", "decreasing", "stable", o "insufficient_data".
+    """
+    # Usar exclusivamente el timeframe de 15m
+    if '15m' not in data or data['15m'].empty or len(data['15m']) < window:
+        logging.warning("Datos de 15m no disponibles o insuficientes para calcular short_volume_trend")
         return "insufficient_data"
+
+    volume_series = data['15m']['volume']
+    
+    if len(volume_series) < window:
+        logging.warning(f"Series de volumen 15m demasiado corta: {len(volume_series)} < {window}")
+        return "insufficient_data"
+    
     last_volume = volume_series.iloc[-1]
-    avg_volume = volume_series[-window:].mean()
-    if last_volume > avg_volume * 1.05:  # Ajustado de 1.1 a 1.05 (5% superior)
+    avg_volume = volume_series[-window:-1].mean()  # Promedio de las 3 velas anteriores (excluyendo la actual)
+    
+    if avg_volume == 0:  # Evitar división por cero
+        logging.warning("Promedio de volumen es 0, no se puede calcular short_volume_trend")
+        return "insufficient_data"
+    
+    # Aumentar el umbral a 10% para ser más conservador en 15m
+    if last_volume > avg_volume * 1.10:  # Aumentado de 1.05 a 1.10
         return "increasing"
-    elif last_volume < avg_volume * 0.95:  # Ajustado de 0.9 a 0.95 (5% inferior)
+    elif last_volume < avg_volume * 0.90:  # Ajustado de 0.95 a 0.90
         return "decreasing"
     else:
         return "stable"
@@ -258,7 +283,7 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
           - La serie de precios de cierre preferida (prioridad '1h', luego '4h', luego '1d').
           Si no hay datos válidos, retorna (None, None).
     """
-    timeframes = ['1h', '4h', '1d']
+    timeframes = ['15m', '1h', '4h', '1d']  # Añadimos 15m como prioridad
     data = {}
     logging.debug(f"Inicio de fetch_and_prepare_data para {symbol}")
 
@@ -282,11 +307,11 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
                 continue
 
             # Rellenar gaps en el índice con límite del 10%
-            expected_freq = pd.Timedelta('1h') if tf == '1h' else pd.Timedelta('4h') if tf == '4h' else pd.Timedelta('1d')
+            expected_freq = pd.Timedelta('15m') if tf == '15m' else pd.Timedelta('1h') if tf == '1h' else pd.Timedelta('4h') if tf == '4h' else pd.Timedelta('1d')
             expected_index = pd.date_range(start=df.index[0], end=df.index[-1], freq=expected_freq)
             if len(expected_index) > len(df.index):
                 gap_ratio = (len(expected_index) - len(df.index)) / len(expected_index)
-                if gap_ratio > 0.1:  # Más del 10% de datos faltantes
+                if gap_ratio > 0.1:
                     logging.error(f"Demasiados gaps en {symbol} en {tf} (ratio: {gap_ratio:.2f}), omitiendo timeframe")
                     continue
                 df = df.reindex(expected_index, method='ffill').dropna(how='all')
@@ -372,7 +397,7 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
         return None, None
 
     # Seleccionar serie de precios preferida
-    for tf in ['1h', '4h', '1d']:
+    for tf in ['1h', '4h', '1d']:  # No usamos 15m para precio, solo para volumen
         if tf in data and not data[tf].empty:
             price_series = data[tf]['close']
             break
@@ -813,7 +838,7 @@ def demo_trading(high_volume_symbols=None):
                     df_slice['MACD_signal'] if 'MACD_signal' in df_slice else pd.Series(),
                     lookback=5
                 )
-                short_volume_trend = calculate_short_volume_trend(volume_series) if len(volume_series) >= 3 else "insufficient_data"
+                short_volume_trend = calculate_short_volume_trend(data) if data else "insufficient_data"
                 volume_trend = "insufficient_data"
                 price_trend = "insufficient_data"
 
