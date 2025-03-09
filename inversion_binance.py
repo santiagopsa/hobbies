@@ -211,7 +211,7 @@ def calculate_short_volume_trend(data, window=3):
     else:
         return "stable"
 
-def fetch_order_book_data(symbol, limit=10):
+def fetch_order_book_data(symbol, limit=20):
     try:
         order_book = exchange.fetch_order_book(symbol, limit=limit)
         bids = order_book['bids']
@@ -265,7 +265,7 @@ def fetch_volume(symbol):
 
 def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, roc_length=7, limit=50):
     """
-    Obtiene datos OHLCV para los timeframes '1h', '4h' y '1d' y calcula indicadores usando
+    Obtiene datos OHLCV para los timeframes '15m', '1h', '4h' y '1d' y calcula indicadores usando
     un número reducido de velas para ATR, RSI, Bollinger Bands y ROC, de modo que se pueda operar
     con el histórico limitado que permite la API de Binance.
 
@@ -279,11 +279,11 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
 
     Returns:
         tuple(dict, pd.Series): 
-          - Un diccionario con DataFrames para cada timeframe ('1h', '4h', '1d').
-          - La serie de precios de cierre preferida (prioridad '1h', luego '4h', luego '1d').
+          - Un diccionario con DataFrames para cada timeframe ('15m', '1h', '4h', '1d').
+          - La serie de precios de cierre preferida (prioridad '15m', luego '1h', '4h', '1d').
           Si no hay datos válidos, retorna (None, None).
     """
-    timeframes = ['15m', '1h', '4h', '1d']  # Añadimos 15m como prioridad
+    timeframes = ['15m', '1h', '4h', '1d']  # 15m ya está incluido
     data = {}
     logging.debug(f"Inicio de fetch_and_prepare_data para {symbol}")
 
@@ -396,10 +396,11 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
         logging.error(f"No hay indicadores válidos para {symbol}")
         return None, None
 
-    # Seleccionar serie de precios preferida
-    for tf in ['1h', '4h', '1d']:  # No usamos 15m para precio, solo para volumen
+    # Seleccionar serie de precios preferida para soporte (priorizar 15m)
+    for tf in ['15m', '1h', '4h', '1d']:
         if tf in data and not data[tf].empty:
             price_series = data[tf]['close']
+            logging.debug(f"Seleccionada serie de precios para soporte: {tf} con {len(price_series)} velas")
             break
     else:
         logging.error(f"No se pudieron obtener series de precios para {symbol}")
@@ -637,8 +638,8 @@ def calculate_adaptive_strategy(indicators, data=None):
     if support_level is not None and current_price > 0:
         support_distance = (current_price - support_level) / support_level
 
-    # Umbral de proximidad al soporte: 3%
-    support_near_threshold = 0.07
+    # Aumentar el umbral de proximidad al soporte a 15%
+    support_near_threshold = 0.15  # Confirmed as 15%
 
     # Evitar mercados sin tendencia (ADX < 25)
     if adx is None or adx < 25:
@@ -670,19 +671,19 @@ def calculate_adaptive_strategy(indicators, data=None):
     # Verificar proximidad al soporte
     if support_distance is None:
         return "mantener", 50, "No se pudo calcular la distancia al soporte (soporte no detectado o precio inválido)"
-    if support_distance > support_near_threshold:
+    if support_distance > support_near_threshold:  # 15% threshold
         return "mantener", 50, f"Lejos del soporte (distancia: {support_distance:.2%})"
 
     # Puntuación ponderada priorizando volumen relativo alto
     weighted_signals = [
-        4 * (relative_volume > 3.0 if relative_volume else False),  # Prioridad alta para volumen fuerte
+        4 * (relative_volume > 3.0 if relative_volume else False),
         3 * (short_volume_trend == "increasing"),
         2 * (price_trend == "increasing"),
         2 * (roc > 1.0 if roc else False),
         1 * (depth >= 5000),
         1 * (spread <= 0.005 * current_price),
         1 * (support_distance <= support_near_threshold),
-        2 * (rsi > 70 if rsi else False) if rsi else 0  # Bono opcional por RSI > 70
+        2 * (rsi > 70 if rsi else False) if rsi else 0
     ]
     signals_score = sum(weighted_signals)
 
@@ -734,7 +735,7 @@ def demo_trading(high_volume_symbols=None):
         return False
 
     if high_volume_symbols is None:
-        high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=100)
+        high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=300)
 
     budget_per_trade = available_for_trading / (MAX_DAILY_BUYS - daily_buys) if (MAX_DAILY_BUYS - daily_buys) > 0 else available_for_trading
     selected_cryptos = high_volume_symbols
@@ -804,22 +805,20 @@ def demo_trading(high_volume_symbols=None):
                     failed_conditions_count['spread <= 0.005 * price'] = failed_conditions_count.get('spread <= 0.005 * price', 0) + 1
                     continue
 
-                conditions['imbalance >= 1.0'] = imbalance >= 1.0
-                if not conditions['imbalance >= 1.0']:
+                conditions['imbalance >= 1.5'] = imbalance >= 1.5 if imbalance is not None else False  # Added None check for safety
+                if not conditions['imbalance >= 1.5']:
                     logging.info(f"Se omite {symbol} por imbalance bajo: {imbalance}")
-                    failed_conditions_count['imbalance >= 1.0'] = failed_conditions_count.get('imbalance >= 1.0', 0) + 1
+                    failed_conditions_count['imbalance >= 1.5'] = failed_conditions_count.get('imbalance >= 1.5', 0) + 1
                     continue
 
                 data, price_series = fetch_and_prepare_data(symbol)
-                conditions['data_available'] = data is not None and price_series is not None
-                if not conditions['data_available']:
+                if data is None or price_series is None:
                     logging.warning(f"Se omite {symbol} por datos insuficientes")
                     failed_conditions_count['data_available'] = failed_conditions_count.get('data_available', 0) + 1
                     continue
 
                 df_slice = data.get('1h', data.get('4h', data.get('1d')))
-                conditions['timeframe_available'] = not df_slice.empty
-                if not conditions['timeframe_available']:
+                if df_slice.empty:
                     logging.warning(f"No hay datos válidos en ningún timeframe para {symbol}")
                     failed_conditions_count['timeframe_available'] = failed_conditions_count.get('timeframe_available', 0) + 1
                     continue
@@ -1159,17 +1158,17 @@ def gpt_decision_buy(prepared_text):
         - confianza: entero entre 50 y 100
         - explicación: cadena con la razón de la decisión
     """
-    # Construir prompt con criterios claros y consistentes
+    # Construir prompt con criterios actualizados
     prompt = f"""
     Eres un experto en trading de criptomonedas de alto riesgo. Basándote en los datos para un activo USDT en Binance:
     {prepared_text}
-    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza tendencias fuertes con volumen relativo alto (> 3.0) y proximidad al soporte (<= 0.07). Responde SOLO con un JSON válido sin '''json''' asi:
-    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen relativo > 3.0, short_volume_trend 'increasing', price_trend 'increasing', distancia al soporte <= 0.07, indican oportunidad de ganancia rápida"}}
+    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza tendencias fuertes con volumen relativo alto (> 3.0) y proximidad al soporte (<= 0.15). Responde SOLO con un JSON válido sin '''json''' asi:
+    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen relativo > 3.0, short_volume_trend 'increasing', price_trend 'increasing', distancia al soporte <= 0.15, indican oportunidad de ganancia rápida"}}
     Criterios:
-    - Compra si: volumen relativo > 3.0, short_volume_trend es 'increasing', price_trend es 'increasing', distancia relativa al soporte <= 0.07, profundidad > 3000, y spread <= 0.5% del precio (0.005 * precio). RSI > 70 es un bono, no un requisito.
-    - Mantener si: volumen relativo <= 3.0, short_volume_trend no es 'increasing', price_trend es 'decreasing', distancia relativa al soporte > 0.07, profundidad <= 3000, o spread > 0.5% del precio.
+    - Compra si: volumen relativo > 3.0, short_volume_trend es 'increasing', price_trend es 'increasing', distancia relativa al soporte <= 0.15, profundidad > 3000, y spread <= 0.5% del precio (0.005 * precio). RSI > 70 es un bono, no un requisito.
+    - Mantener si: volumen relativo <= 3.0, short_volume_trend no es 'increasing', price_trend es 'decreasing', distancia relativa al soporte > 0.15, profundidad <= 3000, o spread > 0.5% del precio.
     - Evalúa liquidez con profundidad (>3000) y spread (<=0.5% del precio).
-    - Asigna confianza >80 solo si volumen relativo > 3.0, soporte cercano (<= 0.07), y al menos 3 condiciones se cumplen; usa 60-79 para riesgos moderados (al menos 2 condiciones); de lo contrario, usa 50. Suma 10 a la confianza si RSI > 70.
+    - Asigna confianza >80 solo si volumen relativo > 3.0, soporte cercano (<= 0.15), y al menos 3 condiciones se cumplen; usa 60-79 para riesgos moderados (al menos 2 condiciones); de lo contrario, usa 50. Suma 10 a la confianza si RSI > 70.
     - Ignora el cruce MACD como requisito; prioriza momentum y soporte.
     """
 
@@ -1217,8 +1216,8 @@ def gpt_decision_buy(prepared_text):
                 if "distancia relativa al soporte" in prepared_text.lower():
                     dist_str = prepared_text.split("distancia relativa al soporte: ")[1].split("\n")[0] if "distancia relativa al soporte: " in prepared_text.lower() else "1.0"
                     support_distance = float(dist_str) if dist_str.replace('.', '').replace('-', '').isdigit() else 1.0
-                    if support_distance > 0.07:
-                        return "mantener", 50, "Far from support (> 0.07), overriding GPT"
+                    if support_distance > 0.15:  # Updated to 0.15
+                        return "mantener", 50, "Far from support (> 0.15), overriding GPT"
                 if "profundidad" in prepared_text:
                     depth_str = prepared_text.split("Profundidad del libro: ")[1].split("\n")[0]
                     depth = float(depth_str) if depth_str.replace('.', '').replace('-', '').isdigit() else 0
@@ -1300,6 +1299,6 @@ def send_periodic_summary():
 
 # Iniciar el hilo al final de if __name__ == "__main__":
 if __name__ == "__main__":
-    high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=100)
+    high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=300)
     threading.Thread(target=send_periodic_summary, daemon=True).start()
     demo_trading(high_volume_symbols)

@@ -35,7 +35,7 @@ THRESHOLD_VOLUME_CHANGE = 0.5  # 50%
 THRESHOLD_PRICE_CHANGE = 0.05  # 5%
 THRESHOLD_RSI_OVERBOUGHT = 70
 THRESHOLD_RSI_OVERSOLD = 30
-SYMBOLS_TO_MONITOR = 200  # Total de símbolos a monitorear
+SYMBOLS_TO_MONITOR = 300  # Total de símbolos a monitorear
 SYMBOLS_PER_BATCH = 40  # Símbolos por iteración (200 / 5 minutos = 40 por minuto)
 
 # Variables globales
