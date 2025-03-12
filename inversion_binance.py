@@ -676,20 +676,20 @@ def calculate_adaptive_strategy(indicators, data=None):
 
     # Puntuación ponderada priorizando volumen relativo alto
     weighted_signals = [
-        4 * (relative_volume > 3.0 if relative_volume else False),
+        4 * (relative_volume > 2.5 if relative_volume else False),
         3 * (short_volume_trend == "increasing"),
         2 * (price_trend == "increasing"),
         2 * (roc > 1.0 if roc else False),
-        1 * (depth >= 5000),
+        1 * (depth >= 3000),
         1 * (spread <= 0.005 * current_price),
         1 * (support_distance <= support_near_threshold),
-        2 * (rsi > 70 if rsi else False) if rsi else 0
+        2 * (rsi > 60 if rsi else False) if rsi else 0
     ]
     signals_score = sum(weighted_signals)
 
     # Ajuste de confianza basado en MACD crossover (opcional)
     base_confidence = 50
-    if signals_score >= 10 and adx and adx > 25:  # Umbral más bajo con volumen fuerte
+    if signals_score >= 9 and adx and adx > 25:  # Umbral más bajo con volumen fuerte
         base_confidence = 70  # Compra si volumen y soporte son fuertes
         if has_macd_crossover:
             base_confidence = 90  # Bono por cruce MACD
@@ -698,7 +698,7 @@ def calculate_adaptive_strategy(indicators, data=None):
 
     # Explicación y decisión
     if base_confidence >= 70:
-        return "comprar", base_confidence, f"Compra fuerte: Volumen relativo > 3.0, puntaje {signals_score}/14, ADX > 25, {'con cruce MACD' if has_macd_crossover else 'sin cruce MACD'}, cerca del soporte{' y RSI > 70' if rsi and rsi > 70 else ''}"
+        return "comprar", base_confidence, f"Compra fuerte: Volumen relativo > 2.5, puntaje {signals_score}/14, ADX > 25, {'con cruce MACD' if has_macd_crossover else 'sin cruce MACD'}, cerca del soporte{' y RSI > 60' if rsi and rsi > 70 else ''}"
     return "mantener", 50, f"Condiciones insuficientes para comprar (puntaje: {signals_score}/14)"
 
 def fetch_ohlcv_with_retry(symbol, timeframe, limit=50, max_retries=3):
