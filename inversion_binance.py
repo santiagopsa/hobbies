@@ -791,8 +791,15 @@ def evaluate_missed_opportunity(symbol, initial_price, confidence, explanation, 
                 "price_change": price_change,
                 "confidence": confidence,
                 "explanation": explanation,
-                "indicators": indicators
+                "rsi": indicators.get('rsi', None),
+                "relative_volume": indicators.get('relative_volume', None),
+                "short_volume_trend": indicators.get('short_volume_trend', 'insufficient_data'),
+                "price_trend": indicators.get('price_trend', 'insufficient_data'),
+                "support_distance": None if indicators.get('support_level', None) is None or initial_price <= 0 else (initial_price - indicators['support_level']) / indicators['support_level'],
+                "depth": indicators.get('depth', 0),
+                "spread": indicators.get('spread', float('inf'))
             }
+            # Guardar en missed_opportunities.csv (como antes)
             with open("missed_opportunities.csv", "a", newline='') as f:
                 f.write(f"{missed_opportunity['initial_timestamp']},{missed_opportunity['symbol']},{missed_opportunity['initial_price']},{missed_opportunity['final_price']},{missed_opportunity['price_change']:.2f},{missed_opportunity['confidence']},{missed_opportunity['explanation']},{json.dumps(missed_opportunity['indicators'])}\n")
             print(f"\n=== Oportunidad Perdida Confirmada ===\n"
@@ -803,6 +810,26 @@ def evaluate_missed_opportunity(symbol, initial_price, confidence, explanation, 
                   f"Confianza: {confidence}%\n"
                   f"Explicación: {explanation}\n")
             send_telegram_message(f"⚠️ *Oportunidad Perdida Confirmada* `{symbol}`\nPrecio Inicial: `{initial_price:.4f}`\nPrecio Final: `{final_price:.4f}`\nCambio: `{price_change:.2f}%`\nConfianza: `{confidence}%`\nExplicación: `{explanation}`")
+
+            # Guardar en trade_stats.csv como un trade no ejecutado
+            with open("trade_stats.csv", "a", newline='') as f:
+                f.write(f"{symbol}_{missed_opportunity['initial_timestamp'].replace(':', '-')},"
+                        f"{symbol},"
+                        f"{missed_opportunity['initial_price']},"
+                        f"{missed_opportunity['final_price']},"
+                        f"0.0,"  # Amount = 0 para indicar no ejecutado
+                        f"{(missed_opportunity['final_price'] - missed_opportunity['initial_price']) * 0.0},"  # Profit/Loss = 0 (potencial perdido)
+                        f"{missed_opportunity['rsi'] or 'N/A'},"
+                        f"{missed_opportunity['initial_timestamp']},"
+                        f"'Missed Opportunity',"
+                        f"{missed_opportunity['confidence']},"
+                        f"{missed_opportunity['explanation']},"
+                        f"{missed_opportunity['relative_volume'] or 'N/A'},"
+                        f"{missed_opportunity['short_volume_trend']},"
+                        f"{missed_opportunity['price_trend']},"
+                        f"{missed_opportunity['support_distance'] or 'N/A'},"
+                        f"{missed_opportunity['depth']},"
+                        f"{missed_opportunity['spread']}\n")
 
 def fetch_ohlcv_with_retry(symbol, timeframe, limit=50, max_retries=3):
     for attempt in range(max_retries):
@@ -1144,7 +1171,7 @@ def analyze_trade_outcome(trade_id):
         profit_loss = (sell_price - buy_data['buy_price']) * buy_data['amount']
         is_profitable = profit_loss > 0
 
-        # Log stats for feedback
+        # Log stats for executed trades
         with open("trade_stats.csv", "a") as f:
             f.write(f"{trade_id},{buy_data['symbol']},{buy_data['buy_price']},{sell_price},{buy_data['amount']},{profit_loss},{buy_data['rsi']},{datetime.now()}\n")
 
