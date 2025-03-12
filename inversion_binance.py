@@ -175,6 +175,17 @@ def detect_support_level(data, price_series, window=15, max_threshold_multiplier
     return support_level if current_price <= support_level * threshold else None
 
 def calculate_short_volume_trend(data, window=3):
+    """
+    Calcula la tendencia de volumen corto usando exclusivamente el timeframe de 15m.
+    
+    Args:
+        data: Diccionario con DataFrames para diferentes timeframes.
+        window: Número de velas a considerar (default 3).
+        
+    Returns:
+        str: "increasing", "decreasing", "stable", o "insufficient_data".
+    """
+    # Usar exclusivamente el timeframe de 15m
     if '15m' not in data or data['15m'].empty or len(data['15m']) < window:
         logging.warning("Datos de 15m no disponibles o insuficientes para calcular short_volume_trend")
         return "insufficient_data"
@@ -186,15 +197,16 @@ def calculate_short_volume_trend(data, window=3):
         return "insufficient_data"
     
     last_volume = volume_series.iloc[-1]
-    avg_volume = volume_series[-window:-1].mean()
+    avg_volume = volume_series[-window:-1].mean()  # Promedio de las 3 velas anteriores (excluyendo la actual)
     
-    if avg_volume == 0:
+    if avg_volume == 0:  # Evitar división por cero
         logging.warning("Promedio de volumen es 0, no se puede calcular short_volume_trend")
         return "insufficient_data"
     
-    if last_volume > avg_volume * 1.05:
+    # Aumentar el umbral a 10% para ser más conservador en 15m
+    if last_volume > avg_volume * 1.10:  # Aumentado de 1.05 a 1.10
         return "increasing"
-    elif last_volume < avg_volume * 0.95:
+    elif last_volume < avg_volume * 0.90:  # Ajustado de 0.95 a 0.90
         return "decreasing"
     else:
         return "stable"
@@ -252,7 +264,26 @@ def fetch_volume(symbol):
         return None
 
 def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, roc_length=7, limit=50):
-    timeframes = ['15m', '1h', '4h', '1d']
+    """
+    Obtiene datos OHLCV para los timeframes '15m', '1h', '4h' y '1d' y calcula indicadores usando
+    un número reducido de velas para ATR, RSI, Bollinger Bands y ROC, de modo que se pueda operar
+    con el histórico limitado que permite la API de Binance.
+
+    Args:
+        symbol (str): Símbolo a consultar (ej. 'DOGE/USDT').
+        atr_length (int): Número de velas para calcular el ATR (default 7).
+        rsi_length (int): Número de velas para calcular el RSI (default 14, ajustado para criptos).
+        bb_length (int): Número de velas para calcular Bollinger Bands (default 20, alineado con TradingView).
+        roc_length (int): Número de velas para calcular ROC (default 7).
+        limit (int): Número de velas a solicitar por timeframe (default 50).
+
+    Returns:
+        tuple(dict, pd.Series): 
+          - Un diccionario con DataFrames para cada timeframe ('15m', '1h', '4h', '1d').
+          - La serie de precios de cierre preferida (prioridad '15m', luego '1h', '4h', '1d').
+          Si no hay datos válidos, retorna (None, None).
+    """
+    timeframes = ['15m', '1h', '4h', '1d']  # 15m ya está incluido
     data = {}
     logging.debug(f"Inicio de fetch_and_prepare_data para {symbol}")
 
@@ -264,6 +295,7 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
                 logging.warning(f"Datos vacíos para {symbol} en {tf}")
                 continue
 
+            # Crear DataFrame
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
@@ -274,6 +306,7 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
                 logging.warning(f"Datos insuficientes (<5 velas) para {symbol} en {tf}")
                 continue
 
+            # Rellenar gaps en el índice con límite del 10%
             expected_freq = pd.Timedelta('15m') if tf == '15m' else pd.Timedelta('1h') if tf == '1h' else pd.Timedelta('4h') if tf == '4h' else pd.Timedelta('1d')
             expected_index = pd.date_range(start=df.index[0], end=df.index[-1], freq=expected_freq)
             if len(expected_index) > len(df.index):
@@ -283,16 +316,19 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
                     continue
                 df = df.reindex(expected_index, method='ffill').dropna(how='all')
 
+            # Convertir columnas a numérico y manejar valores inválidos
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
                 if df[col].isna().any():
                     df[col] = df[col].ffill().bfill()
 
+            # Asegurar índices únicos y ordenados
             if not df.index.is_unique:
                 df = df[~df.index.duplicated(keep='first')]
             if not df.index.is_monotonic_increasing:
                 df = df.sort_index()
 
+            # Calcular ATR, RSI, Bollinger Bands, MACD, ROC
             if len(df) >= atr_length:
                 df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=atr_length).ffill().bfill()
             else:
@@ -323,7 +359,7 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
             else:
                 df['ROC'] = np.nan
 
-            # Calcular tendencia alcista y volumen creciente en 1h y 4h
+            # Nuevos cálculos para '4h'
             if len(df) >= 7:
                 df['SMA_7'] = ta.sma(df['close'], length=7)
                 df['tendencia_alcista'] = df['close'] > df['SMA_7']
@@ -383,6 +419,7 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
         logging.error(f"No se obtuvieron datos válidos para {symbol} en ningún timeframe")
         return None, None
 
+    # Validar que haya al menos un indicador útil
     has_valid_indicators = any(
         not df[['RSI', 'ATR', 'MACD']].isna().all().all()
         for df in data.values()
@@ -391,6 +428,7 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
         logging.error(f"No hay indicadores válidos para {symbol}")
         return None, None
 
+    # Seleccionar serie de precios preferida para soporte (priorizar 15m)
     for tf in ['15m', '1h', '4h', '1d']:
         if tf in data and not data[tf].empty:
             price_series = data[tf]['close']
@@ -614,6 +652,7 @@ def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, indicators):
     threading.Thread(target=trailing_logic, daemon=True).start()
 
 def calculate_adaptive_strategy(indicators, data=None):
+    # Extraer indicadores
     rsi = indicators.get('rsi', None)
     relative_volume = indicators.get('relative_volume', None)
     roc = indicators.get('roc', None)
@@ -626,11 +665,13 @@ def calculate_adaptive_strategy(indicators, data=None):
     adx = indicators.get('adx', None)
     has_macd_crossover = indicators.get('has_macd_crossover', False)
 
+    # Calcular distancia al soporte
     support_distance = None
     if support_level is not None and current_price > 0:
         support_distance = (current_price - support_level) / support_level
 
-    support_near_threshold = 0.15
+    # Aumentar el umbral de proximidad al soporte a 15%
+    support_near_threshold = 0.15  # Confirmed as 15%
 
     # Verificar tendencia en 1h o 4h para evitar falsos positivos
     trend_confirmed = False
@@ -646,32 +687,40 @@ def calculate_adaptive_strategy(indicators, data=None):
     if not trend_confirmed:
         return "mantener", 50, "Tendencia no confirmada en 1h o 4h"
 
-    if adx is None or adx < 20:
-        return "mantener", 50, "Tendencia débil (ADX < 20), evitando mercado sin dirección"
+    # Evitar mercados sin tendencia (ADX < 25)
+    if adx is None or adx < 25:
+        return "mantener", 50, "Tendencia débil (ADX < 25), evitando mercado sin dirección"
 
+    # Confirmar tendencia alcista y volumen
     roc_4h = None
     tendencia_alcista = False
     macd_4h = None
     volumen_creciente = False
+
     if data and '4h' in data and not data['4h'].empty:
         roc_4h = data['4h']['ROC'].iloc[-1] if 'ROC' in data['4h'] and not pd.isna(data['4h']['ROC'].iloc[-1]) else None
-        tendencia_alcista = data['4h']['tendencia_alcista'].iloc[-1] if 'tendencia_alcista' in data['4h'] and not pd.isna(data['4h']['tendencia_alcista'].iloc[-1]) else False
+        tendencia_alcista = data['4h']['tendencia_alcista'].iloc[-1] if 'tendencia_alcista' in data['4h'] else False
         macd_4h = data['4h']['MACD'].iloc[-1] if 'MACD' in data['4h'] and not pd.isna(data['4h']['MACD'].iloc[-1]) else None
-        volumen_creciente = data['4h']['volumen_creciente'].iloc[-1] if 'volumen_creciente' in data['4h'] and not pd.isna(data['4h']['volumen_creciente'].iloc[-1]) else False
+        volumen_creciente = data['4h']['volumen_creciente'].iloc[-1] if 'volumen_creciente' in data['4h'] else False
     else:
         logging.warning("Datos '4h' no disponibles, usando '1h' como fallback")
         if '1h' in data and not data['1h'].empty:
-            roc_4h = data['1h']['ROC'].iloc[-1] if 'ROC' in data['1h'] and not pd.isna(data['1h']['ROC'].iloc[-1]) else None
-            tendencia_alcista = data['1h']['tendencia_alcista'].iloc[-1] if 'tendencia_alcista' in data['1h'] and not pd.isna(data['1h']['tendencia_alcista'].iloc[-1]) else False
-            macd_4h = data['1h']['MACD'].iloc[-1] if 'MACD' in data['1h'] and not pd.isna(data['1h']['MACD'].iloc[-1]) else None
-            volumen_creciente = data['1h']['volumen_creciente'].iloc[-1] if 'volumen_creciente' in data['1h'] and not pd.isna(data['1h']['volumen_creciente'].iloc[-1]) else False
+            roc_4h = data['1h']['ROC'].iloc[-1] if 'ROC' in data['1h'] else None
+            tendencia_alcista = data['1h']['close'].iloc[-1] > data['1h']['close'].mean() if 'close' in data['1h'] else False
+            macd_4h = data['1h']['MACD'].iloc[-1] if 'MACD' in data['1h'] else None
+            volumen_creciente = data['1h']['volume'].iloc[-1] > data['1h']['volume'].mean() if 'volume' in data['1h'] else False
 
-    if roc_4h is None or roc_4h <= 0.3 or not tendencia_alcista or macd_4h <= 0 or not volumen_creciente:
+    # Condiciones obligatorias mínimas
+    if (roc_4h is None or roc_4h <= 0.5 or not tendencia_alcista or macd_4h <= 0 or not volumen_creciente):
         return "mantener", 50, f"Tendencia alcista o volumen no confirmados (ROC: {roc_4h}, Tendencia: {tendencia_alcista}, MACD: {macd_4h}, Volumen: {volumen_creciente})"
 
-    if support_distance is None or support_distance > support_near_threshold:
-        return "mantener", 50, f"No se pudo calcular la distancia al soporte (soporte no detectado o precio inválido) o lejos del soporte (distancia: {support_distance:.2%})"
+    # Verificar proximidad al soporte
+    if support_distance is None:
+        return "mantener", 50, "No se pudo calcular la distancia al soporte (soporte no detectado o precio inválido)"
+    if support_distance > support_near_threshold:  # 15% threshold
+        return "mantener", 50, f"Lejos del soporte (distancia: {support_distance:.2%})"
 
+    # Nuevos indicadores de 15m
     ema_crossover = False
     stoch_crossover = False
     atr_increasing = False
@@ -688,9 +737,11 @@ def calculate_adaptive_strategy(indicators, data=None):
             lookback=5
         )[0]
 
+    # Filtro de volatilidad: ATR debe haber aumentado al menos un 5% en las últimas 3 velas en 15m
     if not atr_increasing:
         return "mantener", 50, "Aumento de volatilidad no confirmado (ATR no sube al menos 5%)"
 
+    # Puntuación ponderada priorizando volumen relativo alto
     weighted_signals = [
         4 * (relative_volume > 2.5 if relative_volume else False),
         3 * (short_volume_trend == "increasing" or short_volume_trend == "stable"),
@@ -707,17 +758,51 @@ def calculate_adaptive_strategy(indicators, data=None):
     ]
     signals_score = sum(weighted_signals)
 
+    # Ajuste de confianza basado en MACD crossover (opcional)
     base_confidence = 50
-    if signals_score >= 9 and adx and adx > 20:
+    if signals_score >= 9 and adx and adx > 20:  # Relajado desde 25
         base_confidence = 70
         if has_macd_crossover or macd_crossover_15m:
             base_confidence = 90
         elif rsi and rsi > 70:
             base_confidence = 85
 
-    if base_confidence >= 70:
-        return "comprar", base_confidence, f"Compra fuerte: Volumen relativo > 2.5, puntaje {signals_score}/13, ADX > 20, {'con cruce MACD' if has_macd_crossover else 'sin cruce MACD'}, cerca del soporte{' y RSI > 60' if rsi and rsi > 60 else ''}{' y EMA crossover' if ema_crossover else ''}{' y Estocástico crossover' if stoch_crossover else ''}{' y OBV aumentando' if obv_increasing else ''}"
-    return "mantener", 50, f"Condiciones insuficientes para comprar (puntaje: {signals_score}/13)"
+    # Explicación y decisión
+    action = "mantener" if base_confidence < 70 else "comprar"
+    explanation = f"{'Compra fuerte' if base_confidence >= 70 else 'Condiciones insuficientes para comprar'}: Volumen relativo > 2.5, puntaje {signals_score}/13, ADX > 20, {'con cruce MACD' if has_macd_crossover else 'sin cruce MACD'}, cerca del soporte{' y RSI > 60' if rsi and rsi > 60 else ''}{' y EMA crossover' if ema_crossover else ''}{' y Estocástico crossover' if stoch_crossover else ''}{' y OBV aumentando' if obv_increasing else ''}"
+
+    # Evaluar si fue una oportunidad perdida (en un hilo separado)
+    if action == "mantener" and base_confidence > 50:
+        threading.Thread(target=evaluate_missed_opportunity, args=(symbol, current_price, base_confidence, explanation, indicators), daemon=True).start()
+
+    return action, base_confidence, explanation
+
+def evaluate_missed_opportunity(symbol, initial_price, confidence, explanation, indicators):
+    time.sleep(3600)  # Esperar 1 hora para evaluar
+    final_price = fetch_price(symbol)
+    if final_price and initial_price:
+        price_change = ((final_price - initial_price) / initial_price) * 100
+        if price_change > 1.0:  # Umbral de ganancia potencial (1%)
+            missed_opportunity = {
+                "symbol": symbol,
+                "initial_timestamp": get_colombia_timestamp(),
+                "initial_price": initial_price,
+                "final_price": final_price,
+                "price_change": price_change,
+                "confidence": confidence,
+                "explanation": explanation,
+                "indicators": indicators
+            }
+            with open("missed_opportunities.csv", "a", newline='') as f:
+                f.write(f"{missed_opportunity['initial_timestamp']},{missed_opportunity['symbol']},{missed_opportunity['initial_price']},{missed_opportunity['final_price']},{missed_opportunity['price_change']:.2f},{missed_opportunity['confidence']},{missed_opportunity['explanation']},{json.dumps(missed_opportunity['indicators'])}\n")
+            print(f"\n=== Oportunidad Perdida Confirmada ===\n"
+                  f"Símbolo: {symbol}\n"
+                  f"Precio Inicial: {initial_price:.4f} USDT\n"
+                  f"Precio Final: {final_price:.4f} USDT\n"
+                  f"Cambio: {price_change:.2f}%\n"
+                  f"Confianza: {confidence}%\n"
+                  f"Explicación: {explanation}\n")
+            send_telegram_message(f"⚠️ *Oportunidad Perdida Confirmada* `{symbol}`\nPrecio Inicial: `{initial_price:.4f}`\nPrecio Final: `{final_price:.4f}`\nCambio: `{price_change:.2f}%`\nConfianza: `{confidence}%`\nExplicación: `{explanation}`")
 
 def fetch_ohlcv_with_retry(symbol, timeframe, limit=50, max_retries=3):
     for attempt in range(max_retries):
@@ -763,7 +848,6 @@ def demo_trading(high_volume_symbols=None):
 
     failed_conditions_count = {}
     symbols_processed = 0
-    missed_opportunities = []  # Lista para almacenar oportunidades perdidas
 
     for i in range(0, len(selected_cryptos), 10):
         batch = selected_cryptos[i:i+10]
@@ -824,7 +908,7 @@ def demo_trading(high_volume_symbols=None):
                     failed_conditions_count['spread <= 0.005 * price'] = failed_conditions_count.get('spread <= 0.005 * price', 0) + 1
                     continue
 
-                conditions['imbalance >= 1.5'] = imbalance >= 1.5 if imbalance is not None else False
+                conditions['imbalance >= 1.5'] = imbalance >= 1.5 if imbalance is not None else False  # Added None check for safety
                 if not conditions['imbalance >= 1.5']:
                     logging.info(f"Se omite {symbol} por imbalance bajo: {imbalance}")
                     failed_conditions_count['imbalance >= 1.5'] = failed_conditions_count.get('imbalance >= 1.5', 0) + 1
@@ -860,6 +944,7 @@ def demo_trading(high_volume_symbols=None):
                 volume_trend = "insufficient_data"
                 price_trend = "insufficient_data"
 
+                # Calcular volume_trend con manejo seguro de linregress
                 if len(volume_series) >= 10:
                     last_10_volume = volume_series[-10:]
                     try:
@@ -872,6 +957,7 @@ def demo_trading(high_volume_symbols=None):
                 else:
                     logging.debug(f"No hay suficientes datos para calcular volume_trend para {symbol}: {len(volume_series)} velas")
 
+                # Calcular price_trend con manejo seguro de linregress
                 if len(price_series) >= 10:
                     last_10_price = price_series[-10:]
                     try:
@@ -913,24 +999,11 @@ def demo_trading(high_volume_symbols=None):
                 conditions_str = "\n".join([f"{key}: {'Sí' if value is True else 'No' if value is False else 'Desconocido'}" for key, value in sorted(conditions.items())])
                 logging.info(f"Condiciones evaluadas para {symbol}:\n{conditions_str}")
 
+                for key, value in conditions.items():
+                    logging.debug(f"Condición {key} para {symbol}: valor={value}, tipo={type(value)}")
+
                 action, confidence, explanation = calculate_adaptive_strategy(indicators, data=data)
                 logging.info(f"Decisión inicial para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
-
-                # Registrar oportunidades perdidas si la confianza es significativa
-                if action == "mantener" and confidence > 50:
-                    missed_opportunity = {
-                        "symbol": symbol,
-                        "timestamp": get_colombia_timestamp(),
-                        "confidence": confidence,
-                        "explanation": explanation,
-                        "indicators": indicators
-                    }
-                    missed_opportunities.append(missed_opportunity)
-                    print(f"\n=== Oportunidad Perdida ===\n"
-                          f"Símbolo: {symbol}\n"
-                          f"Confianza: {confidence}%\n"
-                          f"Explicación: {explanation}\n")
-                    send_telegram_message(f"⚠️ *Oportunidad Perdida* `{symbol}`\nConfianza: `{confidence}%`\nExplicación: `{explanation}`")
 
                 gpt_conditions = {
                     'action is "mantener"': action == "mantener",
@@ -952,6 +1025,8 @@ def demo_trading(high_volume_symbols=None):
                     logging.info(f"Resultado de gpt_decision_buy para {symbol}: Acción={action}, Confianza={confidence}%, Explicación={explanation}")
 
                 logging.info(f"Decisión final para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
+
+                logging.debug(f"Verificación post-decisión para {symbol}: action={action}, confidence={confidence}, explanation={explanation}, conditions={conditions}")
 
                 if action == "comprar" and confidence >= 70:
                     with buy_lock:
@@ -990,10 +1065,14 @@ def demo_trading(high_volume_symbols=None):
                         else:
                             logging.info(f"Compra no ejecutada para {symbol}: valor de la operación ({trade_value}) < MIN_NOTIONAL ({MIN_NOTIONAL}) y saldo insuficiente")
 
+                logging.debug(f"Verificación antes de contadores para {symbol}: failed_conditions_count={failed_conditions_count}, symbols_processed={symbols_processed}")
+
                 failed_conditions = [key for key, value in conditions.items() if not value]
                 for condition in failed_conditions:
                     failed_conditions_count[condition] = failed_conditions_count.get(condition, 0) + 1
                 symbols_processed += 1
+
+                logging.debug(f"Contadores actualizados para {symbol}: failed_conditions_count={failed_conditions_count}, symbols_processed={symbols_processed}")
 
             except Exception as e:
                 logging.error(f"Error en demo_trading para {symbol}: {e}", exc_info=True)
@@ -1003,19 +1082,12 @@ def demo_trading(high_volume_symbols=None):
             del data
         time.sleep(30)
 
-    # Guardar oportunidades perdidas en un archivo CSV
-    if missed_opportunities:
-        with open("missed_opportunities.csv", "a", newline='') as f:
-            for opp in missed_opportunities:
-                f.write(f"{opp['timestamp']},{opp['symbol']},{opp['confidence']},{opp['explanation']},{json.dumps(opp['indicators'])}\n")
-        logging.info(f"Guardadas {len(missed_opportunities)} oportunidades perdidas en missed_opportunities.csv")
-
     if symbols_processed > 0 and failed_conditions_count:
         most_common_condition = max(failed_conditions_count, key=failed_conditions_count.get)
         most_common_count = failed_conditions_count[most_common_condition]
         summary_message = (f"Resumen final: Después de procesar {symbols_processed} símbolos, "
-                          f"la condición más común que impidió operaciones fue '{most_common_condition}' "
-                          f"con {most_common_count} ocurrencias ({(most_common_count / symbols_processed) * 100:.1f}%).")
+                           f"la condición más común que impidió operaciones fue '{most_common_condition}' "
+                           f"con {most_common_count} ocurrencias ({(most_common_count / symbols_processed) * 100:.1f}%).")
         logging.info(summary_message)
 
         with open("trade_blockers_summary.txt", "a") as f:
@@ -1172,8 +1244,6 @@ def gpt_prepare_data(data, indicators):
     - ROC: {indicators.get('roc', 'No disponible')}
     """
     return prompt
-
-import asyncio
 
 def gpt_decision_buy(prepared_text):
     """
