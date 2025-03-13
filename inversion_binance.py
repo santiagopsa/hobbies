@@ -70,7 +70,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 logging.basicConfig(
     level=logging.INFO,
-    filename="trading_real.log",
+    filename="trading.log",
     filemode="a",
     format="%(asctime)s - %(levelname)s - %(message)s",
     flush=True  # Fuerza el vaciado inmediato
