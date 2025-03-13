@@ -72,8 +72,11 @@ logging.basicConfig(
     level=logging.INFO,
     filename="trading_real.log",
     filemode="a",
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    flush=True  # Fuerza el vaciado inmediato
 )
+
+logging.debug("Prueba de escritura en trading_real.log al iniciar")
 
 # Constantes actualizadas
 MAX_DAILY_BUYS = 10  # Reducido de 10 para memoria baja
