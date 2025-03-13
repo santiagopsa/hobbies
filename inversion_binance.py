@@ -69,14 +69,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Cambia de INFO a DEBUG
     filename="trading.log",
     filemode="a",
     format="%(asctime)s - %(levelname)s - %(message)s",
-    flush=True  # Fuerza el vaciado inmediato
+    flush=True
 )
 
-logging.debug("Prueba de escritura en trading_real.log al iniciar")
+logging.debug("Prueba de escritura en trading.log al iniciar")
 
 # Constantes actualizadas
 MAX_DAILY_BUYS = 10  # Reducido de 10 para memoria baja
@@ -1410,7 +1410,7 @@ def with_timeout(func, kwargs, timeout_sec):
 def send_periodic_summary():
     while True:
         try:
-            with open("trading_real.log", "r") as log_file:
+            with open("trading.log", "r") as log_file:
                 lines = log_file.readlines()[-100:]  # Últimas 100 líneas para no cargar demasiado
                 buys_attempted = sum(1 for line in lines if "Intentando compra para" in line)
                 buys_executed = sum(1 for line in lines if "Compra ejecutada para" in line)
