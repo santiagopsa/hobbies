@@ -1433,3 +1433,4 @@ if __name__ == "__main__":
     high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=300)
     threading.Thread(target=send_periodic_summary, daemon=True).start()
     demo_trading(high_volume_symbols)
+    logging.shutdown()
