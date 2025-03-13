@@ -786,7 +786,7 @@ def evaluate_missed_opportunity(symbol, initial_price, confidence, explanation, 
     final_price = fetch_price(symbol)
     if final_price and initial_price:
         price_change = ((final_price - initial_price) / initial_price) * 100
-        if price_change > 1.0:  # Umbral de ganancia potencial (1%)
+        if price_change > 10.0:  # Umbral de ganancia potencial (1%)
             missed_opportunity = {
                 "symbol": symbol,
                 "initial_timestamp": get_colombia_timestamp(),
