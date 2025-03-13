@@ -16,6 +16,14 @@ import pandas_ta as ta  # Nueva librería reemplazando ta-lib
 from elegir_cripto import choose_best_cryptos
 from scipy.stats import linregress
 
+logger = logging.getLogger("inversion_binance")
+logger.setLevel(logging.DEBUG)
+handler = logging.FileHandler(os.path.expanduser("~/hobbies/trading.log"))
+handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+logger.addHandler(handler)
+logger.propagate = False  # Evita que los mensajes suban al logger raíz de inversion.py
+
+logger.info("Prueba de escritura en trading.log al iniciar")
 # Configuración e Inicialización
 load_dotenv()
 GPT_MODEL = "gpt-4o-mini"
@@ -68,15 +76,17 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# Limpiar handlers existentes
+logging.getLogger().handlers.clear()
 logging.basicConfig(
-    level=logging.DEBUG,  # Cambia de INFO a DEBUG
-    filename="trading.log",
+    level=logging.DEBUG,
+    filename=os.path.expanduser("~/hobbies/trading.log"),
     filemode="a",
     format="%(asctime)s - %(levelname)s - %(message)s",
     flush=True
 )
 
-logging.debug("Prueba de escritura en trading.log al iniciar")
+logging.info("Prueba de escritura en trading.log al iniciar")
 
 # Constantes actualizadas
 MAX_DAILY_BUYS = 10  # Reducido de 10 para memoria baja
