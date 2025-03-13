@@ -665,6 +665,7 @@ def calculate_adaptive_strategy(indicators, data=None):
     support_level = indicators.get('support_level', None)
     adx = indicators.get('adx', None)
     has_macd_crossover = indicators.get('has_macd_crossover', False)
+    symbol = indicators.get('symbol', 'desconocido')  # Extraer symbol explícitamente
 
     # Calcular distancia al soporte
     support_distance = None
@@ -684,13 +685,15 @@ def calculate_adaptive_strategy(indicators, data=None):
                         trend_confirmed = True
                         break
                 else:
-                    logging.warning(f"Columnas 'tendencia_alcista' o 'volumen_creciente' no disponibles en {tf} para {indicators.get('symbol', 'desconocido')}")
+                    logging.warning(f"Columnas 'tendencia_alcista' o 'volumen_creciente' no disponibles en {tf} para {symbol}")
+            else:
+                logging.warning(f"Datos insuficientes o vacíos en {tf} para {symbol}")
     if not trend_confirmed:
-        return "mantener", 50, "Tendencia no confirmada en 1h o 4h"
+        return "mantener", 50, f"Tendencia no confirmada en 1h o 4h para {symbol}"
 
     # Evitar mercados sin tendencia (ADX < 25)
     if adx is None or adx < 25:
-        return "mantener", 50, "Tendencia débil (ADX < 25), evitando mercado sin dirección"
+        return "mantener", 50, f"Tendencia débil (ADX: {adx if adx else 'None'}) para {symbol}"
 
     # Confirmar tendencia alcista y volumen
     roc_4h = None
@@ -704,7 +707,7 @@ def calculate_adaptive_strategy(indicators, data=None):
         macd_4h = data['4h']['MACD'].iloc[-1] if 'MACD' in data['4h'] and not pd.isna(data['4h']['MACD'].iloc[-1]) else None
         volumen_creciente = data['4h']['volumen_creciente'].iloc[-1] if 'volumen_creciente' in data['4h'] else False
     else:
-        logging.warning("Datos '4h' no disponibles, usando '1h' como fallback")
+        logging.warning(f"Datos '4h' no disponibles para {symbol}, usando '1h' como fallback")
         if '1h' in data and not data['1h'].empty:
             roc_4h = data['1h']['ROC'].iloc[-1] if 'ROC' in data['1h'] else None
             tendencia_alcista = data['1h']['close'].iloc[-1] > data['1h']['close'].mean() if 'close' in data['1h'] else False
@@ -713,13 +716,13 @@ def calculate_adaptive_strategy(indicators, data=None):
 
     # Condiciones obligatorias mínimas
     if (roc_4h is None or roc_4h <= 0.5 or not tendencia_alcista or macd_4h <= 0 or not volumen_creciente):
-        return "mantener", 50, f"Tendencia alcista o volumen no confirmados (ROC: {roc_4h}, Tendencia: {tendencia_alcista}, MACD: {macd_4h}, Volumen: {volumen_creciente})"
+        return "mantener", 50, f"Tendencia alcista o volumen no confirmados (ROC: {roc_4h}, Tendencia: {tendencia_alcista}, MACD: {macd_4h}, Volumen: {volumen_creciente}) para {symbol}"
 
     # Verificar proximidad al soporte
     if support_distance is None:
-        return "mantener", 50, "No se pudo calcular la distancia al soporte (soporte no detectado o precio inválido)"
-    if support_distance > support_near_threshold:  # 15% threshold
-        return "mantener", 50, f"Lejos del soporte (distancia: {support_distance:.2%})"
+        return "mantener", 50, f"No se pudo calcular la distancia al soporte para {symbol} (soporte no detectado o precio inválido)"
+    if support_distance > support_near_threshold:
+        return "mantener", 50, f"Lejos del soporte (distancia: {support_distance:.2%}) para {symbol}"
 
     # Nuevos indicadores de 15m
     ema_crossover = False
@@ -740,7 +743,7 @@ def calculate_adaptive_strategy(indicators, data=None):
 
     # Filtro de volatilidad: ATR debe haber aumentado al menos un 5% en las últimas 3 velas en 15m
     if not atr_increasing:
-        return "mantener", 50, "Aumento de volatilidad no confirmado (ATR no sube al menos 5%)"
+        return "mantener", 50, f"Aumento de volatilidad no confirmado (ATR no sube al menos 5%) para {symbol}"
 
     # Puntuación ponderada priorizando volumen relativo alto
     weighted_signals = [
@@ -770,7 +773,7 @@ def calculate_adaptive_strategy(indicators, data=None):
 
     # Explicación y decisión
     action = "mantener" if base_confidence < 70 else "comprar"
-    explanation = f"{'Compra fuerte' if base_confidence >= 70 else 'Condiciones insuficientes para comprar'}: Volumen relativo > 2.5, puntaje {signals_score}/13, ADX > 20, {'con cruce MACD' if has_macd_crossover else 'sin cruce MACD'}, cerca del soporte{' y RSI > 60' if rsi and rsi > 60 else ''}{' y EMA crossover' if ema_crossover else ''}{' y Estocástico crossover' if stoch_crossover else ''}{' y OBV aumentando' if obv_increasing else ''}"
+    explanation = f"{'Compra fuerte' if base_confidence >= 70 else 'Condiciones insuficientes para comprar'}: Volumen relativo > 2.5, puntaje {signals_score}/13, ADX > 20, {'con cruce MACD' if has_macd_crossover else 'sin cruce MACD'}, cerca del soporte{' y RSI > 60' if rsi and rsi > 60 else ''}{' y EMA crossover' if ema_crossover else ''}{' y Estocástico crossover' if stoch_crossover else ''}{' y OBV aumentando' if obv_increasing else ''} para {symbol}"
 
     # Evaluar si fue una oportunidad perdida (en un hilo separado)
     if action == "mantener" and base_confidence > 50:
@@ -1021,7 +1024,8 @@ def demo_trading(high_volume_symbols=None):
                     "short_volume_trend": short_volume_trend,
                     "support_level": support_level,
                     "roc": roc,
-                    "current_price": current_price
+                    "current_price": current_price,
+                    "symbol": symbol
                 }
 
                 conditions_str = "\n".join([f"{key}: {'Sí' if value is True else 'No' if value is False else 'Desconocido'}" for key, value in sorted(conditions.items())])
