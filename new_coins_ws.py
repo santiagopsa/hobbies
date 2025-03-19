@@ -121,7 +121,7 @@ def increment_daily_purchases():
 # Global variables
 market_cache = {}
 active_orders = set()
-MIN_NOTIONAL = 7  # Minimum notional set to $7 USD for new coins
+MIN_NOTIONAL = 10  # Minimum notional set to $7 USD for new coins
 
 # Función para obtener precio
 def fetch_price(symbol):
@@ -153,7 +153,7 @@ threading.Thread(target=update_market_cache, daemon=True).start()
 # Compra optimizada con reintentos
 buying_lock = threading.Lock()
 
-def buy_symbol_microsecond(symbol, budget=15, max_attempts=200, retry_delay=0.001):
+def buy_symbol_microsecond(symbol, budget=15, max_attempts=5, retry_delay=0.001):
     daily_purchases = get_daily_purchases()
     if daily_purchases >= MAX_DAILY_PURCHASES:
         log_queue.put((logging.INFO, f"Límite diario alcanzado ({MAX_DAILY_PURCHASES}). Ignorando {symbol}."))
@@ -162,69 +162,47 @@ def buy_symbol_microsecond(symbol, budget=15, max_attempts=200, retry_delay=0.00
 
     with buying_lock:
         if symbol in active_orders:
-            log_queue.put((logging.DEBUG, f"Orden ya en proceso para {symbol}"))
             return None
         active_orders.add(symbol)
 
-    log_queue.put((logging.INFO, f"🚀 Intentando comprar {symbol} tan pronto esté disponible..."))
-    for attempt in range(max_attempts):
-        try:
-            if symbol not in market_cache:
-                log_queue.put((logging.DEBUG, f"{symbol} no en caché. Esperando..."))
-                time.sleep(retry_delay)
-                continue
+    log_queue.put((logging.INFO, f"🚀 Comprando {symbol} inmediatamente..."))
+    try:
+        # Obtener precio rápidamente
+        ticker = exchange.fetch_ticker(symbol)
+        price = ticker['last']
+        if not price:
+            raise Exception("No se pudo obtener precio")
 
-            market = market_cache[symbol]
-            if market.get('info', {}).get('status') != 'TRADING':
-                log_queue.put((logging.DEBUG, f"{symbol} no en estado TRADING. Intento {attempt+1}/{max_attempts}"))
-                time.sleep(retry_delay)
-                continue
+        # Calcular cantidad mínima viable
+        amount = budget / price
+        market = market_cache.get(symbol, exchange.markets[symbol])
+        lot_size = market['limits']['amount']['min']
+        amount = max(amount, lot_size)
+        amount = round(amount / lot_size) * lot_size
 
-            ticker = exchange.fetch_ticker(symbol)
-            price = ticker['last']
-            if not price:
-                log_queue.put((logging.ERROR, f"No se pudo obtener precio para {symbol}"))
-                time.sleep(retry_delay)
-                continue
+        # Ejecutar compra sin más verificaciones
+        start_time = time.time()
+        order = exchange.create_market_buy_order(symbol, amount)
+        end_time = time.time()
 
-            calculated_amount = budget / price
-            min_notional = market.get('limits', {}).get('cost', {}).get('min', MIN_NOTIONAL)  # $7 minimum
-            lot_size = market['limits']['amount']['min']
-            min_amount = min_notional / price
-            amount = max(calculated_amount, min_amount, lot_size)
-            amount = round(amount / lot_size) * lot_size  # Ensure lot size compliance
+        order_price = order.get('average', price)
+        filled = order.get('filled', amount)
+        timestamp = datetime.now(timezone.utc).isoformat()
 
-            start_time = time.time()
-            order = exchange.create_market_buy_order(symbol, amount)
-            end_time = time.time()
+        insert_transaction(symbol, 'buy', order_price, filled, timestamp)
+        increment_daily_purchases()
+        latency_ms = (end_time - start_time) * 1000
+        log_queue.put((logging.INFO, f"✅ Compra ejecutada: {symbol} a {order_price} USDT | Cantidad: {filled} | Latencia: {latency_ms:.3f}ms"))
+        send_telegram_message(f"✅ *Compra ejecutada*\nSímbolo: `{symbol}`\nPrecio: `{order_price}`\nCantidad: `{filled}`\nLatencia: `{latency_ms:.3f}ms`")
 
-            order_price = order.get('average', order.get('price', price))
-            filled = order.get('filled', 0)
-            timestamp = datetime.now(timezone.utc).isoformat()
+        active_orders.remove(symbol)
+        return {'price': order_price, 'filled': filled}
 
-            insert_transaction(symbol, 'buy', order_price, filled, timestamp)
-            increment_daily_purchases()
-            latency_ms = (end_time - start_time) * 1000
-            log_queue.put((logging.INFO, f"✅ Compra ejecutada: {symbol} a {order_price} USDT | Cantidad: {filled} | Latencia: {latency_ms:.3f}ms"))
-            send_telegram_message(f"✅ *Compra ejecutada*\nSímbolo: `{symbol}`\nPrecio: `{order_price}`\nCantidad: `{filled}`\nLatencia: `{latency_ms:.3f}ms`")
-
-            active_orders.remove(symbol)
-            return {'price': order_price, 'filled': filled}
-
-        except ccxt.RateLimitExceeded:
-            log_queue.put((logging.WARNING, f"Límite de API excedido al intentar comprar {symbol}. Esperando..."))
-            time.sleep(0.1)  # Slightly longer delay for rate limits
-        except ccxt.ExchangeError as e:
-            log_queue.put((logging.ERROR, f"Error de exchange al comprar {symbol}: {e}"))
-            time.sleep(retry_delay)
-        except Exception as e:
-            log_queue.put((logging.ERROR, f"Excepción al comprar {symbol}: {e}"))
-            time.sleep(retry_delay)
-
-    log_queue.put((logging.ERROR, f"❌ {symbol} no estuvo disponible tras {max_attempts} intentos."))
-    send_telegram_message(f"❌ *Error*: `{symbol}` no estuvo disponible tras varios intentos.")
-    active_orders.remove(symbol)
-    return None
+    except Exception as e:
+        log_queue.put((logging.ERROR, f"Error al comprar {symbol}: {e}"))
+        send_telegram_message(f"❌ *Error*: `{symbol}` no se pudo comprar: {e}")
+        active_orders.remove(symbol)
+        return None
 
 # Venta
 def sell_symbol(symbol, amount):
