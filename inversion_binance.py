@@ -600,7 +600,7 @@ def sell_symbol(symbol, amount, trade_id):
 
 def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, indicators):
     """
-    Implementa un trailing stop dinámico ajustado por volatilidad y proximidad al soporte.
+    Implementa un trailing stop dinámico con take-profit y stop-loss fijo, ajustado por volatilidad y proximidad al soporte.
     
     Args:
         symbol: Símbolo del activo (e.g., 'BTC/USDT').
@@ -612,14 +612,17 @@ def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, indicators):
     def trailing_logic():
         try:
             highest_price = purchase_price
+            take_profit_price = purchase_price * 1.05  # Take-profit fijo al 5%
+            stop_loss_price = purchase_price * 0.98    # Stop-loss fijo al 2%
             data, price_series = fetch_and_prepare_data(symbol)
             if data is None or price_series is None:
-                logging.error(f"No data para trailing stop de {symbol}, reintentando en 60s")
-                time.sleep(60)
+                logging.error(f"No data para trailing stop de {symbol}, forzando venta inmediata")
+                sell_symbol(symbol, amount, trade_id)
                 return
 
-            atr = data['1h']['ATR'].iloc[-1] if 'ATR' in data['1h'] and not pd.isna(data['1h']['ATR'].iloc[-1]) else purchase_price * 0.02
-            volatility = atr / purchase_price * 100 if purchase_price > 0 else 2
+            # Usar ATR de 1h o fallback
+            atr = data['1h']['ATR'].iloc[-1] if '1h' in data and 'ATR' in data['1h'] and not pd.isna(data['1h']['ATR'].iloc[-1]) else purchase_price * 0.02
+            volatility = atr / purchase_price * 100 if purchase_price > 0 else 3.0  # Default 3% si falla
             support_level = indicators.get('support_level', None)
 
             while True:
@@ -629,17 +632,30 @@ def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, indicators):
                     time.sleep(60)
                     continue
 
-                support_distance = (current_price - support_level) / support_level if support_level else float('inf')
-                if support_distance < 0.02:
-                    trailing_percent = max(1, min(3, volatility * 0.5))
+                # Stop-loss fijo
+                if current_price <= stop_loss_price:
+                    sell_symbol(symbol, amount, trade_id)
+                    logging.info(f"Stop-loss alcanzado para {symbol} a {current_price}")
+                    break
+
+                # Take-profit fijo
+                if current_price >= take_profit_price:
+                    sell_symbol(symbol, amount, trade_id)
+                    logging.info(f"Take-profit alcanzado para {symbol} a {current_price}")
+                    break
+
+                # Trailing stop dinámico
+                support_distance = (current_price - support_level) / support_level if support_level and current_price > 0 else float('inf')
+                if support_distance < 0.05:  # Cerca del soporte
+                    trailing_percent = max(3.0, min(6.0, volatility * 1.0))  # Mínimo 3%, máximo 6%
                 else:
-                    trailing_percent = max(2, min(5, volatility * 1.5))
+                    trailing_percent = max(4.0, min(8.0, volatility * 1.5))  # Mínimo 4%, máximo 8%
 
                 if current_price > highest_price:
                     highest_price = current_price
                 trailing_stop_price = highest_price * (1 - trailing_percent / 100)
 
-                logging.info(f"Trailing stop {symbol}: precio actual={current_price}, máximo={highest_price}, stop={trailing_stop_price}")
+                logging.info(f"Trailing stop {symbol}: precio actual={current_price}, máximo={highest_price}, stop={trailing_stop_price}, trailing_percent={trailing_percent:.2f}%")
 
                 if current_price <= trailing_stop_price:
                     sell_symbol(symbol, amount, trade_id)
@@ -665,42 +681,31 @@ def calculate_adaptive_strategy(indicators, data=None):
     support_level = indicators.get('support_level', None)
     adx = indicators.get('adx', None)
     has_macd_crossover = indicators.get('has_macd_crossover', False)
-    symbol = indicators.get('symbol', 'desconocido')  # Extraer symbol explícitamente
+    symbol = indicators.get('symbol', 'desconocido')
 
     # Calcular distancia al soporte
-    support_distance = None
-    if support_level is not None and current_price > 0:
-        support_distance = (current_price - support_level) / support_level
+    support_distance = (current_price - support_level) / support_level if support_level and current_price > 0 else float('inf')
+    support_near_threshold = 0.2  # Aumentado de 0.15 para más flexibilidad
 
-    # Aumentar el umbral de proximidad al soporte a 15%
-    support_near_threshold = 0.15  # Confirmed as 15%
-
-    # Verificar tendencia en 1h o 4h para evitar falsos positivos
+    # Confirmación multi-timeframe (15m y 1h)
     trend_confirmed = False
-    if data and ('1h' in data or '4h' in data):
-        for tf in ['1h', '4h']:
-            if tf in data and not data[tf].empty and len(data[tf]) >= 10:
-                if 'tendencia_alcista' in data[tf] and 'volumen_creciente' in data[tf]:
-                    if data[tf]['tendencia_alcista'].iloc[-1] and data[tf]['volumen_creciente'].iloc[-1]:
-                        trend_confirmed = True
-                        break
-                else:
-                    logging.warning(f"Columnas 'tendencia_alcista' o 'volumen_creciente' no disponibles en {tf} para {symbol}")
-            else:
-                logging.warning(f"Datos insuficientes o vacíos en {tf} para {symbol}")
+    if data and '15m' in data and '1h' in data and not data['15m'].empty and not data['1h'].empty:
+        trend_15m = data['15m']['tendencia_alcista'].iloc[-1] if 'tendencia_alcista' in data['15m'] else False
+        trend_1h = data['1h']['tendencia_alcista'].iloc[-1] if 'tendencia_alcista' in data['1h'] else False
+        if trend_15m and trend_1h:
+            trend_confirmed = True
     if not trend_confirmed:
-        return "mantener", 50, f"Tendencia no confirmada en 1h o 4h para {symbol}"
+        return "mantener", 50, f"Tendencia no confirmada en 15m y 1h para {symbol}"
 
-    # Evitar mercados sin tendencia (ADX < 25)
-    if adx is None or adx < 25:
+    # Relajar requisito de ADX
+    if adx is None or adx < 20:  # Reducido de 25
         return "mantener", 50, f"Tendencia débil (ADX: {adx if adx else 'None'}) para {symbol}"
 
-    # Confirmar tendencia alcista y volumen
+    # Confirmar tendencia alcista y volumen en 4h o 1h
     roc_4h = None
     tendencia_alcista = False
     macd_4h = None
     volumen_creciente = False
-
     if data and '4h' in data and not data['4h'].empty:
         roc_4h = data['4h']['ROC'].iloc[-1] if 'ROC' in data['4h'] and not pd.isna(data['4h']['ROC'].iloc[-1]) else None
         tendencia_alcista = data['4h']['tendencia_alcista'].iloc[-1] if 'tendencia_alcista' in data['4h'] else False
@@ -714,22 +719,21 @@ def calculate_adaptive_strategy(indicators, data=None):
             macd_4h = data['1h']['MACD'].iloc[-1] if 'MACD' in data['1h'] else None
             volumen_creciente = data['1h']['volume'].iloc[-1] > data['1h']['volume'].mean() if 'volume' in data['1h'] else False
 
-    # Condiciones obligatorias mínimas
-    if (roc_4h is None or roc_4h <= 0.5 or not tendencia_alcista or macd_4h <= 0 or not volumen_creciente):
+    # Relajar condiciones mínimas
+    if (roc_4h is None or roc_4h <= 0.3 or not tendencia_alcista or macd_4h is None or macd_4h <= 0 or not volumen_creciente):
         return "mantener", 50, f"Tendencia alcista o volumen no confirmados (ROC: {roc_4h}, Tendencia: {tendencia_alcista}, MACD: {macd_4h}, Volumen: {volumen_creciente}) para {symbol}"
 
     # Verificar proximidad al soporte
-    if support_distance is None:
-        return "mantener", 50, f"No se pudo calcular la distancia al soporte para {symbol} (soporte no detectado o precio inválido)"
     if support_distance > support_near_threshold:
         return "mantener", 50, f"Lejos del soporte (distancia: {support_distance:.2%}) para {symbol}"
 
-    # Nuevos indicadores de 15m
+    # Indicadores de 15m
     ema_crossover = False
     stoch_crossover = False
     atr_increasing = False
     obv_increasing = False
     macd_crossover_15m = False
+    breakout = False
     if data and '15m' in data and not data['15m'].empty:
         ema_crossover = data['15m']['ema_crossover'].iloc[-1] if 'ema_crossover' in data['15m'] and not pd.isna(data['15m']['ema_crossover'].iloc[-1]) else False
         stoch_crossover = data['15m']['stoch_crossover'].iloc[-1] if 'stoch_crossover' in data['15m'] and not pd.isna(data['15m']['stoch_crossover'].iloc[-1]) else False
@@ -740,42 +744,47 @@ def calculate_adaptive_strategy(indicators, data=None):
             data['15m']['MACD_signal'] if 'MACD_signal' in data['15m'] else pd.Series(),
             lookback=5
         )[0]
+        # Señal de breakout: precio supera el máximo de las últimas 10 velas en 15m con volumen
+        if len(data['15m']) >= 10:
+            recent_highs = data['15m']['high'].iloc[-10:-1].max()
+            breakout = current_price > recent_highs and relative_volume > 2.0
 
-    # Filtro de volatilidad: ATR debe haber aumentado al menos un 5% en las últimas 3 velas en 15m
+    # Relajar filtro de volatilidad
     if not atr_increasing:
-        return "mantener", 50, f"Aumento de volatilidad no confirmado (ATR no sube al menos 5%) para {symbol}"
+        logging.debug(f"Volatilidad no aumenta (ATR no sube 5%) para {symbol}, pero se evalúa de todos modos")
 
-    # Puntuación ponderada priorizando volumen relativo alto
+    # Puntuación ponderada ajustada con breakout
     weighted_signals = [
-        4 * (relative_volume > 2.5 if relative_volume else False),
-        3 * (short_volume_trend == "increasing" or short_volume_trend == "stable"),
+        4 * (relative_volume > 2.0 if relative_volume else False),  # Reducido de 2.5
+        3 * (short_volume_trend in ["increasing", "stable"]),
         2 * (price_trend == "increasing"),
-        2 * (roc > 1.0 if roc else False),
-        1 * (depth >= 3000),
-        1 * (spread <= 0.005 * current_price),
+        2 * (roc > 0.5 if roc else False),  # Reducido de 1.0
+        1 * (depth >= 2000),  # Reducido de 3000
+        1 * (spread <= 0.01 * current_price),  # Aumentado de 0.005
         1 * (support_distance <= support_near_threshold),
-        2 * (rsi > 60 if rsi else False) if rsi else 0,
+        2 * (rsi > 50 if rsi else False) if rsi else 0,  # Reducido de 60
         2 * (ema_crossover),
         1 * (stoch_crossover),
         1 * (obv_increasing),
-        1 * (macd_crossover_15m)
+        1 * (macd_crossover_15m),
+        2 * (breakout)  # Nueva señal de breakout
     ]
     signals_score = sum(weighted_signals)
 
-    # Ajuste de confianza basado en MACD crossover (opcional)
+    # Ajuste de confianza relajado
     base_confidence = 50
-    if signals_score >= 9 and adx and adx > 20:  # Relajado desde 25
+    if signals_score >= 7 and adx and adx > 20:  # Reducido de 9
         base_confidence = 70
-        if has_macd_crossover or macd_crossover_15m:
+        if has_macd_crossover or macd_crossover_15m or breakout:
             base_confidence = 90
         elif rsi and rsi > 70:
             base_confidence = 85
 
-    # Explicación y decisión
+    # Decisión y explicación
     action = "mantener" if base_confidence < 70 else "comprar"
-    explanation = f"{'Compra fuerte' if base_confidence >= 70 else 'Condiciones insuficientes para comprar'}: Volumen relativo > 2.5, puntaje {signals_score}/13, ADX > 20, {'con cruce MACD' if has_macd_crossover else 'sin cruce MACD'}, cerca del soporte{' y RSI > 60' if rsi and rsi > 60 else ''}{' y EMA crossover' if ema_crossover else ''}{' y Estocástico crossover' if stoch_crossover else ''}{' y OBV aumentando' if obv_increasing else ''} para {symbol}"
+    explanation = f"{'Compra fuerte' if base_confidence >= 70 else 'Condiciones insuficientes'}: Volumen relativo={relative_volume or 'N/A'}, puntaje={signals_score}/13, ADX={adx or 'N/A'}, breakout={'Sí' if breakout else 'No'}, soporte_dist={support_distance:.2%}{' y RSI > 50' if rsi and rsi > 50 else ''}{' y EMA crossover' if ema_crossover else ''}{' y Estocástico crossover' if stoch_crossover else ''}{' y OBV aumentando' if obv_increasing else ''} para {symbol}"
 
-    # Evaluar si fue una oportunidad perdida (en un hilo separado)
+    # Mantener evaluación de oportunidades perdidas
     if action == "mantener" and base_confidence > 50:
         threading.Thread(target=evaluate_missed_opportunity, args=(symbol, current_price, base_confidence, explanation, indicators), daemon=True).start()
 
@@ -850,6 +859,56 @@ def fetch_ohlcv_with_retry(symbol, timeframe, limit=50, max_retries=3):
 # Global lock for buy synchronization
 buy_lock = threading.Lock()
 
+def backtest_strategy(symbol, timeframe='1h', limit=500):
+    """
+    Realiza un backtest simple de la estrategia en un símbolo dado usando datos históricos.
+
+    Args:
+        symbol: Símbolo del activo (e.g., 'BTC/USDT').
+        timeframe: Marco temporal para el backtest (default '1h').
+        limit: Número de velas históricas a usar (default 500).
+
+    Returns:
+        float: Ganancia total en USDT, o None si no hay datos.
+    """
+    data, price_series = fetch_and_prepare_data(symbol, limit=limit)
+    if not data or timeframe not in data or data[timeframe].empty:
+        logging.error(f"No hay datos suficientes para backtest de {symbol}")
+        return None
+
+    df = data[timeframe]
+    trades = []
+    position = None
+
+    for i in range(len(df)):
+        indicators = {
+            'rsi': df['RSI'].iloc[i] if 'RSI' in df else None,
+            'relative_volume': df['volume'].iloc[i] / df['volume'].iloc[max(0, i-10):i].mean() if i >= 10 and df['volume'].iloc[max(0, i-10):i].mean() != 0 else None,
+            'roc': df['ROC'].iloc[i] if 'ROC' in df else None,
+            'price_trend': 'increasing' if 'SMA_7' in df and df['close'].iloc[i] > df['SMA_7'].iloc[i] else 'stable',
+            'short_volume_trend': calculate_short_volume_trend({'15m': df}) if '15m' in data else 'insufficient_data',
+            'current_price': df['close'].iloc[i],
+            'support_level': detect_support_level(data, df['close'].iloc[:i+1]),
+            'adx': calculate_adx(df.iloc[:i+1]) if i >= 14 else None,
+            'has_macd_crossover': has_recent_macd_crossover(df['MACD'].iloc[:i+1], df['MACD_signal'].iloc[:i+1])[0] if 'MACD' in df else False,
+            'symbol': symbol
+        }
+        action, confidence, _ = calculate_adaptive_strategy(indicators, data)
+
+        if action == "comprar" and confidence >= 70 and not position:
+            position = {'buy_price': df['close'].iloc[i], 'amount': 1000 / df['close'].iloc[i]}  # Simula 1000 USDT por trade
+        elif position:
+            current_price = df['close'].iloc[i]
+            profit = (current_price - position['buy_price']) * position['amount']
+            # Simula take-profit al 5% o stop-loss al 2%
+            if current_price >= position['buy_price'] * 1.05 or current_price <= position['buy_price'] * 0.98:
+                trades.append({'symbol': symbol, 'profit': profit})
+                position = None
+
+    total_profit = sum(trade['profit'] for trade in trades)
+    logging.info(f"Backtest para {symbol}: {len(trades)} trades, ganancia total: {total_profit:.2f} USDT")
+    return total_profit
+
 def demo_trading(high_volume_symbols=None):
     logging.info("Iniciando trading en segundo plano para todos los activos USDT relevantes...")
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
@@ -896,6 +955,12 @@ def demo_trading(high_volume_symbols=None):
                     logging.info(f"Se omite {symbol} porque ya tienes una posición abierta.")
                     continue
 
+                # Backtest simple para filtrar símbolos no rentables
+                backtest_result = backtest_strategy(symbol)
+                if backtest_result is not None and backtest_result < 0:
+                    logging.info(f"{symbol} no rentable en backtest, omitiendo")
+                    continue
+
                 conditions = {}
                 daily_volume = fetch_volume(symbol)
                 conditions['daily_volume >= 250000'] = daily_volume is not None and daily_volume >= 250000
@@ -939,7 +1004,7 @@ def demo_trading(high_volume_symbols=None):
                     failed_conditions_count['spread <= 0.005 * price'] = failed_conditions_count.get('spread <= 0.005 * price', 0) + 1
                     continue
 
-                conditions['imbalance >= 1.5'] = imbalance >= 1.5 if imbalance is not None else False  # Added None check for safety
+                conditions['imbalance >= 1.5'] = imbalance >= 1.5 if imbalance is not None else False
                 if not conditions['imbalance >= 1.5']:
                     logging.info(f"Se omite {symbol} por imbalance bajo: {imbalance}")
                     failed_conditions_count['imbalance >= 1.5'] = failed_conditions_count.get('imbalance >= 1.5', 0) + 1
@@ -975,11 +1040,10 @@ def demo_trading(high_volume_symbols=None):
                 volume_trend = "insufficient_data"
                 price_trend = "insufficient_data"
 
-                # Calcular volume_trend con manejo seguro de linregress
                 if len(volume_series) >= 10:
                     last_10_volume = volume_series[-10:]
                     try:
-                        slope_volume, intercept, r_value, p_value, std_err = linregress(range(10), last_10_volume)
+                        slope_volume, _, _, _, _ = linregress(range(10), last_10_volume)
                         volume_trend = "increasing" if slope_volume > 0.01 else "decreasing" if slope_volume < -0.01 else "stable"
                         logging.debug(f"Volume trend calculado para {symbol}: slope={slope_volume}, trend={volume_trend}")
                     except Exception as e:
@@ -988,11 +1052,10 @@ def demo_trading(high_volume_symbols=None):
                 else:
                     logging.debug(f"No hay suficientes datos para calcular volume_trend para {symbol}: {len(volume_series)} velas")
 
-                # Calcular price_trend con manejo seguro de linregress
                 if len(price_series) >= 10:
                     last_10_price = price_series[-10:]
                     try:
-                        slope_price, intercept, r_value, p_value, std_err = linregress(range(10), last_10_price)
+                        slope_price, _, _, _, _ = linregress(range(10), last_10_price)
                         price_trend = "increasing" if slope_price > 0.01 else "decreasing" if slope_price < -0.01 else "stable"
                         logging.debug(f"Price trend calculado para {symbol}: slope={slope_price}, trend={price_trend}")
                     except Exception as e:
@@ -1002,10 +1065,7 @@ def demo_trading(high_volume_symbols=None):
                     logging.debug(f"No hay suficientes datos para calcular price_trend para {symbol}: {len(price_series)} velas")
 
                 support_level = detect_support_level(data, price_series, window=15, max_threshold_multiplier=3.0)
-
-                support_distance = None
-                if support_level is not None and current_price > 0:
-                    support_distance = (current_price - support_level) / support_level
+                support_distance = (current_price - support_level) / support_level if support_level and current_price > 0 else None
 
                 indicators = {
                     "adx": adx,
@@ -1057,7 +1117,6 @@ def demo_trading(high_volume_symbols=None):
                     logging.info(f"Resultado de gpt_decision_buy para {symbol}: Acción={action}, Confianza={confidence}%, Explicación={explanation}")
 
                 logging.info(f"Decisión final para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
-
                 logging.debug(f"Verificación post-decisión para {symbol}: action={action}, confidence={confidence}, explanation={explanation}, conditions={conditions}")
 
                 if action == "comprar" and confidence >= 70:
@@ -1092,19 +1151,20 @@ def demo_trading(high_volume_symbols=None):
                                 logging.info(f"Compra ejecutada para {symbol}: {explanation}")
                                 send_telegram_message(f"✅ *Compra* `{symbol}`\nConfianza: `{confidence}%`\nCantidad: `{amount}`\nExplicación: `{explanation}`")
                                 dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], indicators)
+                                # Rebalanceo dinámico tras cada trade
+                                usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
+                                available_for_trading = max(usdt_balance - reserve, 0)
+                                budget_per_trade = available_for_trading / (MAX_DAILY_BUYS - get_daily_buys()) if (MAX_DAILY_BUYS - get_daily_buys()) > 0 else available_for_trading
+                                logging.info(f"Rebalanceo: Nuevo saldo USDT={usdt_balance}, presupuesto por trade={budget_per_trade}")
                             else:
                                 logging.error(f"Error al ejecutar compra para {symbol}: orden no completada")
                         else:
                             logging.info(f"Compra no ejecutada para {symbol}: valor de la operación ({trade_value}) < MIN_NOTIONAL ({MIN_NOTIONAL}) y saldo insuficiente")
 
-                logging.debug(f"Verificación antes de contadores para {symbol}: failed_conditions_count={failed_conditions_count}, symbols_processed={symbols_processed}")
-
                 failed_conditions = [key for key, value in conditions.items() if not value]
                 for condition in failed_conditions:
                     failed_conditions_count[condition] = failed_conditions_count.get(condition, 0) + 1
                 symbols_processed += 1
-
-                logging.debug(f"Contadores actualizados para {symbol}: failed_conditions_count={failed_conditions_count}, symbols_processed={symbols_processed}")
 
             except Exception as e:
                 logging.error(f"Error en demo_trading para {symbol}: {e}", exc_info=True)
@@ -1137,8 +1197,14 @@ def analyze_trade_outcome(trade_id):
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         
+        # Obtener datos de compra y venta directamente de la base de datos
         cursor.execute("""
-            SELECT t1.*, t2.*
+            SELECT t1.symbol, t1.price AS buy_price, t1.amount, t1.timestamp AS buy_time,
+                   t1.rsi, t1.adx, t1.atr, t1.relative_volume, t1.divergence, t1.bb_position,
+                   t1.confidence, t1.has_macd_crossover, t1.candles_since_crossover,
+                   t1.volume_trend, t1.price_trend, t1.short_volume_trend, t1.support_level,
+                   t1.spread, t1.imbalance, t1.depth,
+                   t2.price AS sell_price, t2.timestamp AS sell_time
             FROM transactions_new t1
             LEFT JOIN transactions_new t2 ON t1.trade_id = t2.trade_id AND t2.action = 'sell'
             WHERE t1.trade_id = ? AND t1.action = 'buy'
@@ -1148,79 +1214,82 @@ def analyze_trade_outcome(trade_id):
         if not trade_data:
             logging.warning(f"No se encontraron datos para el trade_id: {trade_id}")
             return
+        
+        if trade_data[20] is None:  # No hay venta registrada aún
+            logging.info(f"Trade {trade_id} no tiene venta registrada aún")
+            return
 
+        # Extraer datos con manejo de valores nulos
         buy_data = {
-            'symbol': trade_data[1],
-            'buy_price': trade_data[3],
-            'amount': trade_data[4],
-            'timestamp': trade_data[5],
-            'rsi': trade_data[7],
-            'adx': trade_data[8],
-            'atr': trade_data[9],
-            'relative_volume': trade_data[10],
-            'divergence': trade_data[11],
-            'bb_position': trade_data[12],
-            'confidence': trade_data[13],
-            'has_macd_crossover': trade_data[14],
-            'candles_since_crossover': trade_data[15],
-            'volume_trend': trade_data[16],
-            'price_trend': trade_data[17],
-            'short_volume_trend': trade_data[18],
-            'support_level': trade_data[19],
-            'spread': trade_data[20],
-            'imbalance': trade_data[21],
-            'depth': trade_data[22]
+            'symbol': trade_data[0],
+            'buy_price': trade_data[1],
+            'amount': trade_data[2],
+            'timestamp': trade_data[3],
+            'rsi': trade_data[4],
+            'adx': trade_data[5],
+            'atr': trade_data[6],
+            'relative_volume': trade_data[7],
+            'divergence': trade_data[8],
+            'bb_position': trade_data[9],
+            'confidence': trade_data[10],
+            'has_macd_crossover': trade_data[11],
+            'candles_since_crossover': trade_data[12],
+            'volume_trend': trade_data[13],
+            'price_trend': trade_data[14],
+            'short_volume_trend': trade_data[15],
+            'support_level': trade_data[16],
+            'spread': trade_data[17],
+            'imbalance': trade_data[18],
+            'depth': trade_data[19]
         }
+        sell_price = trade_data[20]  # Usar precio de venta de la DB directamente
 
-        sell_price = trade_data[23] if trade_data[23] else fetch_price(buy_data['symbol'])
+        # Calcular ganancia/pérdida con datos reales
         profit_loss = (sell_price - buy_data['buy_price']) * buy_data['amount']
         is_profitable = profit_loss > 0
 
-        # Log stats for executed trades
+        # Guardar estadísticas
         with open("trade_stats.csv", "a") as f:
-            f.write(f"{trade_id},{buy_data['symbol']},{buy_data['buy_price']},{sell_price},{buy_data['amount']},{profit_loss},{buy_data['rsi']},{datetime.now()}\n")
+            f.write(f"{trade_id},{buy_data['symbol']},{buy_data['buy_price']},{sell_price},{buy_data['amount']},{profit_loss:.2f},{buy_data['rsi'] or 'N/A'},{datetime.now()}\n")
 
-        # Dynamic RSI adjustment
+        # Ajuste dinámico de RSI_THRESHOLD
         global RSI_THRESHOLD
         if 'RSI_THRESHOLD' not in globals():
-            RSI_THRESHOLD = 80  # Default if not set
-        if profit_loss > 0 and buy_data['rsi'] < 80:
+            RSI_THRESHOLD = 70  # Restaurar valor original si no está definido
+        if profit_loss > 0 and buy_data['rsi'] and buy_data['rsi'] < 80:
             RSI_THRESHOLD = max(65, RSI_THRESHOLD - 5)
-            logging.info(f"RSI_THRESHOLD lowered to {RSI_THRESHOLD} due to profitable early RSI trade")
-        elif profit_loss < 0 and buy_data['rsi'] > 75:
+            logging.info(f"RSI_THRESHOLD reducido a {RSI_THRESHOLD} por operación rentable con RSI temprano")
+        elif profit_loss < 0 and buy_data['rsi'] and buy_data['rsi'] > 75:
             RSI_THRESHOLD = min(85, RSI_THRESHOLD + 5)
-            logging.info(f"RSI_THRESHOLD raised to {RSI_THRESHOLD} due to losing late RSI trade")
+            logging.info(f"RSI_THRESHOLD aumentado a {RSI_THRESHOLD} por operación perdedora con RSI tardío")
 
+        # Prompt para GPT con datos reales
         gpt_prompt = f"""
-        Analiza los datos de la transacción de `{buy_data['symbol']}` (ID: {trade_id}) para determinar por qué fue un éxito o un fracaso, proporcionando detalles específicos sobre qué hicimos bien o mal según nuestra estrategia. Responde SOLO con un JSON válido sin etiqueta '''json''':
+        Analiza esta transacción de `{buy_data['symbol']}` (ID: {trade_id}) para determinar por qué fue un éxito o un fracaso, si es exito dime cual fue el acierto y si fue un fracaso dime que se deberia corregir en los datos agregar para tomar un amejor decision:
+        - Precio de compra: {buy_data['buy_price']}
+        - Precio de venta: {sell_price}
+        - Cantidad: {buy_data['amount']}
+        - Ganancia/Pérdida: {profit_loss:.2f} USDT
+        - RSI: {buy_data['rsi'] if buy_data['rsi'] else 'N/A'}
+        - ADX: {buy_data['adx'] if buy_data['adx'] else 'N/A'}
+        - ATR: {buy_data['atr'] if buy_data['atr'] else 'N/A'}
+        - Volumen relativo: {buy_data['relative_volume'] if buy_data['relative_volume'] else 'N/A'}
+        - Divergencia: {buy_data['divergence'] if buy_data['divergence'] else 'N/A'}
+        - Posición BB: {buy_data['bb_position'] if buy_data['bb_position'] else 'N/A'}
+        - Confianza: {buy_data['confidence'] if buy_data['confidence'] else 'N/A'}
+        - Cruce MACD: {'Sí' if buy_data['has_macd_crossover'] else 'No'}
+        - Velas desde cruce MACD: {buy_data['candles_since_crossover'] if buy_data['candles_since_crossover'] else 'N/A'}
+        - Tendencia de volumen: {buy_data['volume_trend'] if buy_data['volume_trend'] else 'N/A'}
+        - Tendencia de precio: {buy_data['price_trend'] if buy_data['price_trend'] else 'N/A'}
+        - Tendencia de volumen corto: {buy_data['short_volume_trend'] if buy_data['short_volume_trend'] else 'N/A'}
+        - Nivel de soporte: {buy_data['support_level'] if buy_data['support_level'] else 'N/A'}
+        - Spread: {buy_data['spread'] if buy_data['spread'] else 'N/A'}
+        - Imbalance: {buy_data['imbalance'] if buy_data['imbalance'] else 'N/A'}
+        - Profundidad: {buy_data['depth'] if buy_data['depth'] else 'N/A'}
+        Responde SOLO con un JSON válido sin etiqueta '''json''':
         {{"resultado": "éxito", "razon": "Compramos {buy_data['symbol']} a {buy_data['buy_price']} con RSI {buy_data['rsi']} y volumen fuerte {buy_data['relative_volume']}, vendimos a {sell_price} por una ganancia de {profit_loss:.2f} USDT gracias a un timing efectivo.", "confianza": 85}}
         o
         {{"resultado": "fracaso", "razon": "Compramos {buy_data['symbol']} a {buy_data['buy_price']} con RSI {buy_data['rsi']} y volumen débil {buy_data['relative_volume']}, vendimos a {sell_price} por una pérdida de {profit_loss:.2f} USDT por falta de momentum.", "confianza": 75}}
-
-        Datos de compra:
-        - Símbolo: {buy_data['symbol']}
-        - Precio de compra: {buy_data['buy_price']}
-        - Cantidad: {buy_data['amount']}
-        - Timestamp de compra: {buy_data['timestamp']}
-        - RSI: {buy_data['rsi']}
-        - ADX: {buy_data['adx']}
-        - ATR: {buy_data['atr']}
-        - Volumen relativo: {buy_data['relative_volume']}
-        - Divergencia: {buy_data['divergence']}
-        - Posición BB: {buy_data['bb_position']}
-        - Confianza: {buy_data['confidence']}
-        - Cruce MACD: {'Sí' if buy_data['has_macd_crossover'] else 'No'}
-        - Velas desde cruce MACD: {buy_data['candles_since_crossover']}
-        - Tendencia de volumen: {buy_data['volume_trend']}
-        - Tendencia de precio: {buy_data['price_trend']}
-        - Tendencia de volumen corto: {buy_data['short_volume_trend']}
-        - Nivel de soporte: {buy_data['support_level']}
-        - Spread: {buy_data['spread']}
-        - Imbalance: {buy_data['imbalance']}
-        - Profundidad: {buy_data['depth']}
-
-        Precio de venta: {sell_price}
-        Ganancia/Pérdida: {profit_loss:.2f} USDT
         """
 
         response = client.chat.completions.create(
@@ -1242,7 +1311,6 @@ def analyze_trade_outcome(trade_id):
                           f"Razón: {razon}\n" \
                           f"Confianza: {confianza}%"
         send_telegram_message(telegram_message)
-
         logging.info(f"Análisis de transacción {trade_id}: {resultado} - {razon} (Confianza: {confianza}%)")
 
     except Exception as e:
