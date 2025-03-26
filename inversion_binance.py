@@ -264,7 +264,7 @@ def fetch_volume(symbol):
         logging.error(f"Error al obtener volumen de {symbol}: {e}")
         return None
 
-def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, roc_length=7, limit=50):
+def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, roc_length=7, limit=100):
     """
     Obtiene datos OHLCV para los timeframes '15m', '1h', '4h' y '1d' y calcula indicadores usando
     un número reducido de velas para ATR, RSI, Bollinger Bands y ROC, de modo que se pueda operar
@@ -303,8 +303,8 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
             df.sort_index(inplace=True)
             logging.debug(f"DataFrame para {symbol} en {tf} creado con {len(df)} velas.")
 
-            if len(df) < 5:
-                logging.warning(f"Datos insuficientes (<5 velas) para {symbol} en {tf}")
+            if len(df) < max(atr_length, rsi_length, bb_length, roc_length, 15):
+                logging.warning(f"Datos insuficientes (<{max(atr_length, rsi_length, bb_length, roc_length, 15)} velas) para {symbol} en {tf}")
                 continue
 
             # Rellenar gaps en el índice con límite del 10%
