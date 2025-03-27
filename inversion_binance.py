@@ -576,22 +576,14 @@ def calculate_adaptive_strategy(indicators, data=None):
     symbol = indicators.get('symbol', 'desconocido')
 
     # Nuevo umbral mínimo para volumen relativo
-    MIN_RELATIVE_VOLUME = 1.0
+    MIN_RELATIVE_VOLUME = 0.5
 
     support_distance = (current_price - support_level) / support_level if support_level and current_price > 0 else 0.5
-    support_near_threshold = 0.2
+    support_near_threshold = 0.3
 
     # Filtro inicial de volumen relativo
     if relative_volume is None or relative_volume < MIN_RELATIVE_VOLUME:
         return "mantener", 50, f"Volumen relativo demasiado bajo ({relative_volume}) para {symbol}"
-
-    # Filtro de tendencia de precio
-    if price_trend != "increasing":
-        return "mantener", 50, f"Tendencia de precio no es alcista para {symbol}"
-
-    # Filtro de tendencia de volumen
-    if short_volume_trend not in ["increasing", "stable"]:
-        return "mantener", 50, f"Tendencia de volumen no es favorable para {symbol}"
 
     trend_confirmed = False
     if data and '15m' in data and '1h' in data and not data['15m'].empty and not data['1h'].empty:
@@ -602,7 +594,7 @@ def calculate_adaptive_strategy(indicators, data=None):
     if not trend_confirmed:
         return "mantener", 50, f"Tendencia no confirmada en 15m y 1h para {symbol}"
 
-    if adx is None or adx < 20:
+    if adx is None or adx < 15:
         return "mantener", 50, f"Tendencia débil (ADX: {adx if adx else 'None'}) para {symbol}"
 
     roc_4h = None
@@ -653,14 +645,16 @@ def calculate_adaptive_strategy(indicators, data=None):
 
     # Ajuste en weighted_signals con mayor peso al volumen relativo
     weighted_signals = [
-        6 * (relative_volume > 2.0 if relative_volume else False),  # Peso aumentado de 4 a 6
-        3 * (short_volume_trend in ["increasing", "stable"]),
-        2 * (price_trend == "increasing"),
+        8 * (relative_volume > 2.0 if relative_volume else False),  # Peso aumentado de 4 a 6
+        4 * (relative_volume > 1.0 if relative_volume else False),
+        2 * (short_volume_trend in ["increasing", "stable"]),
+        3 * (price_trend == "increasing"),
         2 * (roc > 0.5 if roc else False),
         1 * (depth >= 2000),
         1 * (spread <= 0.01 * current_price),
-        1 * (support_distance <= support_near_threshold),
-        2 * (rsi > 50 if rsi else False) if rsi else 0,
+        0.5 * (support_distance <= support_near_threshold),
+        3 * (rsi > 50 if rsi else False) if rsi else 0,
+        2 * (rsi > 70 if rsi else False) if rsi else 0,  # Nuevo peso para RSI alto
         2 * (ema_crossover),
         1 * (stoch_crossover),
         1 * (obv_increasing),
@@ -670,7 +664,7 @@ def calculate_adaptive_strategy(indicators, data=None):
     signals_score = sum(weighted_signals)
 
     base_confidence = 50
-    if signals_score >= 7 and adx and adx > 20:
+    if signals_score >= 7 and adx and adx > 15:  # Cambiado de 20 a 15
         base_confidence = 70
         if has_macd_crossover or macd_crossover_15m or breakout:
             base_confidence = 90
@@ -679,7 +673,7 @@ def calculate_adaptive_strategy(indicators, data=None):
 
     # Penalización de confianza si volumen relativo es bajo
     if relative_volume < 1.5:
-        base_confidence = max(50, base_confidence - 10)  # Penalización del 10%
+        base_confidence = max(50, base_confidence - 5)  # Penalización del 5%
 
     action = "mantener" if base_confidence < 70 else "comprar"
     explanation = f"{'Compra fuerte' if base_confidence >= 70 else 'Condiciones insuficientes'}: Volumen relativo={relative_volume or 'N/A'}, puntaje={signals_score}/13, ADX={adx or 'N/A'}, breakout={'Sí' if breakout else 'No'}, soporte_dist={support_distance:.2%}{' y RSI > 50' if rsi and rsi > 50 else ''}{' y EMA crossover' if ema_crossover else ''}{' y Estocástico crossover' if stoch_crossover else ''}{' y OBV aumentando' if obv_increasing else ''} para {symbol}"
