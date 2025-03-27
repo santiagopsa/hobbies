@@ -34,7 +34,7 @@ threading.Thread(target=log_worker, daemon=True).start()
 # Cargar variables de entorno desde .env
 load_dotenv()
 
-# Configuración de la API de Binance para spot (por defecto)
+# Configuración de la API de Binance para spot
 exchange = ccxt.binance({
     'apiKey': os.getenv('BINANCE_API_KEY_REAL'),
     'secret': os.getenv('BINANCE_SECRET_KEY_REAL'),
@@ -118,16 +118,20 @@ def increment_daily_purchases():
     conn.commit()
     conn.close()
 
-# Global variables
+# Variables globales
 market_cache = {}
 active_orders = set()
-MIN_NOTIONAL = 10  # Minimum notional set to $7 USD for new coins
+MIN_NOTIONAL = 10  # Mínimo notional en $10 USD para nuevas monedas
 
-# Función para obtener precio
-def fetch_price(symbol):
+# Función para obtener precio (mejorada)
+def fetch_price(symbol, ws_ticker=None):
     try:
+        if ws_ticker and 'c' in ws_ticker:  # 'c' es el último precio en el stream de Binance
+            log_queue.put((logging.DEBUG, f"Usando precio del WebSocket para {symbol}: {ws_ticker['c']}"))
+            return float(ws_ticker['c'])
         ticker = exchange.fetch_ticker(symbol)
-        return ticker['last']
+        log_queue.put((logging.DEBUG, f"Ticker obtenido para {symbol}: {ticker}"))
+        return ticker['last'] if ticker.get('last') else ticker.get('bid')  # Fallback al precio de oferta
     except ccxt.RateLimitExceeded:
         log_queue.put((logging.WARNING, f"Límite de API excedido al obtener precio para {symbol}"))
         time.sleep(0.1)
@@ -136,24 +140,24 @@ def fetch_price(symbol):
         log_queue.put((logging.ERROR, f"Error al obtener precio para {symbol}: {e}"))
         return None
 
-# Cache markets
+# Cache de mercados
 def update_market_cache():
     global market_cache
     while True:
         try:
             market_cache = exchange.load_markets()
             log_queue.put((logging.DEBUG, "Mercados actualizados en caché."))
-            time.sleep(60)  # Update every minute
+            time.sleep(60)  # Actualizar cada minuto
         except Exception as e:
             log_queue.put((logging.ERROR, f"Error al actualizar caché de mercados: {e}"))
             time.sleep(10)
 
 threading.Thread(target=update_market_cache, daemon=True).start()
 
-# Compra optimizada con reintentos
+# Compra optimizada con reintentos y verificación de mercado
 buying_lock = threading.Lock()
 
-def buy_symbol_microsecond(symbol, budget=15, max_attempts=5, retry_delay=0.001):
+def buy_symbol_microsecond(symbol, ws_ticker=None, budget=15, max_attempts=5, retry_delay=0.001):
     daily_purchases = get_daily_purchases()
     if daily_purchases >= MAX_DAILY_PURCHASES:
         log_queue.put((logging.INFO, f"Límite diario alcanzado ({MAX_DAILY_PURCHASES}). Ignorando {symbol}."))
@@ -166,43 +170,58 @@ def buy_symbol_microsecond(symbol, budget=15, max_attempts=5, retry_delay=0.001)
         active_orders.add(symbol)
 
     log_queue.put((logging.INFO, f"🚀 Comprando {symbol} inmediatamente..."))
-    try:
-        # Obtener precio rápidamente
-        ticker = exchange.fetch_ticker(symbol)
-        price = ticker['last']
-        if not price:
-            raise Exception("No se pudo obtener precio")
+    attempt = 0
+    while attempt < max_attempts:
+        try:
+            # Verificar que el mercado esté activo
+            market = market_cache.get(symbol)
+            if not market or market.get('active') is not True:
+                exchange.load_markets(reload=True)  # Forzar actualización
+                market = exchange.markets.get(symbol)
+                if not market or market.get('active') is not True:
+                    raise Exception("El mercado no está activo o no está disponible")
 
-        # Calcular cantidad mínima viable
-        amount = budget / price
-        market = market_cache.get(symbol, exchange.markets[symbol])
-        lot_size = market['limits']['amount']['min']
-        amount = max(amount, lot_size)
-        amount = round(amount / lot_size) * lot_size
+            # Obtener precio rápidamente
+            price = fetch_price(symbol, ws_ticker)
+            if not price:
+                attempt += 1
+                log_queue.put((logging.WARNING, f"Intento {attempt}/{max_attempts} fallido para {symbol}: precio no disponible"))
+                time.sleep(retry_delay)
+                continue
 
-        # Ejecutar compra sin más verificaciones
-        start_time = time.time()
-        order = exchange.create_market_buy_order(symbol, amount)
-        end_time = time.time()
+            # Calcular cantidad mínima viable
+            amount = budget / price
+            lot_size = market['limits']['amount']['min']
+            amount = max(amount, lot_size)
+            amount = round(amount / lot_size) * lot_size
 
-        order_price = order.get('average', price)
-        filled = order.get('filled', amount)
-        timestamp = datetime.now(timezone.utc).isoformat()
+            # Ejecutar compra
+            start_time = time.time()
+            order = exchange.create_market_buy_order(symbol, amount)
+            end_time = time.time()
 
-        insert_transaction(symbol, 'buy', order_price, filled, timestamp)
-        increment_daily_purchases()
-        latency_ms = (end_time - start_time) * 1000
-        log_queue.put((logging.INFO, f"✅ Compra ejecutada: {symbol} a {order_price} USDT | Cantidad: {filled} | Latencia: {latency_ms:.3f}ms"))
-        send_telegram_message(f"✅ *Compra ejecutada*\nSímbolo: `{symbol}`\nPrecio: `{order_price}`\nCantidad: `{filled}`\nLatencia: `{latency_ms:.3f}ms`")
+            order_price = order.get('average', price)
+            filled = order.get('filled', amount)
+            timestamp = datetime.now(timezone.utc).isoformat()
 
-        active_orders.remove(symbol)
-        return {'price': order_price, 'filled': filled}
+            insert_transaction(symbol, 'buy', order_price, filled, timestamp)
+            increment_daily_purchases()
+            latency_ms = (end_time - start_time) * 1000
+            log_queue.put((logging.INFO, f"✅ Compra ejecutada: {symbol} a {order_price} USDT | Cantidad: {filled} | Latencia: {latency_ms:.3f}ms"))
+            send_telegram_message(f"✅ *Compra ejecutada*\nSímbolo: `{symbol}`\nPrecio: `{order_price}`\nCantidad: `{filled}`\nLatencia: `{latency_ms:.3f}ms`")
 
-    except Exception as e:
-        log_queue.put((logging.ERROR, f"Error al comprar {symbol}: {e}"))
-        send_telegram_message(f"❌ *Error*: `{symbol}` no se pudo comprar: {e}")
-        active_orders.remove(symbol)
-        return None
+            active_orders.remove(symbol)
+            return {'price': order_price, 'filled': filled}
+
+        except Exception as e:
+            log_queue.put((logging.ERROR, f"Error al comprar {symbol}: {e}"))
+            send_telegram_message(f"❌ *Error*: `{symbol}` no se pudo comprar: {e}")
+            attempt += 1
+            if attempt < max_attempts:
+                time.sleep(retry_delay)
+            else:
+                active_orders.remove(symbol)
+                return None
 
 # Venta
 def sell_symbol(symbol, amount):
@@ -219,12 +238,12 @@ def sell_symbol(symbol, amount):
         if not current_price:
             return None
         notional = amount * current_price
-        min_notional = market.get('limits', {}).get('cost', {}).get('min', MIN_NOTIONAL)  # $7 minimum
+        min_notional = market.get('limits', {}).get('cost', {}).get('min', MIN_NOTIONAL)
         if notional < min_notional:
-            amount = min_notional / current_price  # Adjust amount to meet minimum
-            amount = max(amount, market['limits']['amount']['min'])  # Ensure lot size
+            amount = min_notional / current_price
+            amount = max(amount, market['limits']['amount']['min'])
             amount = round(amount / market['limits']['amount']['stepSize']) * market['limits']['amount']['stepSize']
-        safe_amount = amount * 0.999  # Safety margin
+        safe_amount = amount * 0.999  # Margen de seguridad
         order = exchange.create_market_sell_order(symbol, safe_amount)
         order_price = order.get('average', order.get('price', current_price))
         ts = datetime.now(timezone.utc).isoformat()
@@ -306,8 +325,8 @@ def on_message(ws, message):
                 log_queue.put((logging.INFO, f"🚀 Nueva moneda detectada: {formatted_symbol} | Latencia: {latency_str}s"))
                 send_telegram_message(f"🚀 *Nueva moneda detectada*: `{formatted_symbol}`")
 
-                # Launch buy in a separate thread for immediate execution
-                threading.Thread(target=buy_symbol_microsecond, args=(formatted_symbol,), daemon=True).start()
+                # Pasar el ticker al hilo de compra
+                threading.Thread(target=buy_symbol_microsecond, args=(formatted_symbol, ticker), daemon=True).start()
     except Exception as e:
         log_queue.put((logging.ERROR, f"Error en on_message: {e}"))
 
@@ -348,7 +367,7 @@ def start_ws_thread():
 def get_sleep_duration():
     now_dt = datetime.now()
     next_critical = now_dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    sleep_time = (next_critical - now_dt).total_seconds() - 5  # Wake up 5 seconds early
+    sleep_time = (next_critical - now_dt).total_seconds() - 5  # Despertar 5 segundos antes
     return max(0, sleep_time)
 
 def keep_markets_updated():
@@ -364,10 +383,10 @@ def keep_markets_updated():
                 
                 if new_coin_detected:
                     log_queue.put((logging.DEBUG, "Nueva moneda detectada, durmiendo para permitir la compra."))
-                    time.sleep(0.1)  # Reduced sleep
+                    time.sleep(0.1)
                     new_coin_detected = False
                 else:
-                    time.sleep(0.05)  # Faster updates during critical window
+                    time.sleep(0.05)
             except ccxt.RateLimitExceeded:
                 log_queue.put((logging.WARNING, "Límite de API excedido en actualización de mercados. Esperando..."))
                 time.sleep(0.1)
@@ -382,7 +401,7 @@ def keep_markets_updated():
             log_queue.put((logging.DEBUG, f"Fuera del rango crítico. Durmiendo por {sleep_time:.1f} segundos hasta el inicio del rango crítico."))
             time.sleep(sleep_time)
 
-# Función para obtener símbolos iniciales usando el endpoint de spot
+# Obtener símbolos iniciales
 def fetch_current_symbols_fast():
     try:
         response = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=1)
