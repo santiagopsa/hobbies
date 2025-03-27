@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from openai import OpenAI
 import pytz
-import pandas_ta as ta  # Nueva librería reemplazando ta-lib
+import pandas_ta as ta
 from elegir_cripto import choose_best_cryptos
 from scipy.stats import linregress
 
@@ -48,7 +48,8 @@ def initialize_db():
             support_level REAL,
             spread REAL,
             imbalance REAL,
-            depth REAL
+            depth REAL,
+            status TEXT DEFAULT 'open'
         )
     ''')
     conn.commit()
@@ -74,8 +75,8 @@ handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)
 logger.addHandler(handler)
 logger.info("Prueba de escritura en trading.log al iniciar")
 
-# Constantes actualizadas
-MAX_OPEN_TRADES = 10
+# Constantes (sin MAX_DAILY_BUYS, solo MAX_OPEN_TRADES)
+MAX_OPEN_TRADES = 10  # Máximo de operaciones abiertas en paralelo
 MIN_NOTIONAL = 10
 RSI_THRESHOLD = 70
 ADX_THRESHOLD = 25
@@ -85,38 +86,6 @@ VOLUME_GROWTH_THRESHOLD = 0.5
 decision_cache = {}
 CACHE_EXPIRATION = 300
 
-def reset_daily_buys():
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        colombia_tz = pytz.timezone("America/Bogota")
-        today = datetime.now(colombia_tz).strftime('%Y-%m-%d')
-        logging.info(f"Attempting to reset daily buys for {today}")
-
-        cursor.execute("PRAGMA table_info(transactions_new)")
-        columns = [row[1] for row in cursor.fetchall()]
-        if 'action' not in columns or 'timestamp' not in columns:
-            raise ValueError("Invalid table schema for transactions_new")
-
-        cursor.execute("DELETE FROM transactions_new WHERE action='buy' AND timestamp LIKE ?", (f"{today}%",))
-        conn.commit()
-        
-        deleted_count = cursor.rowcount
-        logging.info(f"Reinicio de compras diarias: {deleted_count} transacciones eliminadas para el día {today}.")
-
-        cursor.execute("SELECT COUNT(*) FROM transactions_new WHERE action='buy' AND timestamp LIKE ?", (f"{today}%",))
-        count = cursor.fetchone()[0]
-        if count > 0:
-            logging.warning(f"Reset incomplete: {count} buys still present for {today}")
-        else:
-            logging.info(f"Conteo de compras diarias después del reinicio: {count}")
-        
-        conn.close()
-        return True
-    except Exception as e:
-        logging.error(f"Error al reiniciar compras diarias: {e}")
-        return False
-    
 def detect_support_level(data, price_series, window=15, max_threshold_multiplier=2.5):
     if len(price_series) < window:
         logging.warning(f"Series too short for {price_series.name}: {len(price_series)} < {window}")
@@ -429,17 +398,14 @@ def has_recent_macd_crossover(macd_series, signal_series, lookback=5):
             return True, abs(i)
     return False, None
 
-def get_daily_buys():
+def get_open_trades():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    colombia_tz = pytz.timezone("America/Bogota")
-    today = datetime.now(colombia_tz).strftime('%Y-%m-%d')
-    query = "SELECT COUNT(*) FROM transactions_new WHERE action='buy' AND timestamp LIKE ?"
-    cursor.execute(query, (f"{today}%",))
+    cursor.execute("SELECT COUNT(*) FROM transactions_new WHERE action='buy' AND status='open'")
     count = cursor.fetchone()[0]
-    cursor.execute("SELECT timestamp FROM transactions_new WHERE action='buy' AND timestamp LIKE ?", (f"{today}%",))
-    timestamps = cursor.fetchall()
-    logging.info(f"Compras contadas para hoy ({today}): {count}. Timestamps: {timestamps}")
+    cursor.execute("SELECT symbol, timestamp, trade_id FROM transactions_new WHERE action='buy' AND status='open'")
+    trades = cursor.fetchall()
+    logging.info(f"Operaciones abiertas: {count}. Detalles: {trades}")
     conn.close()
     return count
 
@@ -462,8 +428,8 @@ def execute_order_buy(symbol, amount, indicators, confidence):
                 symbol, action, price, amount, timestamp, trade_id, rsi, adx, atr, 
                 relative_volume, divergence, bb_position, confidence, has_macd_crossover, 
                 candles_since_crossover, volume_trend, price_trend, short_volume_trend, 
-                support_level, spread, imbalance, depth
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                support_level, spread, imbalance, depth, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             symbol, "buy", price, executed_amount, timestamp, trade_id,
             indicators.get('rsi'), indicators.get('adx'), indicators.get('atr'),
@@ -472,7 +438,7 @@ def execute_order_buy(symbol, amount, indicators, confidence):
             indicators.get('candles_since_crossover'),
             indicators.get('volume_trend'), indicators.get('price_trend'), indicators.get('short_volume_trend'),
             indicators.get('support_level'), indicators.get('spread'), indicators.get('imbalance'), 
-            indicators.get('depth')
+            indicators.get('depth'), 'open'
         ))
         conn.commit()
         conn.close()
@@ -507,9 +473,10 @@ def sell_symbol(symbol, amount, trade_id):
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT INTO transactions_new (symbol, action, price, amount, timestamp, trade_id)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (symbol, "sell", sell_price, amount, timestamp, trade_id))
+                INSERT INTO transactions_new (symbol, action, price, amount, timestamp, trade_id, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (symbol, "sell", sell_price, amount, timestamp, trade_id, 'closed'))
+            cursor.execute("UPDATE transactions_new SET status='closed' WHERE trade_id=? AND action='buy'", (trade_id,))
             conn.commit()
             conn.close()
             return
@@ -525,9 +492,10 @@ def sell_symbol(symbol, amount, trade_id):
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO transactions_new (symbol, action, price, amount, timestamp, trade_id, rsi, adx, atr)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (symbol, "sell", sell_price, amount, timestamp, trade_id, rsi, adx, atr))
+            INSERT INTO transactions_new (symbol, action, price, amount, timestamp, trade_id, rsi, adx, atr, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (symbol, "sell", sell_price, amount, timestamp, trade_id, rsi, adx, atr, 'closed'))
+        cursor.execute("UPDATE transactions_new SET status='closed' WHERE trade_id=? AND action='buy'", (trade_id,))
         conn.commit()
         conn.close()
         
@@ -541,8 +509,8 @@ def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, indicators):
     def trailing_logic():
         try:
             highest_price = purchase_price
-            take_profit_price = purchase_price * 1.05  # Take-profit fijo al 5%
-            stop_loss_price = purchase_price * 0.98    # Stop-loss fijo al 2%
+            take_profit_price = purchase_price * 1.05
+            stop_loss_price = purchase_price * 0.98
             data, price_series = fetch_and_prepare_data(symbol)
             if data is None or price_series is None:
                 logging.error(f"No data para trailing stop de {symbol}, forzando venta inmediata")
@@ -607,7 +575,7 @@ def calculate_adaptive_strategy(indicators, data=None):
     has_macd_crossover = indicators.get('has_macd_crossover', False)
     symbol = indicators.get('symbol', 'desconocido')
 
-    support_distance = (current_price - support_level) / support_level if support_level and current_price > 0 else 0.5  # Default a 50% si falta soporte
+    support_distance = (current_price - support_level) / support_level if support_level and current_price > 0 else 0.5
     support_near_threshold = 0.2
 
     trend_confirmed = False
@@ -779,16 +747,16 @@ def demo_trading(high_volume_symbols=None):
     available_for_trading = max(usdt_balance - reserve, 0)
     logging.info(f"Disponible para trading: {available_for_trading}, se deja una reserva de {reserve}")
 
-    daily_buys = get_daily_buys()
-    logging.info(f"Compras diarias realizadas: {daily_buys}")
-    if daily_buys >= MAX_DAILY_BUYS:
-        logging.info("Límite diario de compras alcanzado.")
+    open_trades = get_open_trades()
+    logging.info(f"Operaciones abiertas actualmente: {open_trades}")
+    if open_trades >= MAX_OPEN_TRADES:
+        logging.info("Límite de operaciones abiertas alcanzado.")
         return False
 
     if high_volume_symbols is None:
         high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=300)
 
-    budget_per_trade = available_for_trading / (MAX_DAILY_BUYS - daily_buys) if (MAX_DAILY_BUYS - daily_buys) > 0 else available_for_trading
+    budget_per_trade = available_for_trading / (MAX_OPEN_TRADES - open_trades) if (MAX_OPEN_TRADES - open_trades) > 0 else available_for_trading
     selected_cryptos = high_volume_symbols
     logging.info(f"Presupuesto por operación: {budget_per_trade}")
     balance = exchange.fetch_balance()['free']
@@ -801,10 +769,10 @@ def demo_trading(high_volume_symbols=None):
         batch = selected_cryptos[i:i+10]
         for symbol in batch:
             try:
-                daily_buys = get_daily_buys()
-                logging.info(f"Compras diarias realizadas antes de procesar {symbol}: {daily_buys}")
-                if daily_buys >= MAX_DAILY_BUYS:
-                    logging.info("Límite diario de compras alcanzado.")
+                open_trades = get_open_trades()
+                logging.info(f"Operaciones abiertas antes de procesar {symbol}: {open_trades}")
+                if open_trades >= MAX_OPEN_TRADES:
+                    logging.info("Límite de operaciones abiertas alcanzado.")
                     return False
 
                 logging.info(f"Procesando {symbol}...")
@@ -828,7 +796,7 @@ def demo_trading(high_volume_symbols=None):
                     failed_conditions_count['order_book_available'] = failed_conditions_count.get('order_book_available', 0) + 1
                     continue
 
-                conditions['depth >= 1000'] = order_book_data['depth'] >= 1000  # Reducido de 3000
+                conditions['depth >= 1000'] = order_book_data['depth'] >= 1000
                 if not conditions['depth >= 1000']:
                     logging.warning(f"Profundidad baja para {symbol}: {order_book_data['depth']}, pero se evalúa de todos modos")
                 else:
@@ -856,7 +824,7 @@ def demo_trading(high_volume_symbols=None):
                     failed_conditions_count['spread <= 0.005 * price'] = failed_conditions_count.get('spread <= 0.005 * price', 0) + 1
                     continue
 
-                conditions['imbalance >= 1.0'] = imbalance >= 1.0 if imbalance is not None else False  # Reducido de 1.5
+                conditions['imbalance >= 1.0'] = imbalance >= 1.0 if imbalance is not None else False
                 if not conditions['imbalance >= 1.0']:
                     logging.warning(f"Imbalance bajo para {symbol}: {imbalance}, pero se evalúa de todos modos")
                 else:
@@ -973,9 +941,9 @@ def demo_trading(high_volume_symbols=None):
 
                 if action == "comprar" and confidence >= 70:
                     with buy_lock:
-                        daily_buys = get_daily_buys()
-                        if daily_buys >= MAX_DAILY_BUYS:
-                            logging.info(f"Límite diario de compras alcanzado, no se ejecuta compra para {symbol}.")
+                        open_trades = get_open_trades()
+                        if open_trades >= MAX_OPEN_TRADES:
+                            logging.info(f"Límite de operaciones abiertas alcanzado, no se ejecuta compra para {symbol}.")
                             return False
 
                         confidence_factor = confidence / 100
@@ -1005,7 +973,7 @@ def demo_trading(high_volume_symbols=None):
                                 dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], indicators)
                                 usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
                                 available_for_trading = max(usdt_balance - reserve, 0)
-                                budget_per_trade = available_for_trading / (MAX_DAILY_BUYS - get_daily_buys()) if (MAX_DAILY_BUYS - get_daily_buys()) > 0 else available_for_trading
+                                budget_per_trade = available_for_trading / (MAX_OPEN_TRADES - get_open_trades()) if (MAX_OPEN_TRADES - get_open_trades()) > 0 else available_for_trading
                                 logging.info(f"Rebalanceo: Nuevo saldo USDT={usdt_balance}, presupuesto por trade={budget_per_trade}")
                             else:
                                 logging.error(f"Error al ejecutar compra para {symbol}: orden no completada")
@@ -1048,7 +1016,6 @@ def analyze_trade_outcome(trade_id):
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         
-        # Obtener datos de compra y venta directamente de la base de datos
         cursor.execute("""
             SELECT t1.symbol, t1.price AS buy_price, t1.amount, t1.timestamp AS buy_time,
                    t1.rsi, t1.adx, t1.atr, t1.relative_volume, t1.divergence, t1.bb_position,
@@ -1066,11 +1033,10 @@ def analyze_trade_outcome(trade_id):
             logging.warning(f"No se encontraron datos para el trade_id: {trade_id}")
             return
         
-        if trade_data[20] is None:  # No hay venta registrada aún
+        if trade_data[20] is None:
             logging.info(f"Trade {trade_id} no tiene venta registrada aún")
             return
 
-        # Extraer datos con manejo de valores nulos
         buy_data = {
             'symbol': trade_data[0],
             'buy_price': trade_data[1],
@@ -1093,20 +1059,17 @@ def analyze_trade_outcome(trade_id):
             'imbalance': trade_data[18],
             'depth': trade_data[19]
         }
-        sell_price = trade_data[20]  # Usar precio de venta de la DB directamente
+        sell_price = trade_data[20]
 
-        # Calcular ganancia/pérdida con datos reales
         profit_loss = (sell_price - buy_data['buy_price']) * buy_data['amount']
         is_profitable = profit_loss > 0
 
-        # Guardar estadísticas
         with open("trade_stats.csv", "a") as f:
             f.write(f"{trade_id},{buy_data['symbol']},{buy_data['buy_price']},{sell_price},{buy_data['amount']},{profit_loss:.2f},{buy_data['rsi'] or 'N/A'},{datetime.now()}\n")
 
-        # Ajuste dinámico de RSI_THRESHOLD
         global RSI_THRESHOLD
         if 'RSI_THRESHOLD' not in globals():
-            RSI_THRESHOLD = 70  # Restaurar valor original si no está definido
+            RSI_THRESHOLD = 70
         if profit_loss > 0 and buy_data['rsi'] and buy_data['rsi'] < 80:
             RSI_THRESHOLD = max(65, RSI_THRESHOLD - 5)
             logging.info(f"RSI_THRESHOLD reducido a {RSI_THRESHOLD} por operación rentable con RSI temprano")
@@ -1114,7 +1077,6 @@ def analyze_trade_outcome(trade_id):
             RSI_THRESHOLD = min(85, RSI_THRESHOLD + 5)
             logging.info(f"RSI_THRESHOLD aumentado a {RSI_THRESHOLD} por operación perdedora con RSI tardío")
 
-        # Prompt para GPT con datos reales
         gpt_prompt = f"""
         Analiza esta transacción de `{buy_data['symbol']}` (ID: {trade_id}) para determinar por qué fue un éxito o un fracaso, si es exito dime cual fue el acierto y si fue un fracaso dime que se deberia corregir en los datos agregar para tomar un amejor decision:
         - Precio de compra: {buy_data['buy_price']}
@@ -1197,20 +1159,6 @@ def gpt_prepare_data(data, indicators):
     return prompt
 
 def gpt_decision_buy(prepared_text):
-    """
-    Consulta a GPT para decidir si comprar o mantener un activo USDT en Binance,
-    basándose en indicadores y datos preparados. Prioriza volumen fuerte y soporte.
-
-    Args:
-        prepared_text (str): Texto preparado con datos e indicadores del activo.
-
-    Returns:
-        tuple(str, int, str): (acción, confianza, explicación) donde
-        - acción: "comprar" o "mantener"
-        - confianza: entero entre 50 y 100
-        - explicación: cadena con la razón de la decisión
-    """
-    # Construir prompt con criterios actualizados
     prompt = f"""
     Eres un experto en trading de criptomonedas de alto riesgo. Basándote en los datos para un activo USDT en Binance:
     {prepared_text}
@@ -1225,11 +1173,10 @@ def gpt_decision_buy(prepared_text):
     """
 
     max_retries = 2
-    timeout_sec = 5  # Tiempo de espera por intento
+    timeout_sec = 5
 
     for attempt in range(max_retries + 1):
         try:
-            # Usar wrapper personalizado para manejar timeout
             response = with_timeout(
                 client.chat.completions.create,
                 kwargs={
@@ -1242,19 +1189,16 @@ def gpt_decision_buy(prepared_text):
             raw_response = response.choices[0].message.content.strip()
             decision = json.loads(raw_response)
 
-            # Validar y extraer valores
             accion = decision.get("accion", "mantener").lower()
             confianza = decision.get("confianza", 50)
             explicacion = decision.get("explicacion", "Respuesta incompleta")
 
-            # Validar tipos y rangos
             if accion not in ["comprar", "mantener"]:
                 accion = "mantener"
             if not isinstance(confianza, (int, float)) or confianza < 50 or confianza > 100:
                 confianza = 50
                 explicacion = "Confianza fuera de rango, ajustada a 50"
 
-            # Validar condiciones clave desde prepared_text (método más robusto)
             try:
                 if "short_volume_trend" in prepared_text and "increasing" not in prepared_text.lower():
                     return "mantener", 50, "Short volume trend not increasing, overriding GPT"
@@ -1268,7 +1212,7 @@ def gpt_decision_buy(prepared_text):
                 if "distancia relativa al soporte" in prepared_text.lower():
                     dist_str = prepared_text.split("distancia relativa al soporte: ")[1].split("\n")[0] if "distancia relativa al soporte: " in prepared_text.lower() else "1.0"
                     support_distance = float(dist_str) if dist_str.replace('.', '').replace('-', '').isdigit() else 1.0
-                    if support_distance > 0.15:  # Updated to 0.15
+                    if support_distance > 0.15:
                         return "mantener", 50, "Far from support (> 0.15), overriding GPT"
                 if "profundidad" in prepared_text:
                     depth_str = prepared_text.split("Profundidad del libro: ")[1].split("\n")[0]
@@ -1300,23 +1244,9 @@ def gpt_decision_buy(prepared_text):
             logging.error(f"Error en GPT (intento {attempt + 1}): {e}")
             if attempt == max_retries:
                 return "mantener", 50, "Error al procesar respuesta de GPT"
-        time.sleep(2 ** attempt)  # Exponential backoff
+        time.sleep(2 ** attempt)
 
 def with_timeout(func, kwargs, timeout_sec):
-    """
-    Ejecuta una función con un tiempo de espera definido usando un hilo.
-
-    Args:
-        func: La función a ejecutar.
-        kwargs: Diccionario de argumentos de la función.
-        timeout_sec: Tiempo de espera en segundos.
-
-    Returns:
-        El resultado de la función o None si falla por timeout.
-
-    Raises:
-        requests.Timeout: Si la función no termina dentro del tiempo de espera.
-    """
     start = time.time()
     result = [None]
     def target():
