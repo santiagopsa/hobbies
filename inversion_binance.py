@@ -575,8 +575,23 @@ def calculate_adaptive_strategy(indicators, data=None):
     has_macd_crossover = indicators.get('has_macd_crossover', False)
     symbol = indicators.get('symbol', 'desconocido')
 
+    # Nuevo umbral mínimo para volumen relativo
+    MIN_RELATIVE_VOLUME = 1.0
+
     support_distance = (current_price - support_level) / support_level if support_level and current_price > 0 else 0.5
     support_near_threshold = 0.2
+
+    # Filtro inicial de volumen relativo
+    if relative_volume is None or relative_volume < MIN_RELATIVE_VOLUME:
+        return "mantener", 50, f"Volumen relativo demasiado bajo ({relative_volume}) para {symbol}"
+
+    # Filtro de tendencia de precio
+    if price_trend != "increasing":
+        return "mantener", 50, f"Tendencia de precio no es alcista para {symbol}"
+
+    # Filtro de tendencia de volumen
+    if short_volume_trend not in ["increasing", "stable"]:
+        return "mantener", 50, f"Tendencia de volumen no es favorable para {symbol}"
 
     trend_confirmed = False
     if data and '15m' in data and '1h' in data and not data['15m'].empty and not data['1h'].empty:
@@ -636,8 +651,9 @@ def calculate_adaptive_strategy(indicators, data=None):
     if not atr_increasing:
         logging.debug(f"Volatilidad no aumenta (ATR no sube 5%) para {symbol}, pero se evalúa de todos modos")
 
+    # Ajuste en weighted_signals con mayor peso al volumen relativo
     weighted_signals = [
-        4 * (relative_volume > 2.0 if relative_volume else False),
+        6 * (relative_volume > 2.0 if relative_volume else False),  # Peso aumentado de 4 a 6
         3 * (short_volume_trend in ["increasing", "stable"]),
         2 * (price_trend == "increasing"),
         2 * (roc > 0.5 if roc else False),
@@ -660,6 +676,10 @@ def calculate_adaptive_strategy(indicators, data=None):
             base_confidence = 90
         elif rsi and rsi > 70:
             base_confidence = 85
+
+    # Penalización de confianza si volumen relativo es bajo
+    if relative_volume < 1.5:
+        base_confidence = max(50, base_confidence - 10)  # Penalización del 10%
 
     action = "mantener" if base_confidence < 70 else "comprar"
     explanation = f"{'Compra fuerte' if base_confidence >= 70 else 'Condiciones insuficientes'}: Volumen relativo={relative_volume or 'N/A'}, puntaje={signals_score}/13, ADX={adx or 'N/A'}, breakout={'Sí' if breakout else 'No'}, soporte_dist={support_distance:.2%}{' y RSI > 50' if rsi and rsi > 50 else ''}{' y EMA crossover' if ema_crossover else ''}{' y Estocástico crossover' if stoch_crossover else ''}{' y OBV aumentando' if obv_increasing else ''} para {symbol}"
@@ -1164,9 +1184,9 @@ def gpt_decision_buy(prepared_text):
     {prepared_text}
     Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza tendencias fuertes con volumen relativo alto (> 3.0) y proximidad al soporte (<= 0.15). Responde SOLO con un JSON válido sin '''json''' asi:
     {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen relativo > 3.0, short_volume_trend 'increasing', price_trend 'increasing', distancia al soporte <= 0.15, indican oportunidad de ganancia rápida"}}
-    Criterios:
-    - Compra si: volumen relativo > 3.0, short_volume_trend es 'increasing', price_trend es 'increasing', distancia relativa al soporte <= 0.15, profundidad > 3000, y spread <= 0.5% del precio (0.005 * precio). RSI > 70 es un bono, no un requisito.
-    - Mantener si: volumen relativo <= 3.0, short_volume_trend no es 'increasing', price_trend es 'decreasing', distancia relativa al soporte > 0.15, profundidad <= 3000, o spread > 0.5% del precio.
+    Criterios ajustados:
+    - Compra si: volumen relativo > 3.0, short_volume_trend es 'increasing' o 'stable', price_trend es 'increasing', distancia relativa al soporte <= 0.15, profundidad > 3000, y spread <= 0.5% del precio (0.005 * precio). RSI > 70 es un bono, no un requisito.
+    - Mantener si: volumen relativo <= 3.0, short_volume_trend es 'decreasing', price_trend no es 'increasing', distancia relativa al soporte > 0.15, profundidad <= 3000, o spread > 0.5% del precio.
     - Evalúa liquidez con profundidad (>3000) y spread (<=0.5% del precio).
     - Asigna confianza >80 solo si volumen relativo > 3.0, soporte cercano (<= 0.15), y al menos 3 condiciones se cumplen; usa 60-79 para riesgos moderados (al menos 2 condiciones); de lo contrario, usa 50. Suma 10 a la confianza si RSI > 70.
     - Ignora el cruce MACD como requisito; prioriza momentum y soporte.
@@ -1200,32 +1220,32 @@ def gpt_decision_buy(prepared_text):
                 explicacion = "Confianza fuera de rango, ajustada a 50"
 
             try:
-                if "short_volume_trend" in prepared_text and "increasing" not in prepared_text.lower():
-                    return "mantener", 50, "Short volume trend not increasing, overriding GPT"
+                if "short_volume_trend" in prepared_text and "increasing" not in prepared_text.lower() and "stable" not in prepared_text.lower():
+                    return "mantener", 50, "Short volume trend no es 'increasing' ni 'stable', overriding GPT"
                 if "relative_volume" in prepared_text:
                     rel_vol_str = prepared_text.split("Volumen relativo: ")[1].split("\n")[0]
                     relative_volume = float(rel_vol_str) if rel_vol_str.replace('.', '').replace('-', '').isdigit() else 0
                     if relative_volume <= 3.0:
-                        return "mantener", 50, "Relative volume too low (<= 3.0), overriding GPT"
+                        return "mantener", 50, "Relative volume demasiado bajo (<= 3.0), overriding GPT"
                 if "price_trend" in prepared_text and "increasing" not in prepared_text.lower():
-                    return "mantener", 50, "Price trend not increasing, overriding GPT"
+                    return "mantener", 50, "Price trend no es 'increasing', overriding GPT"
                 if "distancia relativa al soporte" in prepared_text.lower():
                     dist_str = prepared_text.split("distancia relativa al soporte: ")[1].split("\n")[0] if "distancia relativa al soporte: " in prepared_text.lower() else "1.0"
                     support_distance = float(dist_str) if dist_str.replace('.', '').replace('-', '').isdigit() else 1.0
                     if support_distance > 0.15:
-                        return "mantener", 50, "Far from support (> 0.15), overriding GPT"
+                        return "mantener", 50, "Lejos del soporte (> 0.15), overriding GPT"
                 if "profundidad" in prepared_text:
                     depth_str = prepared_text.split("Profundidad del libro: ")[1].split("\n")[0]
                     depth = float(depth_str) if depth_str.replace('.', '').replace('-', '').isdigit() else 0
                     if depth <= 3000:
-                        return "mantener", 50, "Depth too low (<= 3000), overriding GPT"
+                        return "mantener", 50, "Profundidad demasiado baja (<= 3000), overriding GPT"
                 if "spread" in prepared_text:
                     spread_str = prepared_text.split("Spread: ")[1].split("\n")[0]
                     spread = float(spread_str) if spread_str.replace('.', '').replace('-', '').isdigit() else float('inf')
                     current_price_str = prepared_text.split("Precio actual: ")[1].split("\n")[0]
                     current_price = float(current_price_str) if current_price_str.replace('.', '').replace('-', '').isdigit() else 1
                     if spread > 0.005 * current_price:
-                        return "mantener", 50, "Spread too high (> 0.5% of price), overriding GPT"
+                        return "mantener", 50, "Spread demasiado alto (> 0.5% del precio), overriding GPT"
             except (ValueError, IndexError) as e:
                 logging.warning(f"Error al validar condiciones en prepared_text: {e}, usando decisión predeterminada")
                 return "mantener", 50, "Error en validación de condiciones, manteniendo por seguridad"
