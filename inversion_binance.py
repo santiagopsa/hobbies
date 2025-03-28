@@ -564,95 +564,54 @@ def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, indicators):
 def calculate_adaptive_strategy(indicators, data=None):
     rsi = indicators.get('rsi', None)
     relative_volume = indicators.get('relative_volume', None)
-    roc = indicators.get('roc', None)
-    short_volume_trend = indicators.get('short_volume_trend', 'insufficient_data')
     price_trend = indicators.get('price_trend', 'insufficient_data')
-    depth = indicators.get('depth', 0)
-    spread = indicators.get('spread', float('inf'))
+    short_volume_trend = indicators.get('short_volume_trend', 'insufficient_data')
     current_price = indicators.get('current_price', 0)
     support_level = indicators.get('support_level', None)
     adx = indicators.get('adx', None)
-    has_macd_crossover = indicators.get('has_macd_crossover', False)
     symbol = indicators.get('symbol', 'desconocido')
 
-    # Umbral mínimo para volumen relativo (opcional, pero recomendado)
-    MIN_RELATIVE_VOLUME = 1.0
+    # Umbrales estrictos basados en datos históricos
+    MIN_ADX = 25               # Mínimo observado en éxitos (PAXG/USDT)
+    MIN_RELATIVE_VOLUME = 1.2  # Umbral para capturar éxitos frecuentes
+    MAX_SUPPORT_DISTANCE = 0.03  # 3%, basado en POL/USDT y ajuste práctico
 
+    # Calcular distancia al soporte
     support_distance = (current_price - support_level) / support_level if support_level and current_price > 0 else 0.5
-    support_near_threshold = 0.3  # Relajado de 0.2 a 0.3 (3%)
 
-    # Filtro 1: ADX mínimo estricto
-    if adx is None or adx < 25:
+    # Filtros iniciales estrictos
+    if adx is None or adx < MIN_ADX:
         return "mantener", 50, f"Tendencia débil (ADX: {adx if adx else 'None'}) para {symbol}"
-
-    # Filtro 2: Tendencia de volumen favorable
-    if short_volume_trend not in ["increasing", "stable"]:
-        return "mantener", 50, f"Tendencia de volumen no es favorable para {symbol}"
-
-    # Filtro 3: Tendencia de precio alcista
-    if price_trend != "increasing":
-        return "mantener", 50, f"Tendencia de precio no es alcista para {symbol}"
-
-    # Filtro opcional: Volumen relativo mínimo
     if relative_volume is None or relative_volume < MIN_RELATIVE_VOLUME:
         return "mantener", 50, f"Volumen relativo demasiado bajo ({relative_volume}) para {symbol}"
+    if price_trend != "increasing":
+        return "mantener", 50, f"Tendencia de precio no es alcista para {symbol}"
+    if short_volume_trend not in ["increasing", "stable"]:
+        return "mantener", 50, f"Tendencia de volumen no es favorable para {symbol}"
+    if support_distance > MAX_SUPPORT_DISTANCE:
+        return "mantener", 50, f"Lejos del soporte (distancia: {support_distance:.2%}) para {symbol}"
+    if rsi is None or rsi < 60:
+        return "mantener", 50, f"RSI demasiado bajo ({rsi}) para {symbol}"
 
-    # Si pasa los filtros mínimos, evaluar otros indicadores para confianza
-    trend_confirmed = False
-    if data and '15m' in data and '1h' in data and not data['15m'].empty and not data['1h'].empty:
-        trend_15m = data['15m']['tendencia_alcista'].iloc[-1] if 'tendencia_alcista' in data['15m'] else False
-        trend_1h = data['1h']['tendencia_alcista'].iloc[-1] if 'tendencia_alcista' in data['1h'] else False
-        if trend_15m and trend_1h:
-            trend_confirmed = True
-
-    ema_crossover = False
-    stoch_crossover = False
-    atr_increasing = False
-    obv_increasing = False
-    macd_crossover_15m = False
-    breakout = False
-    if data and '15m' in data and not data['15m'].empty:
-        ema_crossover = data['15m']['ema_crossover'].iloc[-1] if 'ema_crossover' in data['15m'] and not pd.isna(data['15m']['ema_crossover'].iloc[-1]) else False
-        stoch_crossover = data['15m']['stoch_crossover'].iloc[-1] if 'stoch_crossover' in data['15m'] and not pd.isna(data['15m']['stoch_crossover'].iloc[-1]) else False
-        atr_increasing = data['15m']['atr_increasing'].iloc[-1] if 'atr_increasing' in data['15m'] and not pd.isna(data['15m']['atr_increasing'].iloc[-1]) else False
-        obv_increasing = data['15m']['obv_increasing'].iloc[-1] if 'obv_increasing' in data['15m'] and not pd.isna(data['15m']['obv_increasing'].iloc[-1]) else False
-        macd_crossover_15m = has_recent_macd_crossover(
-            data['15m']['MACD'] if 'MACD' in data['15m'] else pd.Series(),
-            data['15m']['MACD_signal'] if 'MACD_signal' in data['15m'] else pd.Series(),
-            lookback=5
-        )[0]
-        if len(data['15m']) >= 10:
-            recent_highs = data['15m']['high'].iloc[-10:-1].max()
-            breakout = current_price > recent_highs and relative_volume > 2.0
-
-    # Puntuación relajada para indicadores secundarios
+    # Puntuación para decisión final
     weighted_signals = [
-        6 * (relative_volume > 2.0 if relative_volume else False),  # Mayor peso al volumen relativo
-        3 * (short_volume_trend in ["increasing", "stable"]),
-        2 * (price_trend == "increasing"),
-        1 * (roc > 0.5 if roc else False),  # Peso reducido
-        1 * (depth >= 2000),                # Peso reducido
-        1 * (spread <= 0.01 * current_price),
-        1 * (support_distance <= support_near_threshold),
-        1 * (rsi > 60 if rsi else False) if rsi else 0,  # Relajado de >50 a >60
-        1 * (ema_crossover),                # Peso reducido
-        1 * (stoch_crossover),              # Peso reducido
-        1 * (obv_increasing),
-        1 * (macd_crossover_15m),           # Peso reducido
-        1 * (breakout)                      # Peso reducido
+        5 * (relative_volume > 1.5 if relative_volume else False),  # Bono por volumen fuerte
+        3 * (short_volume_trend in ["increasing", "stable"]),       # Tendencia de volumen
+        2 * (price_trend == "increasing"),                          # Tendencia de precio
+        1 * (support_distance <= 0.01),                            # Soporte muy cercano (<1%)
+        1 * (adx > 35 if adx else False),                          # Tendencia fuerte
     ]
     signals_score = sum(weighted_signals)
 
-    base_confidence = 70  # Base más alta porque ya pasó filtros estrictos
-    if signals_score >= 7:
-        base_confidence = 80
-        if rsi and rsi > 70:
-            base_confidence += 5  # Bono por RSI alto
-        if relative_volume > 2.0:
-            base_confidence += 5  # Bono por volumen alto
-
-    action = "mantener" if base_confidence < 75 else "comprar"  # Umbral ajustado
-    explanation = f"{'Compra fuerte' if base_confidence >= 75 else 'Condiciones insuficientes'}: Volumen relativo={relative_volume or 'N/A'}, puntaje={signals_score}/13, ADX={adx or 'N/A'}, breakout={'Sí' if breakout else 'No'}, soporte_dist={support_distance:.2%}{' y RSI > 60' if rsi and rsi > 60 else ''}{' y OBV aumentando' if obv_increasing else ''} para {symbol}"
+    # Umbral de decisión
+    if signals_score >= 8:  # Máximo 12, requiere al menos 66% del puntaje
+        action = "comprar"
+        base_confidence = 80 if signals_score < 10 else 90
+        explanation = f"Compra fuerte: Volumen relativo={relative_volume}, ADX={adx}, soporte_dist={support_distance:.2%}, RSI={rsi}, tendencia alcista confirmada para {symbol}"
+    else:
+        action = "mantener"
+        base_confidence = 60
+        explanation = f"Condiciones insuficientes: Volumen relativo={relative_volume}, ADX={adx}, soporte_dist={support_distance:.2%}, RSI={rsi}, puntaje={signals_score}/12 para {symbol}"
 
     return action, base_confidence, explanation
 
