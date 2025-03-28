@@ -569,49 +569,50 @@ def calculate_adaptive_strategy(indicators, data=None):
     current_price = indicators.get('current_price', 0)
     support_level = indicators.get('support_level', None)
     adx = indicators.get('adx', None)
+    obv_increasing = indicators.get('obv_increasing', False)
     symbol = indicators.get('symbol', 'desconocido')
 
-    # Umbrales estrictos basados en datos históricos
-    MIN_ADX = 25               # Mínimo observado en éxitos (PAXG/USDT)
-    MIN_RELATIVE_VOLUME = 1.2  # Umbral para capturar éxitos frecuentes
-    MAX_SUPPORT_DISTANCE = 0.03  # 3%, basado en POL/USDT y ajuste práctico
+    MIN_ADX = 25
+    MIN_RELATIVE_VOLUME = 0.9
+    MAX_SUPPORT_DISTANCE = 0.03
 
-    # Calcular distancia al soporte
     support_distance = (current_price - support_level) / support_level if support_level and current_price > 0 else 0.5
 
-    # Filtros iniciales estrictos
+    # Filtros iniciales
     if adx is None or adx < MIN_ADX:
         return "mantener", 50, f"Tendencia débil (ADX: {adx if adx else 'None'}) para {symbol}"
     if relative_volume is None or relative_volume < MIN_RELATIVE_VOLUME:
-        return "mantener", 50, f"Volumen relativo demasiado bajo ({relative_volume}) para {symbol}"
+        return "mantener", 50, f"Volumen relativo bajo ({relative_volume}) para {symbol}"
     if price_trend != "increasing":
-        return "mantener", 50, f"Tendencia de precio no es alcista para {symbol}"
+        return "mantener", 50, f"Tendencia no alcista para {symbol}"
     if short_volume_trend not in ["increasing", "stable"]:
-        return "mantener", 50, f"Tendencia de volumen no es favorable para {symbol}"
+        return "mantener", 50, f"Volumen no favorable para {symbol}"
     if support_distance > MAX_SUPPORT_DISTANCE:
-        return "mantener", 50, f"Lejos del soporte (distancia: {support_distance:.2%}) para {symbol}"
+        return "mantener", 50, f"Lejos del soporte ({support_distance:.2%}) para {symbol}"
     if rsi is None or rsi < 60:
-        return "mantener", 50, f"RSI demasiado bajo ({rsi}) para {symbol}"
+        return "mantener", 50, f"RSI bajo ({rsi}) para {symbol}"
 
-    # Puntuación para decisión final
+    # Puntuación ponderada
     weighted_signals = [
-        5 * (relative_volume > 1.5 if relative_volume else False),  # Bono por volumen fuerte
-        3 * (short_volume_trend in ["increasing", "stable"]),       # Tendencia de volumen
-        2 * (price_trend == "increasing"),                          # Tendencia de precio
-        1 * (support_distance <= 0.01),                            # Soporte muy cercano (<1%)
-        1 * (adx > 35 if adx else False),                          # Tendencia fuerte
+        4 * (relative_volume > 1.0 if relative_volume else False),
+        3 * (short_volume_trend in ["increasing", "stable"]),
+        2 * (price_trend == "increasing"),
+        1 * (support_distance <= 0.03),
+        2 * (adx > 40 if adx else False),
+        1 * (rsi > 70 if rsi else False),
+        1 * (obv_increasing if obv_increasing else False),
     ]
     signals_score = sum(weighted_signals)
 
-    # Umbral de decisión
-    if signals_score >= 8:  # Máximo 12, requiere al menos 66% del puntaje
+    # Decisión
+    if signals_score >= 7:
         action = "comprar"
-        base_confidence = 80 if signals_score < 10 else 90
-        explanation = f"Compra fuerte: Volumen relativo={relative_volume}, ADX={adx}, soporte_dist={support_distance:.2%}, RSI={rsi}, tendencia alcista confirmada para {symbol}"
+        base_confidence = 80 if signals_score < 9 else 90
+        explanation = f"Compra fuerte: Volumen={relative_volume}, ADX={adx}, soporte_dist={support_distance:.2%}, RSI={rsi} para {symbol}"
     else:
         action = "mantener"
         base_confidence = 60
-        explanation = f"Condiciones insuficientes: Volumen relativo={relative_volume}, ADX={adx}, soporte_dist={support_distance:.2%}, RSI={rsi}, puntaje={signals_score}/12 para {symbol}"
+        explanation = f"Insuficiente: Volumen={relative_volume}, ADX={adx}, soporte_dist={support_distance:.2%}, RSI={rsi}, puntaje={signals_score} para {symbol}"
 
     return action, base_confidence, explanation
 
