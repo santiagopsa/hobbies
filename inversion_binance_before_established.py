@@ -21,9 +21,6 @@ load_dotenv()
 GPT_MODEL = "gpt-4o-mini"
 DB_NAME = "trading_real.db"
 
-# Lista de monedas establecidas
-ESTABLISHED_COINS = ['BTC', 'ETH', 'BNB']
-
 def initialize_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -78,8 +75,8 @@ handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)
 logger.addHandler(handler)
 logger.info("Prueba de escritura en trading.log al iniciar")
 
-# Constantes
-MAX_OPEN_TRADES = 10
+# Constantes (sin MAX_DAILY_BUYS, solo MAX_OPEN_TRADES)
+MAX_OPEN_TRADES = 10  # Máximo de operaciones abiertas en paralelo
 MIN_NOTIONAL = 10
 RSI_THRESHOLD = 70
 ADX_THRESHOLD = 25
@@ -619,77 +616,6 @@ def calculate_adaptive_strategy(indicators, data=None):
 
     return action, base_confidence, explanation
 
-def calculate_established_strategy(indicators, data=None):
-    rsi = indicators.get('rsi', None)
-    relative_volume = indicators.get('relative_volume', None)
-    price_trend = indicators.get('price_trend', 'insufficient_data')
-    short_volume_trend = indicators.get('short_volume_trend', 'insufficient_data')
-    current_price = indicators.get('current_price', 0)
-    support_level = indicators.get('support_level', None)
-    adx = indicators.get('adx', None)
-    obv_increasing = indicators.get('obv_increasing', False)
-    symbol = indicators.get('symbol', 'desconocido')
-
-    # Adjusted thresholds for established coins
-    MIN_ADX = 20  # Less extreme trends are acceptable
-    MIN_RELATIVE_VOLUME = 0.8  # More consistent volume
-    MAX_SUPPORT_DISTANCE = 0.02  # Closer support due to clear levels
-    OVERSOLD_THRESHOLD = 0.95  # Price < 95% of MA(7)
-    VOLUME_SPIKE_FACTOR = 1.5  # Current volume > 1.5 * avg volume of last 10 candles
-
-    support_distance = (current_price - support_level) / support_level if support_level and current_price > 0 else 0.5
-
-    # Initial filters
-    if adx is None or adx < MIN_ADX:
-        return "mantener", 50, f"Tendencia débil (ADX: {adx if adx else 'None'}) para {symbol}"
-    if relative_volume is None or relative_volume < MIN_RELATIVE_VOLUME:
-        return "mantener", 50, f"Volumen relativo bajo ({relative_volume}) para {symbol}"
-    if short_volume_trend not in ["increasing", "stable"]:
-        return "mantener", 50, f"Volumen no favorable para {symbol}"
-    if support_distance > MAX_SUPPORT_DISTANCE:
-        return "mantener", 50, f"Lejos del soporte ({support_distance:.2%}) para {symbol}"
-    if rsi is None or rsi < 50:  # Lower RSI allowed
-        return "mantener", 50, f"RSI bajo ({rsi}) para {symbol}"
-
-    # New conditions for reversal opportunities
-    oversold = False
-    volume_spike = False
-    if data and '1h' in data:
-        df = data['1h']
-        if len(df) >= 7:
-            ma7 = df['close'].rolling(window=7).mean().iloc[-1]
-            oversold = current_price < ma7 * OVERSOLD_THRESHOLD
-        if len(df) >= 10:
-            avg_volume_10 = df['volume'].rolling(window=10).mean().iloc[-1]
-            current_volume = df['volume'].iloc[-1]
-            volume_spike = current_volume > avg_volume_10 * VOLUME_SPIKE_FACTOR
-
-    # Weighted scoring with emphasis on support and new conditions
-    weighted_signals = [
-        3 * (relative_volume > 1.0 if relative_volume else False),
-        2 * (short_volume_trend in ["increasing", "stable"]),
-        1 * (price_trend == "increasing"),  # Reduced weight for reversals
-        3 * (support_distance <= 0.02),  # Higher weight on support
-        1 * (adx > 30 if adx else False),  # Less strict ADX
-        1 * (rsi > 50 if rsi else False),  # Less strict RSI
-        1 * (obv_increasing if obv_increasing else False),
-        2 * oversold,  # Extra points if oversold
-        1 * volume_spike  # Extra points if volume spike
-    ]
-    signals_score = sum(weighted_signals)
-
-    # Decision with adjusted threshold
-    if signals_score >= 6:  # Lower threshold for stability
-        action = "comprar"
-        base_confidence = 80 if signals_score < 8 else 90
-        explanation = f"Compra fuerte (establecido): Volumen={relative_volume}, ADX={adx}, soporte_dist={support_distance:.2%}, RSI={rsi}, Sobrevendido={oversold}, Pico de volumen={volume_spike} para {symbol}"
-    else:
-        action = "mantener"
-        base_confidence = 60
-        explanation = f"Insuficiente (establecido): Volumen={relative_volume}, ADX={adx}, soporte_dist={support_distance:.2%}, RSI={rsi}, Sobrevendido={oversold}, Pico de volumen={volume_spike}, puntaje={signals_score} para {symbol}"
-
-    return action, base_confidence, explanation
-
 def evaluate_missed_opportunity(symbol, initial_price, confidence, explanation, indicators):
     time.sleep(18000)
     final_price = fetch_price(symbol)
@@ -935,12 +861,7 @@ def demo_trading(high_volume_symbols=None):
                 for key, value in conditions.items():
                     logging.debug(f"Condición {key} para {symbol}: valor={value}, tipo={type(value)}")
 
-                # Seleccionar estrategia según si es una moneda establecida
-                base_currency = symbol.split('/')[0]
-                if base_currency in ESTABLISHED_COINS:
-                    action, confidence, explanation = calculate_established_strategy(indicators, data)
-                else:
-                    action, confidence, explanation = calculate_adaptive_strategy(indicators, data)
+                action, confidence, explanation = calculate_adaptive_strategy(indicators, data=data)
                 logging.info(f"Decisión inicial para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
 
                 gpt_conditions = {
@@ -1036,7 +957,7 @@ def demo_trading(high_volume_symbols=None):
 
     logging.info("Trading ejecutado correctamente en segundo plano para todos los activos USDT")
     return True
-
+    
 def analyze_trade_outcome(trade_id):
     try:
         conn = sqlite3.connect(DB_NAME)
@@ -1288,7 +1209,7 @@ def send_periodic_summary():
     while True:
         try:
             with open("trading.log", "r") as log_file:
-                lines = log_file.readlines()[-100:]
+                lines = log_file.readlines()[-100:]  # Últimas 100 líneas para no cargar demasiado
                 buys_attempted = sum(1 for line in lines if "Intentando compra para" in line)
                 buys_executed = sum(1 for line in lines if "Compra ejecutada para" in line)
                 errors = sum(1 for line in lines if "Error" in line)
@@ -1303,8 +1224,9 @@ def send_periodic_summary():
         except Exception as e:
             logging.error(f"Error en resumen periódico: {e}")
             send_telegram_message(f"⚠️ *Error en Resumen* `{str(e)}`")
-        time.sleep(3600)
+        time.sleep(3600)  # Cada hora
 
+# Iniciar el hilo al final de if __name__ == "__main__":
 if __name__ == "__main__":
     high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=300)
     threading.Thread(target=send_periodic_summary, daemon=True).start()

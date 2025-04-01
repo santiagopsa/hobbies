@@ -200,6 +200,7 @@ def buy_symbol_microsecond(symbol, ws_ticker=None, budget=15, max_attempts=5, re
             order = exchange.create_market_buy_order(symbol, amount)
             end_time = time.time()
 
+        # Después de la compra exitosa
             order_price = order.get('average', price)
             filled = order.get('filled', amount)
             timestamp = datetime.now(timezone.utc).isoformat()
@@ -211,6 +212,11 @@ def buy_symbol_microsecond(symbol, ws_ticker=None, budget=15, max_attempts=5, re
             send_telegram_message(f"✅ *Compra ejecutada*\nSímbolo: `{symbol}`\nPrecio: `{order_price}`\nCantidad: `{filled}`\nLatencia: `{latency_ms:.3f}ms`")
 
             active_orders.remove(symbol)
+            
+            # Iniciar trailing stop después de la compra
+            order_details = {'price': order_price, 'filled': filled}
+            process_order(symbol, order_details)  # Llamada a process_order
+            
             return {'price': order_price, 'filled': filled}
 
         except Exception as e:
@@ -263,20 +269,23 @@ def sell_symbol(symbol, amount):
 def set_trailing_stop(symbol, amount, purchase_price, trailing_percent=5, max_duration=24*3600):
     start_time = time.time()
     highest_price = purchase_price
-    log_queue.put((logging.INFO, f"🔄 Trailing stop iniciado para {symbol}"))
+    log_queue.put((logging.INFO, f"🔄 Trailing stop iniciado para {symbol} con precio inicial {purchase_price}"))
 
     while time.time() - start_time < max_duration:
         try:
             current_price = fetch_price(symbol)
             if not current_price:
+                log_queue.put((logging.WARNING, f"Precio no disponible para {symbol}"))
                 time.sleep(0.1)
                 continue
 
+            log_queue.put((logging.DEBUG, f"Precio actual de {symbol}: {current_price}, máximo: {highest_price}"))
             if current_price > highest_price:
                 highest_price = current_price
                 log_queue.put((logging.INFO, f"📈 Nuevo máximo: {symbol} a {highest_price}"))
 
             stop_price = highest_price * (1 - trailing_percent / 100)
+            log_queue.put((logging.DEBUG, f"Stop price calculado: {stop_price}"))
             if current_price <= stop_price:
                 log_queue.put((logging.INFO, f"🔴 Trailing stop activado: {symbol} vendido a {current_price}"))
                 sell_symbol(symbol, amount)
@@ -296,8 +305,9 @@ def process_order(symbol, order_details):
     purchase_price = order_details.get('price')
     amount = order_details.get('filled')
     if not purchase_price or not amount or float(amount) <= 0:
-        log_queue.put((logging.ERROR, f"Datos insuficientes para trailing stop en {symbol}"))
+        log_queue.put((logging.ERROR, f"Datos insuficientes para trailing stop en {symbol}: {order_details}"))
         return
+    log_queue.put((logging.DEBUG, f"Iniciando trailing stop para {symbol} con precio {purchase_price} y cantidad {amount}"))
     threading.Thread(target=set_trailing_stop, args=(symbol, amount, purchase_price), daemon=True).start()
 
 # WebSocket para spot
