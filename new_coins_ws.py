@@ -98,25 +98,20 @@ def insert_transaction(symbol, action, price, amount, timestamp):
     except Exception as e:
         log_queue.put((logging.ERROR, f"Error al insertar transacción: {e}"))
 
+daily_purchases_count = 0
+current_date = datetime.now().strftime('%Y-%m-%d')
+
 def get_daily_purchases():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+    global daily_purchases_count, current_date
     today = datetime.now().strftime('%Y-%m-%d')
-    cursor.execute("SELECT count FROM daily_purchases WHERE date = ?", (today,))
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else 0
+    if today != current_date:
+        daily_purchases_count = 0
+        current_date = today
+    return daily_purchases_count
 
 def increment_daily_purchases():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    today = datetime.now().strftime('%Y-%m-%d')
-    cursor.execute(
-        "INSERT INTO daily_purchases (date, count) VALUES (?, 1) "
-        "ON CONFLICT(date) DO UPDATE SET count = count + 1", (today,)
-    )
-    conn.commit()
-    conn.close()
+    global daily_purchases_count
+    daily_purchases_count += 1
 
 # Variables globales
 market_cache = {}
@@ -333,10 +328,9 @@ def on_message(ws, message):
                 latency = (detection_time.timestamp() - (event_time_ms / 1000)) if event_time_ms else None
                 latency_str = f"{latency:.6f}" if latency is not None else "N/A"
                 log_queue.put((logging.INFO, f"🚀 Nueva moneda detectada: {formatted_symbol} | Latencia: {latency_str}s"))
-                send_telegram_message(f"🚀 *Nueva moneda detectada*: `{formatted_symbol}`")
 
-                # Pasar el ticker al hilo de compra
                 threading.Thread(target=buy_symbol_microsecond, args=(formatted_symbol, ticker), daemon=True).start()
+                threading.Thread(target=send_telegram_message, args=(f"🚀 *Nueva moneda detectada*: `{formatted_symbol}`",), daemon=True).start()
     except Exception as e:
         log_queue.put((logging.ERROR, f"Error en on_message: {e}"))
 
