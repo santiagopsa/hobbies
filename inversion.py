@@ -6,7 +6,8 @@ import requests
 import numpy as np
 import threading
 import logging
-from inversion_binance import demo_trading
+#from inversion_binance import demo_trading
+from binance import demo_trading
 from dotenv import load_dotenv
 from elegir_cripto import choose_best_cryptos
 
