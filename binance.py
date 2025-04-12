@@ -687,42 +687,79 @@ def calculate_adaptive_strategy(indicators, data=None):
     return action, confidence, explanation
 
 def calculate_established_strategy(indicators, data=None):
-    rsi = indicators.get('rsi')
+    rsi = indicators.get('rsi', None)
+    relative_volume = indicators.get('relative_volume', None)
+    price_trend = indicators.get('price_trend', 'insufficient_data')
+    short_volume_trend = indicators.get('short_volume_trend', 'insufficient_data')
     current_price = indicators.get('current_price', 0)
-    support_level = indicators.get('support_level')
+    support_level = indicators.get('support_level', None)
+    adx = indicators.get('adx', None)
     symbol = indicators.get('symbol', 'desconocido')
 
-    support_distance = (current_price - support_level) / support_level if support_level and current_price > 0 else 1.0
-    rsi_oversold = rsi is not None and rsi < 30
-    bullish_candle = detect_bullish_candlestick(data, '1h') if data else False
-    macd_crossover = indicators.get('has_macd_crossover', False)
-    volume_behavior = calculate_volume_behavior(data, '1h') if data else "insufficient_data"
+    # Adjusted thresholds for established coins
+    MIN_ADX = 20
+    MIN_RELATIVE_VOLUME = 1.0  # Lowered to allow more trades
+    MAX_SUPPORT_DISTANCE = 0.03
+    OVERSOLD_THRESHOLD = 0.95
+    VOLUME_SPIKE_FACTOR = 1.5
 
-    conditions = [
-        support_distance <= 0.02,
-        rsi_oversold,
-        bullish_candle,
-        macd_crossover,
-        volume_behavior in ["decreasing", "increasing"]
+    support_distance = (current_price - support_level) / support_level if support_level and current_price > 0 else 0.5
+
+    # Initial filters
+    if adx is None or adx < MIN_ADX:
+        return "mantener", 50, f"Tendencia débil (ADX: {adx if adx else 'None'}) para {symbol}"
+    if relative_volume is None or relative_volume < MIN_RELATIVE_VOLUME:
+        return "mantener", 50, f"Volumen relativo bajo ({relative_volume}) para {symbol}"
+    if short_volume_trend != "increasing":
+        return "mantener", 50, f"Volumen no favorable para {symbol}"
+    if support_distance > MAX_SUPPORT_DISTANCE:
+        return "mantener", 50, f"Lejos del soporte ({support_distance:.2%}) para {symbol}"
+    if rsi is None or rsi < 30:
+        return "mantener", 50, f"RSI bajo ({rsi}) para {symbol}"
+
+    # Volume spike filter
+    volume_spike = False
+    if data and '1h' in data:
+        df = data['1h']
+        if len(df) >= 10:
+            avg_volume_10 = df['volume'].rolling(window=10).mean().iloc[-1]
+            current_volume = df['volume'].iloc[-1]
+            volume_spike = current_volume > avg_volume_10 * VOLUME_SPIKE_FACTOR
+        if not volume_spike:
+            return "mantener", 50, f"Sin pico de volumen para {symbol}"
+
+    # Oversold condition
+    oversold = False
+    if data and '1h' in data:
+        df = data['1h']
+        if len(df) >= 7:
+            ma7 = df['close'].rolling(window=7).mean().iloc[-1]
+            oversold = current_price < ma7 * OVERSOLD_THRESHOLD
+
+    # Weighted scoring (simplified)
+    weighted_signals = [
+        3 * (relative_volume > 1.0 if relative_volume else False),
+        2 * (short_volume_trend == "increasing"),
+        1 * (price_trend == "increasing"),
+        3 * (support_distance <= 0.03),
+        1 * (adx > 30 if adx else False),
+        -1 * (rsi > 70 if rsi else False),  # Penalty for overbought
+        2 * oversold,
+        1 * volume_spike
     ]
-    met_conditions = sum(1 for c in conditions if c)
+    signals_score = sum(weighted_signals)
 
-    if met_conditions >= 3:
+    # Decision with adjusted threshold
+    if signals_score >= 5:  # Lowered to allow more trades
         action = "comprar"
-        confidence = 80 + (met_conditions - 3) * 5
-        explanation = (f"Compra en {symbol}: {met_conditions}/5 condiciones cumplidas "
-                       f"(Soporte: {support_distance:.2%}, RSI: {rsi}, "
-                       f"Vela alcista: {bullish_candle}, MACD cruce: {macd_crossover}, "
-                       f"Volumen: {volume_behavior})")
+        base_confidence = 80 if signals_score < 7 else 90
+        explanation = f"Compra fuerte (establecido): Volumen={relative_volume}, ADX={adx}, soporte_dist={support_distance:.2%}, RSI={rsi}, Sobrevendido={oversold}, Pico de volumen={volume_spike} para {symbol}"
     else:
         action = "mantener"
-        confidence = 60
-        explanation = (f"Mantener {symbol}: Solo {met_conditions}/5 condiciones cumplidas "
-                       f"(Soporte: {support_distance:.2%}, RSI: {rsi}, "
-                       f"Vela alcista: {bullish_candle}, MACD cruce: {macd_crossover}, "
-                       f"Volumen: {volume_behavior})")
+        base_confidence = 60
+        explanation = f"Insuficiente (establecido): Volumen={relative_volume}, ADX={adx}, soporte_dist={support_distance:.2%}, RSI={rsi}, Sobrevendido={oversold}, Pico de volumen={volume_spike}, puntaje={signals_score} para {symbol}"
 
-    return action, confidence, explanation
+    return action, base_confidence, explanation
 
 def evaluate_missed_opportunity(symbol, initial_price, confidence, explanation, indicators):
     time.sleep(18000)
