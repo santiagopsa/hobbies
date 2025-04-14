@@ -77,7 +77,7 @@ logger.addHandler(handler)
 logger.info("Prueba de escritura en trading.log al iniciar")
 
 # Constantes
-MAX_OPEN_TRADES = 10
+MAX_OPEN_TRADES = 5
 MIN_NOTIONAL = 10
 RSI_THRESHOLD = 70
 ADX_THRESHOLD = 25
@@ -835,7 +835,7 @@ def demo_trading(high_volume_symbols=None):
         logging.warning("Saldo insuficiente en USDT para alcanzar MIN_NOTIONAL.")
         return False
 
-    reserve = 150
+    reserve = 50
     available_for_trading = max(usdt_balance - reserve, 0)
     logging.info(f"Disponible para trading: {available_for_trading}, se deja una reserva de {reserve}")
 

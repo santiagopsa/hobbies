@@ -116,7 +116,7 @@ def increment_daily_purchases():
 # Variables globales
 market_cache = {}
 active_orders = set()
-MIN_NOTIONAL = 10  # Mínimo notional en $10 USD para nuevas monedas
+MIN_NOTIONAL = 20  # Mínimo notional en $10 USD para nuevas monedas
 
 # Función para obtener precio (mejorada)
 def fetch_price(symbol, ws_ticker=None):
@@ -152,7 +152,7 @@ threading.Thread(target=update_market_cache, daemon=True).start()
 # Compra optimizada con reintentos y verificación de mercado
 buying_lock = threading.Lock()
 
-def buy_symbol_microsecond(symbol, ws_ticker=None, budget=15, max_attempts=5, retry_delay=0.001):
+def buy_symbol_microsecond(symbol, ws_ticker=None, budget=20, max_attempts=5, retry_delay=0.001):
     daily_purchases = get_daily_purchases()
     if daily_purchases >= MAX_DAILY_PURCHASES:
         log_queue.put((logging.INFO, f"Límite diario alcanzado ({MAX_DAILY_PURCHASES}). Ignorando {symbol}."))
