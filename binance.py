@@ -20,7 +20,7 @@ from scipy.stats import linregress
 load_dotenv()
 GPT_MODEL = "gpt-4o-mini"
 DB_NAME = "trading_real.db"
-ESTABLISHED_COINS = ['BTC', 'ETH', 'BNB']
+ESTABLISHED_COINS = ['BTC', 'ETH', 'SOL','ADA']
 
 def initialize_db():
     conn = sqlite3.connect(DB_NAME)
