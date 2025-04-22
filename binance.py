@@ -77,7 +77,7 @@ logger.addHandler(handler)
 logger.info("Prueba de escritura en trading.log al iniciar")
 
 # Constantes
-MAX_OPEN_TRADES = 5
+MAX_OPEN_TRADES = 3
 MIN_NOTIONAL = 10
 RSI_THRESHOLD = 70
 ADX_THRESHOLD = 25

@@ -12,6 +12,7 @@ import requests
 import queue
 from datetime import timedelta
 from binance.client import Client
+from binance.exceptions import BinanceAPIException
 
 # Configurar logging
 logging.basicConfig(
@@ -119,7 +120,7 @@ def increment_daily_purchases():
 # Variables globales
 market_cache = {}
 active_orders = set()
-MIN_NOTIONAL = 20  # Mínimo notional en $10 USD para nuevas monedas
+MIN_NOTIONAL = 10  # Mínimo notional en $10 USD para nuevas monedas
 
 # Función para obtener precio (mejorada)
 def fetch_price(symbol, ws_ticker=None):
@@ -155,7 +156,7 @@ threading.Thread(target=update_market_cache, daemon=True).start()
 # Compra optimizada con reintentos y verificación de mercado
 buying_lock = threading.Lock()
 
-def buy_symbol_microsecond(symbol, ws_ticker=None, budget=20, max_attempts=10, retry_delay=0.0005):
+def buy_symbol_microsecond(symbol, ws_ticker=None, budget=10, max_attempts=10, retry_delay=0.0005):
     """
     Execute a buy order for a new coin with minimal latency, handling delayed market info.
     
@@ -190,9 +191,9 @@ def buy_symbol_microsecond(symbol, ws_ticker=None, budget=20, max_attempts=10, r
     while attempt < max_attempts:
         try:
             # Fetch price from WebSocket or API
-            price = ws_ticker.get("p") if ws_ticker and ws_ticker.get("p") else fetch_price(symbol)
+            price = ws_ticker.get("c") if ws_ticker and "c" in ws_ticker else fetch_price(symbol)
             if not price:
-                raise BinanceAPIException("Precio no disponible", None)
+                raise ValueError("Price not available")
 
             # Calculate amount based on budget
             amount = budget / float(price)
@@ -201,12 +202,14 @@ def buy_symbol_microsecond(symbol, ws_ticker=None, budget=20, max_attempts=10, r
             try:
                 market = binance_client.get_symbol_info(symbol.replace("/", ""))
                 if not market:
-                    raise BinanceAPIException("Información del mercado no disponible", None)
+                    raise ValueError("Información del mercado no disponible")
+                # Extract lot size from filters
                 lot_size = float(market["filters"][2]["minQty"])  # LOT_SIZE filter
+                # Calculate price precision dynamically
                 price_precision = int(market["filters"][0]["tickSize"].find("1") - 1) if market["filters"][0]["tickSize"].find("1") >= 0 else 8
                 amount = max(amount, lot_size)
                 amount = round(amount / lot_size) * lot_size  # Adjust to lot size
-            except BinanceAPIException:
+            except (ValueError, KeyError):
                 # Fallback: Assume permissive lot size and precision
                 log_queue.put((logging.WARNING, f"Market info no disponible para {symbol}. Usando valores predeterminados."))
                 lot_size = 0.0001  # Minimal lot size
@@ -228,7 +231,7 @@ def buy_symbol_microsecond(symbol, ws_ticker=None, budget=20, max_attempts=10, r
                     timeInForce="GTC"
                 )
                 end_time = time.time()
-            except BinanceAPIException as e:
+            except (BinanceAPIException) as e:
                 log_queue.put((logging.WARNING, f"Orden límite fallida para {symbol}: {e}. Intentando orden de mercado..."))
                 # Fallback to market order
                 start_time = time.time()
@@ -268,7 +271,7 @@ def buy_symbol_microsecond(symbol, ws_ticker=None, budget=20, max_attempts=10, r
 
             return {'price': order_price, 'filled': filled}
 
-        except BinanceAPIException as e:
+        except (BinanceAPIException, ValueError) as e:
             log_queue.put((logging.WARNING, f"Intento {attempt + 1}/{max_attempts} fallido para {symbol}: {e}"))
             attempt += 1
             if attempt < max_attempts:
