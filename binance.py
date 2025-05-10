@@ -77,6 +77,7 @@ logger.addHandler(handler)
 logger.info("Prueba de escritura en trading.log al iniciar")
 
 # Constantes
+FIXED_TRADE_AMOUNT = 70
 MAX_OPEN_TRADES = 3
 MIN_NOTIONAL = 10
 RSI_THRESHOLD = 70
@@ -831,13 +832,11 @@ def demo_trading(high_volume_symbols=None):
     logging.info("Iniciando trading en segundo plano para todos los activos USDT relevantes...")
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
     logging.info(f"Saldo USDT disponible: {usdt_balance}")
-    if usdt_balance < MIN_NOTIONAL:
-        logging.warning("Saldo insuficiente en USDT para alcanzar MIN_NOTIONAL.")
+    
+    # Validar que el saldo sea suficiente para al menos un trade
+    if usdt_balance < FIXED_TRADE_AMOUNT:
+        logging.warning(f"Saldo insuficiente en USDT ({usdt_balance}) para cubrir FIXED_TRADE_AMOUNT ({FIXED_TRADE_AMOUNT}).")
         return False
-
-    reserve = 50
-    available_for_trading = max(usdt_balance - reserve, 0)
-    logging.info(f"Disponible para trading: {available_for_trading}, se deja una reserva de {reserve}")
 
     open_trades = get_open_trades()
     logging.info(f"Operaciones abiertas actualmente: {open_trades}")
@@ -848,9 +847,7 @@ def demo_trading(high_volume_symbols=None):
     if high_volume_symbols is None:
         high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=300)
 
-    budget_per_trade = available_for_trading / (MAX_OPEN_TRADES - open_trades) if (MAX_OPEN_TRADES - open_trades) > 0 else available_for_trading
     selected_cryptos = [s for s in high_volume_symbols if s.split('/')[0] in ESTABLISHED_COINS]
-    logging.info(f"Presupuesto por operación: {budget_per_trade}")
     balance = exchange.fetch_balance()['free']
     logging.info(f"Balance actual: {balance}")
 
@@ -1042,6 +1039,12 @@ def demo_trading(high_volume_symbols=None):
                             logging.info(f"Límite de operaciones abiertas alcanzado, no se ejecuta compra para {symbol}.")
                             return False
 
+                        # Validar saldo suficiente para el monto fijo
+                        usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
+                        if usdt_balance < FIXED_TRADE_AMOUNT:
+                            logging.warning(f"Saldo insuficiente ({usdt_balance} USDT) para ejecutar compra de {FIXED_TRADE_AMOUNT} USDT en {symbol}.")
+                            continue
+
                         confidence_factor = confidence / 100
                         if current_price is None or current_price <= 0:
                             logging.error(f"Precio actual inválido para {symbol} ({current_price}), omitiendo operación")
@@ -1054,10 +1057,12 @@ def demo_trading(high_volume_symbols=None):
                         else:
                             volatility_factor = min(2.0, (atr_value / current_price * 100))
                         size_multiplier = confidence_factor * volatility_factor
-                        adjusted_budget = budget_per_trade * size_multiplier
+                        
+                        # Usar monto fijo para calcular la cantidad
+                        adjusted_budget = FIXED_TRADE_AMOUNT * size_multiplier
                         min_amount_for_notional = MIN_NOTIONAL / current_price
                         target_amount = max(adjusted_budget / current_price, min_amount_for_notional)
-                        amount = min(target_amount, 0.10 * usdt_balance / current_price)
+                        amount = target_amount  # No limitamos por el 10% del saldo, ya que usamos monto fijo
                         trade_value = amount * current_price
 
                         logging.info(f"Intentando compra para {symbol}: amount={amount}, trade_value={trade_value}, confidence={confidence}%, volatility_factor={volatility_factor:.2f}x")
@@ -1067,10 +1072,6 @@ def demo_trading(high_volume_symbols=None):
                                 logging.info(f"Compra ejecutada para {symbol}: {explanation}")
                                 send_telegram_message(f"✅ *Compra* `{symbol}`\nConfianza: `{confidence}%`\nCantidad: `{amount}`\nExplicación: `{explanation}`")
                                 dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], indicators)
-                                usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
-                                available_for_trading = max(usdt_balance - reserve, 0)
-                                budget_per_trade = available_for_trading / (MAX_OPEN_TRADES - get_open_trades()) if (MAX_OPEN_TRADES - get_open_trades()) > 0 else available_for_trading
-                                logging.info(f"Rebalanceo: Nuevo saldo USDT={usdt_balance}, presupuesto por trade={budget_per_trade}")
                             else:
                                 logging.error(f"Error al ejecutar compra para {symbol}: orden no completada")
                         else:
