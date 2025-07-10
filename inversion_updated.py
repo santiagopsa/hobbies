@@ -108,21 +108,19 @@ twitter_api = tweepy.API(auth)
 # Sentiment Analyzer
 sia = SentimentIntensityAnalyzer()
 
-def get_tweet_sentiment(keyword, num_tweets=50):
+def get_market_sentiment():
     try:
-        tweets = twitter_api.search_tweets(q=keyword, count=num_tweets, lang="en", tweet_mode="extended")
-        scores = []
-        for tweet in tweets:
-            cleaned_tweet = ' '.join(re.sub("(@[A-Za-z0-9]+)|([^0-9A-Za-z \t])|(\w+:\/\/\S+)", " ", tweet.full_text).split())
-            score = sia.polarity_scores(cleaned_tweet)['compound']
-            scores.append(score)
-        if scores:
-            avg_score = sum(scores) / len(scores)
-            return avg_score
-        return 0
+        response = requests.get("https://api.alternative.me/fng/?limit=1")
+        response.raise_for_status()
+        data = response.json()
+        if data['data']:
+            score = int(data['data'][0]['value'])
+            classification = data['data'][0]['value_classification']
+            return score, classification
+        return 0, "Neutral"
     except Exception as e:
-        logging.error(f"Error fetching sentiment for {keyword}: {e}")
-        return 0
+        logging.error(f"Error fetching market sentiment: {e}")
+        return 0, "Neutral"
 
 def detect_support_level(data, price_series, window=15, max_threshold_multiplier=2.5):
     if len(price_series) < window:
@@ -954,15 +952,15 @@ def demo_trading():
 
             # Add sentiment analysis
             keyword = f"${base_asset} OR ${base_asset.lower()}"
-            sentiment_score = get_tweet_sentiment(keyword)
-            logging.info(f"Sentiment score for {symbol}: {sentiment_score}")
-            if sentiment_score > 0.05:
+            sentiment_score, classification = get_market_sentiment()
+            logging.info(f"Market sentiment: Score={sentiment_score}, Classification={classification} for {symbol}")
+            if sentiment_score > 50:  # Greed/positive
                 confidence = min(confidence + 10, 100)
-                explanation += f" (Sentiment positivo: {sentiment_score:.2f})"
-            elif sentiment_score < -0.05:
+                explanation += f" (Market sentiment positive: {classification}, Score={sentiment_score})"
+            elif sentiment_score < 50:  # Fear/negative
                 action = "mantener"
                 confidence = 50
-                explanation += f" (Sentiment negativo: {sentiment_score:.2f}, overriding to hold)"
+                explanation += f" (Market sentiment negative: {classification}, Score={sentiment_score}, overriding to hold)"
 
             gpt_conditions = {
                 'action is "mantener"': action == "mantener",
