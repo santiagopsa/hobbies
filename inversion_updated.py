@@ -13,7 +13,6 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import pytz
 import pandas_ta as ta
-from elegir_cripto import choose_best_cryptos
 from scipy.stats import linregress
 import tweepy
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
@@ -28,6 +27,7 @@ DB_NAME = "trading_real.db"
 
 # Lista de monedas establecidas
 ESTABLISHED_COINS = ['BTC', 'ETH', 'ADA']
+SELECTED_CRYPTOS = [f"{coin}/USDT" for coin in ESTABLISHED_COINS]
 
 # Twitter API Credentials
 TWITTER_CONSUMER_KEY = os.getenv("TWITTER_CONSUMER_KEY")
@@ -777,7 +777,7 @@ def fetch_ohlcv_with_retry(symbol, timeframe, limit=100, max_retries=3):
 
 buy_lock = threading.Lock()
 
-def demo_trading(high_volume_symbols=None):
+def demo_trading():
     logging.info("Iniciando trading en segundo plano para los activos establecidos...")
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
     logging.info(f"Saldo USDT disponible: {usdt_balance}")
@@ -794,12 +794,6 @@ def demo_trading(high_volume_symbols=None):
         logging.info("Límite de operaciones abiertas alcanzado.")
         return False
 
-    if high_volume_symbols is None:
-        high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=300)
-
-    # Filtro para solo monedas establecidas
-    selected_cryptos = [s for s in high_volume_symbols if s.split('/')[0] in ESTABLISHED_COINS]
-
     budget_per_trade = available_for_trading / (MAX_OPEN_TRADES - open_trades) if (MAX_OPEN_TRADES - open_trades) > 0 else available_for_trading
     logging.info(f"Presupuesto por operación: {budget_per_trade}")
     balance = exchange.fetch_balance()['free']
@@ -808,7 +802,7 @@ def demo_trading(high_volume_symbols=None):
     failed_conditions_count = {}
     symbols_processed = 0
 
-    for symbol in selected_cryptos:
+    for symbol in SELECTED_CRYPTOS:
         try:
             open_trades = get_open_trades()
             logging.info(f"Operaciones abiertas antes de procesar {symbol}: {open_trades}")
@@ -1338,9 +1332,8 @@ def send_periodic_summary():
         time.sleep(3600)
 
 if __name__ == "__main__":
-    high_volume_symbols = choose_best_cryptos(base_currency="USDT", top_n=300)
     threading.Thread(target=send_periodic_summary, daemon=True).start()
     while True:  # Loop infinito para re-evaluar continuamente
-        demo_trading(high_volume_symbols)
+        demo_trading()
         time.sleep(300)  # Espera 5 minutos antes de la siguiente iteración
     logging.shutdown()
