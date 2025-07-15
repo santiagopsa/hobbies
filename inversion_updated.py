@@ -8,16 +8,18 @@ import requests
 import json
 import logging
 import threading
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from dotenv import load_dotenv
-from openai import OpenAI
 import pytz
 import pandas_ta as ta
 from scipy.stats import linregress
 
+# Suppress pandas_ta warning
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pandas_ta")
+
 # Configuración e Inicialización
 load_dotenv()
-GPT_MODEL = "gpt-4o-mini"
 DB_NAME = "trading_real.db"
 
 # Lista de monedas establecidas
@@ -67,7 +69,6 @@ exchange = ccxt.binance({
     'options': {'defaultType': 'spot', 'adjustForTimeDifference': True}
 })
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -76,6 +77,9 @@ logger.setLevel(logging.DEBUG)
 handler = logging.FileHandler(os.path.expanduser("~/hobbies/trading.log"))
 handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 logger.addHandler(handler)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+logger.addHandler(console_handler)
 logger.info("Prueba de escritura en trading.log al iniciar")
 
 # Constantes
@@ -213,6 +217,8 @@ def fetch_order_book_data(symbol, limit=100):
         imbalance = bid_volume / ask_volume if ask_volume > 0 else None
         current_price = fetch_price(symbol) or 1
         depth = (bid_volume + ask_volume) * current_price  # Convert to USDT
+        logging.info(f"Order book data for {symbol}: spread={spread}, imbalance={imbalance}, depth={depth}")
+        print(f"Order book for {symbol}: Spread={spread}, Imbalance={imbalance}, Depth={depth}")
         return {
             'spread': spread,
             'bid_volume': bid_volume,
@@ -222,6 +228,7 @@ def fetch_order_book_data(symbol, limit=100):
         }
     except Exception as e:
         logging.error(f"Error al obtener order book para {symbol}: {e}")
+        print(f"Error fetching order book for {symbol}: {e}")
         return None
 
 def send_telegram_message(message):
@@ -232,6 +239,7 @@ def send_telegram_message(message):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
         requests.post(url, json=payload, timeout=3)
+        logging.info(f"Telegram message sent: {message[:50]}...")
     except Exception as e:
         logging.error(f"Error al enviar a Telegram: {e}")
 
@@ -391,7 +399,7 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
                     df['obv_increasing'] = False
 
             data[tf] = df
-            logging.info(f"Indicators calculated for {symbol} on {tf}: RSI={df['RSI'].iloc[-1] if 'RSI' in df else 'N/A'}, ATR={df['ATR'].iloc[-1] if 'ATR' in df else 'N/A'}")
+            logging.info(f"Indicators for {symbol} on {tf}: RSI={df['RSI'].iloc[-1] if 'RSI' in df else 'N/A'}, ATR={df['ATR'].iloc[-1] if 'ATR' in df else 'N/A'}")
             print(f"Indicators for {symbol} on {tf}: RSI={df['RSI'].iloc[-1] if 'RSI' in df else 'N/A'}, ATR={df['ATR'].iloc[-1] if 'ATR' in df else 'N/A'}")
 
         except Exception as e:
@@ -621,9 +629,9 @@ def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, indicators):
             while True:
                 current_price = fetch_price(symbol)
                 if current_price is None:
-                    logging.warning(f"No se pudo obtener precio para {symbol}, reintentando en 60s")
-                    print(f"No price for {symbol}, retrying in 60s")
-                    time.sleep(60)
+                    logging.warning(f"No se pudo obtener precio para {symbol}, reintentando en 15s")
+                    print(f"No price for {symbol}, retrying in 15s")
+                    time.sleep(15)
                     continue
 
                 if current_price <= stop_loss_price:
@@ -654,7 +662,7 @@ def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, indicators):
                 if current_price <= trailing_stop_price:
                     sell_symbol(symbol, amount, trade_id)
                     break
-                time.sleep(60)
+                time.sleep(15)  # Shortened for faster checks
 
         except Exception as e:
             logging.error(f"Error en trailing stop para {symbol}: {e}")
@@ -718,7 +726,7 @@ def calculate_established_strategy(indicators, data=None):
 
     # Weighted scoring (simplified)
     weighted_signals = [
-        3 * (relative_volume > 1.0 if relative_volume else False),
+        3 * (relative_volume > 0.5 if relative_volume else False),
         2 * (short_volume_trend == "increasing"),
         1 * (price_trend == "increasing"),
         3 * (support_distance <= 0.03),
@@ -744,7 +752,7 @@ def calculate_established_strategy(indicators, data=None):
     return action, confidence, explanation
 
 def evaluate_missed_opportunity(symbol, initial_price, confidence, explanation, indicators):
-    time.sleep(18000)
+    time.sleep(1800)  # Shortened to 30 min for quicker feedback
     final_price = fetch_price(symbol)
     if final_price and initial_price:
         price_change = ((final_price - initial_price) / initial_price) * 100
@@ -810,7 +818,7 @@ def fetch_ohlcv_with_retry(symbol, timeframe, limit=100, max_retries=3):
         except Exception as e:
             logging.error(f"Error al obtener OHLCV para {symbol} en {timeframe}, intento {attempt + 1}/{max_retries}: {e}")
             print(f"Error fetching OHLCV for {symbol} on {timeframe}: {e}")
-        time.sleep(2 ** attempt)
+        time.sleep(2 ** attempt)  # Exponential backoff, short
     return None
 
 buy_lock = threading.Lock()
@@ -859,7 +867,7 @@ def demo_trading():
                 return False
 
             base_asset = symbol.split('/')[0]
-            if base_asset in balance and balance[base_asset] > 0.001:
+            if base_asset in balance and balance[base_asset] > 0.001:  # Ignore dust
                 logging.info(f"Se omite {symbol} porque ya tienes una posición abierta.")
                 print(f"Skipping {symbol}: Position already open.")
                 continue
@@ -881,8 +889,8 @@ def demo_trading():
                 failed_conditions_count['order_book_available'] = failed_conditions_count.get('order_book_available', 0) + 1
                 continue
 
-            conditions['depth >= 1000'] = order_book_data['depth'] >= 1000
-            if not conditions['depth >= 1000']:
+            conditions['depth >= 100000'] = order_book_data['depth'] >= 100000
+            if not conditions['depth >= 100000']:
                 logging.warning(f"Profundidad baja para {symbol}: {order_book_data['depth']}, pero se evalúa de todos modos")
             else:
                 logging.info(f"Profundidad aceptable para {symbol}: {order_book_data['depth']}")
@@ -1006,6 +1014,9 @@ def demo_trading():
                 "symbol": symbol
             }
 
+            # Print full indicators for screen debug
+            print(f"Indicators for {symbol}: {indicators}")
+
             conditions_str = "\n".join([f"{key}: {'Sí' if value is True else 'No' if value is False else 'Desconocido'}" for key, value in sorted(conditions.items())])
             logging.info(f"Condiciones evaluadas para {symbol}:\n{conditions_str}")
             print(f"Conditions for {symbol}:\n{conditions_str}")
@@ -1028,32 +1039,11 @@ def demo_trading():
                 confidence = 50
                 explanation += f" (Market sentiment negative: {classification}, Score={sentiment_score}, overriding to hold)"
 
-            gpt_conditions = {
-                'action is "mantener"': action == "mantener",
-                'Relative volume is None or low (< 1.8)': relative_volume is None or (relative_volume is not None and relative_volume < 1.8),
-                'No recent MACD crossover': not has_crossover,
-                'Far from support (> 0.03)': support_distance is None or support_distance > 0.03
-            }
-
-            gpt_conditions_str = "\n".join([f"{key}: {'Sí' if value else 'No'}" for key, value in gpt_conditions.items()])
-            total_gpt_conditions = len(gpt_conditions)
-            passed_gpt_conditions = sum(1 for value in gpt_conditions.values() if value)
-            failed_gpt_conditions = [key for key, value in gpt_conditions.items() if not value]
-            failed_gpt_conditions_str = ", ".join(failed_gpt_conditions) if failed_gpt_conditions else "Ninguna"
-            logging.info(f"Condiciones para llamar a gpt_decision_buy en {symbol}: Pasadas {passed_gpt_conditions} de {total_gpt_conditions}:\n{gpt_conditions_str}\nNo se cumplieron: {failed_gpt_conditions_str}")
-            print(f"GPT conditions for {symbol}: Passed {passed_gpt_conditions}/{total_gpt_conditions}")
-
-            if passed_gpt_conditions == total_gpt_conditions:
-                prepared_text = gpt_prepare_data(data, indicators)
-                action, confidence, explanation = gpt_decision_buy(prepared_text)
-                logging.info(f"Resultado de gpt_decision_buy para {symbol}: Acción={action}, Confianza={confidence}%, Explicación={explanation}")
-                print(f"GPT decision for {symbol}: {action}, Confidence={confidence}%, Expl={explanation}")
-
-            logging.info(f"Decisión final para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
+            logging.info(f"Final decision for {symbol}: {action} (Confidence: {confidence}%) - {explanation}")
             print(f"Final decision for {symbol}: {action} (Confidence: {confidence}%) - {explanation}")
             logging.debug(f"Verificación post-decisión para {symbol}: action={action}, confidence={confidence}, explanation={explanation}, conditions={conditions}")
 
-            if action == "comprar" and confidence >= 80:
+            if action == "comprar" and confidence >= 75:
                 with buy_lock:
                     open_trades = get_open_trades()
                     if open_trades >= MAX_OPEN_TRADES:
@@ -1213,196 +1203,18 @@ def analyze_trade_outcome(trade_id):
             logging.info(f"RSI_THRESHOLD aumentado a {RSI_THRESHOLD} por operación perdedora con RSI tardío")
             print(f"RSI_THRESHOLD increased to {RSI_THRESHOLD}")
 
-        gpt_prompt = f"""
-        Analiza esta transacción de `{buy_data['symbol']}` (ID: {trade_id}) para determinar por qué fue un éxito o un fracaso, si es exito dime cual fue el acierto y si fue un fracaso dime que se deberia corregir en los datos agregar para tomar un amejor decision:
-        - Precio de compra: {buy_data['buy_price']}
-        - Precio de venta: {sell_price}
-        - Cantidad: {buy_data['amount']}
-        - Ganancia/Pérdida: {profit_loss:.2f} USDT
-        - RSI: {buy_data['rsi'] if buy_data['rsi'] else 'N/A'}
-        - ADX: {buy_data['adx'] if buy_data['adx'] else 'N/A'}
-        - ATR: {buy_data['atr'] if buy_data['atr'] else 'N/A'}
-        - Volumen relativo: {buy_data['relative_volume'] if buy_data['relative_volume'] else 'N/A'}
-        - Divergencia: {buy_data['divergence'] if buy_data['divergence'] else 'N/A'}
-        - Posición BB: {buy_data['bb_position'] if buy_data['bb_position'] else 'N/A'}
-        - Confianza: {buy_data['confidence'] if buy_data['confidence'] else 'N/A'}
-        - Cruce MACD: {'Sí' if buy_data['has_macd_crossover'] else 'No'}
-        - Velas desde cruce MACD: {buy_data['candles_since_crossover'] if buy_data['candles_since_crossover'] else 'N/A'}
-        - Tendencia de volumen: {buy_data['volume_trend'] if buy_data['volume_trend'] else 'N/A'}
-        - Tendencia de precio: {buy_data['price_trend'] if buy_data['price_trend'] else 'N/A'}
-        - Tendencia de volumen corto: {buy_data['short_volume_trend'] if buy_data['short_volume_trend'] else 'N/A'}
-        - Nivel de soporte: {buy_data['support_level'] if buy_data['support_level'] else 'N/A'}
-        - Spread: {buy_data['spread'] if buy_data['spread'] else 'N/A'}
-        - Imbalance: {buy_data['imbalance'] if buy_data['imbalance'] else 'N/A'}
-        - Profundidad: {buy_data['depth'] if buy_data['depth'] else 'N/A'}
-        Responde SOLO con un JSON válido sin etiqueta '''json''':
-        {{"resultado": "éxito", "razon": "Compramos {buy_data['symbol']} a {buy_data['buy_price']} con RSI {buy_data['rsi']} y volumen fuerte {buy_data['relative_volume']}, vendimos a {sell_price} por una ganancia de {profit_loss:.2f} USDT gracias a un timing efectivo.", "confianza": 85}}
-        o
-        {{"resultado": "fracaso", "razon": "Compramos {buy_data['symbol']} a {buy_data['buy_price']} con RSI {buy_data['rsi']} y volumen débil {buy_data['relative_volume']}, vendimos a {sell_price} por una pérdida de {profit_loss:.2f} USDT por falta de momentum.", "confianza": 75}}
-        """
-
-        print(f"Analyzing trade outcome for ID {trade_id}")
-        response = client.chat.completions.create(
-            model=GPT_MODEL,
-            messages=[{"role": "user", "content": gpt_prompt}],
-            temperature=0
-        )
-        raw_response = response.choices[0].message.content.strip()
-        send_telegram_message(raw_response)
-        outcome = json.loads(raw_response)
-        
-        resultado = outcome.get("resultado", "desconocido").lower()
-        razon = outcome.get("razon", "Sin análisis disponible")
-        confianza = outcome.get("confianza", 50)
-
         telegram_message = f"📊 *Análisis de Resultado* `{buy_data['symbol']}` (ID: {trade_id})\n" \
                           f"Resultado: {'Éxito' if is_profitable else 'Fracaso'}\n" \
                           f"Ganancia/Pérdida: {profit_loss:.2f} USDT\n" \
-                          f"Razón: {razon}\n" \
-                          f"Confianza: {confianza}%"
+                          f"Confianza: {buy_data['confidence'] if buy_data['confidence'] else 'N/A'}%"
         send_telegram_message(telegram_message)
-        logging.info(f"Análisis de transacción {trade_id}: {resultado} - {razon} (Confianza: {confianza}%)")
-        print(f"Trade analysis {trade_id}: {resultado} - {razon} (Conf: {confianza}%)")
+        logging.info(f"Análisis de transacción {trade_id}: {'Éxito' if is_profitable else 'Fracaso'} - P/L {profit_loss:.2f}")
 
     except Exception as e:
         logging.error(f"Error al analizar el resultado de la transacción {trade_id}: {e}")
         print(f"Error analyzing trade {trade_id}: {e}")
     finally:
         conn.close()
-
-def gpt_prepare_data(data, indicators):
-    combined_data = ""
-    for tf, df in data.items():
-        if not df.empty:
-            combined_data += f"\nDatos de {tf} (últimos 3):\n{df.tail(3).to_string(index=False)}\n"
-    prompt = f"""
-    Analiza los datos y decide si comprar esta criptomoneda para maximizar ganancias a corto plazo en cualquier activo USDT en Binance:
-    {combined_data}
-    Indicadores actuales:
-    - RSI: {indicators.get('rsi', 'No disponible')}
-    - ADX: {indicators.get('adx', 'No disponible')}
-    - Divergencias: {indicators.get('divergence', 'No disponible')}
-    - Volumen relativo: {indicators.get('relative_volume', 'No disponible')}
-    - Precio actual: {indicators.get('current_price', 'No disponible')}
-    - Cruce alcista reciente de MACD: {indicators.get('has_macd_crossover', 'No disponible')}
-    - Velas desde el cruce: {indicators.get('candles_since_crossover', 'No disponible')}
-    - Spread: {indicators.get('spread', 'No disponible')}
-    - Imbalance (bids/asks): {indicators.get('imbalance', 'No disponible')}
-    - Profundidad del libro: {indicators.get('depth', 'No disponible')}
-    - Tendencia de volumen: {indicators.get('volume_trend', 'No disponible')}
-    - Tendencia de precio: {indicators.get('price_trend', 'No disponible')}
-    - Tendencia de volumen corto: {indicators.get('short_volume_trend', 'No disponible')}
-    - Nivel de soporte: {indicators.get('support_level', 'No disponible')}
-    - ROC: {indicators.get('roc', 'No disponible')}
-    """
-    logging.debug(f"GPT prompt prepared: {prompt[:200]}...")  # Log snippet
-    print(f"GPT prompt prepared for analysis.")
-    return prompt
-
-def gpt_decision_buy(prepared_text):
-    prompt = f"""
-    Eres un experto en trading de criptomonedas de alto riesgo. Basándote en los datos para un activo USDT en Binance:
-    {prepared_text}
-    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza tendencias fuertes con volumen relativo alto (> 3.0) y proximidad al soporte (<= 0.15). Responde SOLO con un JSON válido sin '''json''' asi:
-    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen relativo > 3.0, short_volume_trend 'increasing', price_trend 'increasing', distancia al soporte <= 0.15, indican oportunidad de ganancia rápida"}}
-    Criterios ajustados:
-    - Compra si: volumen relativo > 3.0, short_volume_trend es 'increasing' o 'stable', price_trend es 'increasing', distancia relativa al soporte <= 0.15, profundidad > 3000, y spread <= 0.5% del precio (0.005 * precio). RSI > 70 es un bono, no un requisito.
-    - Mantener si: volumen relativo <= 3.0, short_volume_trend es 'decreasing', price_trend no es 'increasing', distancia relativa al soporte > 0.15, profundidad <= 3000, o spread > 0.5% del precio.
-    - Evalúa liquidez con profundidad (>3000) y spread (<=0.5% del precio).
-    - Asigna confianza >80 solo si volumen relativo > 3.0, soporte cercano (<= 0.15), y al menos 3 condiciones se cumplen; usa 60-79 para riesgos moderados (al menos 2 condiciones); de lo contrario, usa 50. Suma 10 a la confianza si RSI > 70.
-    - Ignora el cruce MACD como requisito; prioriza momentum y soporte.
-    """
-
-    max_retries = 2
-    timeout_sec = 5
-
-    for attempt in range(max_retries + 1):
-        try:
-            print(f"Calling GPT for decision, attempt {attempt + 1}")
-            response = with_timeout(
-                client.chat.completions.create,
-                kwargs={
-                    "model": GPT_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0
-                },
-                timeout_sec=timeout_sec
-            )
-            raw_response = response.choices[0].message.content.strip()
-            decision = json.loads(raw_response)
-
-            accion = decision.get("accion", "mantener").lower()
-            confianza = decision.get("confianza", 50)
-            explicacion = decision.get("explicacion", "Respuesta incompleta")
-
-            if accion not in ["comprar", "mantener"]:
-                accion = "mantener"
-            if not isinstance(confianza, (int, float)) or confianza < 50 or confianza > 100:
-                confianza = 50
-                explicacion = "Confianza fuera de rango, ajustada a 50"
-
-            try:
-                if "short_volume_trend" in prepared_text and "increasing" not in prepared_text.lower() and "stable" not in prepared_text.lower():
-                    return "mantener", 50, "Short volume trend no es 'increasing' ni 'stable', overriding GPT"
-                if "relative_volume" in prepared_text:
-                    rel_vol_str = prepared_text.split("Volumen relativo: ")[1].split("\n")[0]
-                    relative_volume = float(rel_vol_str) if rel_vol_str.replace('.', '').replace('-', '').isdigit() else 0
-                    if relative_volume <= 3.0:
-                        return "mantener", 50, "Relative volume demasiado bajo (<= 3.0), overriding GPT"
-                if "price_trend" in prepared_text and "increasing" not in prepared_text.lower():
-                    return "mantener", 50, "Price trend no es 'increasing', overriding GPT"
-                if "distancia relativa al soporte" in prepared_text.lower():
-                    dist_str = prepared_text.split("distancia relativa al soporte: ")[1].split("\n")[0] if "distancia relativa al soporte: " in prepared_text.lower() else "1.0"
-                    support_distance = float(dist_str) if dist_str.replace('.', '').replace('-', '').isdigit() else 1.0
-                    if support_distance > 0.15:
-                        return "mantener", 50, "Lejos del soporte (> 0.15), overriding GPT"
-                if "profundidad" in prepared_text:
-                    depth_str = prepared_text.split("Profundidad del libro: ")[1].split("\n")[0]
-                    depth = float(depth_str) if depth_str.replace('.', '').replace('-', '').isdigit() else 0
-                    if depth <= 3000:
-                        return "mantener", 50, "Profundidad demasiado baja (<= 3000), overriding GPT"
-                if "spread" in prepared_text:
-                    spread_str = prepared_text.split("Spread: ")[1].split("\n")[0]
-                    spread = float(spread_str) if spread_str.replace('.', '').replace('-', '').isdigit() else float('inf')
-                    current_price_str = prepared_text.split("Precio actual: ")[1].split("\n")[0]
-                    current_price = float(current_price_str) if current_price_str.replace('.', '').replace('-', '').isdigit() else 1
-                    if spread > 0.005 * current_price:
-                        return "mantener", 50, "Spread demasiado alto (> 0.5% del precio), overriding GPT"
-            except (ValueError, IndexError) as e:
-                logging.warning(f"Error al validar condiciones en prepared_text: {e}, usando decisión predeterminada")
-                print(f"Error validating GPT conditions: {e}")
-                return "mantener", 50, "Error en validación de condiciones, manteniendo por seguridad"
-
-            return accion, confianza, explicacion
-
-        except json.JSONDecodeError as e:
-            logging.error(f"Intento {attempt + 1} fallido: Respuesta de GPT no es JSON válido - {raw_response}")
-            print(f"GPT response not JSON: {e}")
-            if attempt == max_retries:
-                return "mantener", 50, f"Error en formato JSON tras {max_retries + 1} intentos"
-        except requests.Timeout:
-            logging.error(f"Intento {attempt + 1} fallido: Timeout de {timeout_sec} segundos en GPT")
-            print(f"GPT timeout on attempt {attempt + 1}")
-            if attempt == max_retries:
-                return "mantener", 50, f"Timeout tras {max_retries + 1} intentos"
-        except Exception as e:
-            logging.error(f"Error en GPT (intento {attempt + 1}): {e}")
-            print(f"GPT error on attempt {attempt + 1}: {e}")
-            if attempt == max_retries:
-                return "mantener", 50, "Error al procesar respuesta de GPT"
-        time.sleep(2 ** attempt)
-
-def with_timeout(func, kwargs, timeout_sec):
-    start = time.time()
-    result = [None]
-    def target():
-        result[0] = func(**kwargs)
-    thread = threading.Thread(target=target)
-    thread.start()
-    thread.join(timeout_sec)
-    if thread.is_alive():
-        raise requests.Timeout(f"Function timed out after {timeout_sec} seconds")
-    return result[0]
 
 def send_periodic_summary():
     while True:
@@ -1445,7 +1257,7 @@ def daily_summary():
             cursor.execute("""
                 SELECT COUNT(*) FROM transactions_new t1
                 JOIN transactions_new t2 ON t1.trade_id = t2.trade_id AND t2.action = 'sell'
-                WHERE t1.action = 'buy' AND t1.status = 'closed' AND (t2.price - t1.price) * t1.amount > 0
+                WHERE t1.action = 'buy' AND t1.status = 'closed' AND (t2.price - t1.price) > 0
             """)
             wins = cursor.fetchone()[0]
             
@@ -1455,13 +1267,13 @@ def daily_summary():
                 WHERE t1.action = 'buy' AND t1.status = 'closed'
             """)
             total_closed = cursor.fetchone()[0]
-            win_rate = (wins / total_closed * 100) if total_closed > 0 else 0.0
+            win_rate = (wins / total_closed * 100) if total_closed > 0 else 0
 
-            # Total trade volume (executed buys)
+            # Total trade volume (executed trades)
             cursor.execute("SELECT COUNT(*) FROM transactions_new WHERE action='buy'")
             total_trades = cursor.fetchone()[0]
 
-            # Missed opportunities count (approximate from CSV if used)
+            # Missed opps count from CSV (or DB if logged)
             missed_count = sum(1 for line in open("missed_opportunities.csv", "r") if line.strip()) if os.path.exists("missed_opportunities.csv") else 0
 
             message = (f"📊 *Resumen Diario del Bot* ({get_colombia_timestamp()})\n"
