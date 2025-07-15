@@ -7,6 +7,7 @@ import time
 import requests
 import json
 import logging
+import logging.handlers  # Added for RotatingFileHandler
 import threading
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
