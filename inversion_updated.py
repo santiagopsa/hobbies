@@ -202,7 +202,7 @@ def calculate_short_volume_trend(data, window=3):
     else:
         return "stable"
 
-def fetch_order_book_data(symbol, limit=20):
+def fetch_order_book_data(symbol, limit=100):
     try:
         order_book = exchange.fetch_order_book(symbol, limit=limit)
         bids = order_book['bids']
@@ -211,9 +211,8 @@ def fetch_order_book_data(symbol, limit=20):
         bid_volume = sum([volume for _, volume in bids])
         ask_volume = sum([volume for _, volume in asks])
         imbalance = bid_volume / ask_volume if ask_volume > 0 else None
-        depth = bid_volume + ask_volume
-        logging.info(f"Order book data for {symbol}: spread={spread}, imbalance={imbalance}, depth={depth}")
-        print(f"Order book for {symbol}: Spread={spread}, Imbalance={imbalance}, Depth={depth}")
+        current_price = fetch_price(symbol) or 1
+        depth = (bid_volume + ask_volume) * current_price  # Convert to USDT
         return {
             'spread': spread,
             'bid_volume': bid_volume,
@@ -223,7 +222,6 @@ def fetch_order_book_data(symbol, limit=20):
         }
     except Exception as e:
         logging.error(f"Error al obtener order book para {symbol}: {e}")
-        print(f"Error fetching order book for {symbol}: {e}")
         return None
 
 def send_telegram_message(message):
@@ -680,7 +678,7 @@ def calculate_established_strategy(indicators, data=None):
 
     # Adjusted thresholds for established coins
     MIN_ADX = 20
-    MIN_RELATIVE_VOLUME = 1.0  # Lowered to allow more trades
+    MIN_RELATIVE_VOLUME = 0.5  # Lowered to allow more trades
     MAX_SUPPORT_DISTANCE = 0.03
     OVERSOLD_THRESHOLD = 0.95
     VOLUME_SPIKE_FACTOR = 1.5
@@ -861,7 +859,7 @@ def demo_trading():
                 return False
 
             base_asset = symbol.split('/')[0]
-            if base_asset in balance and balance[base_asset] > 0:
+            if base_asset in balance and balance[base_asset] > 0.001:
                 logging.info(f"Se omite {symbol} porque ya tienes una posición abierta.")
                 print(f"Skipping {symbol}: Position already open.")
                 continue
@@ -1429,9 +1427,68 @@ def send_periodic_summary():
             send_telegram_message(f"⚠️ *Error en Resumen* `{str(e)}`")
         time.sleep(3600)
 
+def daily_summary():
+    while True:
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            
+            # Total P/L from closed trades
+            cursor.execute("""
+                SELECT SUM((t2.price - t1.price) * t1.amount) FROM transactions_new t1
+                JOIN transactions_new t2 ON t1.trade_id = t2.trade_id AND t2.action = 'sell'
+                WHERE t1.action = 'buy' AND t1.status = 'closed'
+            """)
+            total_pl = cursor.fetchone()[0] or 0.0
+
+            # Win rate: profitable closed trades / total closed
+            cursor.execute("""
+                SELECT COUNT(*) FROM transactions_new t1
+                JOIN transactions_new t2 ON t1.trade_id = t2.trade_id AND t2.action = 'sell'
+                WHERE t1.action = 'buy' AND t1.status = 'closed' AND (t2.price - t1.price) * t1.amount > 0
+            """)
+            wins = cursor.fetchone()[0]
+            
+            cursor.execute("""
+                SELECT COUNT(*) FROM transactions_new t1
+                JOIN transactions_new t2 ON t1.trade_id = t2.trade_id AND t2.action = 'sell'
+                WHERE t1.action = 'buy' AND t1.status = 'closed'
+            """)
+            total_closed = cursor.fetchone()[0]
+            win_rate = (wins / total_closed * 100) if total_closed > 0 else 0.0
+
+            # Total trade volume (executed buys)
+            cursor.execute("SELECT COUNT(*) FROM transactions_new WHERE action='buy'")
+            total_trades = cursor.fetchone()[0]
+
+            # Missed opportunities count (approximate from CSV if used)
+            missed_count = sum(1 for line in open("missed_opportunities.csv", "r") if line.strip()) if os.path.exists("missed_opportunities.csv") else 0
+
+            message = (f"📊 *Resumen Diario del Bot* ({get_colombia_timestamp()})\n"
+                       f"Total Ganancia/Pérdida: {total_pl:.2f} USDT\n"
+                       f"Tasa de Ganancia: {win_rate:.1f}% ({wins}/{total_closed} trades)\n"
+                       f"Volumen Total de Trades: {total_trades}\n"
+                       f"Oportunidades Perdidas: {missed_count}")
+            send_telegram_message(message)
+            logging.info(message)
+            print(message)
+            conn.close()
+        except Exception as e:
+            logging.error(f"Error en resumen diario: {e}")
+            print(f"Error in daily summary: {e}")
+            send_telegram_message(f"⚠️ *Error en Resumen Diario* `{str(e)}`")
+        time.sleep(86400)  # 24 hours
+
 if __name__ == "__main__":
     threading.Thread(target=send_periodic_summary, daemon=True).start()
-    while True:  # Loop infinito para re-evaluar continuamente
-        demo_trading()
-        time.sleep(300)  # Espera 5 minutos antes de la siguiente iteración
-    logging.shutdown()
+    threading.Thread(target=daily_summary, daemon=True).start()
+    try:
+        while True:
+            demo_trading()
+            time.sleep(30)
+    except (KeyboardInterrupt, SystemExit):
+        logging.shutdown()
+        for handler in logger.handlers[:]:
+            handler.close()
+            logger.removeHandler(handler)
+        print("Logging shut down gracefully at", get_colombia_timestamp())
