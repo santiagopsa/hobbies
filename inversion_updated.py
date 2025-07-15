@@ -8,18 +8,16 @@ import requests
 import json
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+from openai import OpenAI
 import pytz
 import pandas_ta as ta
 from scipy.stats import linregress
 
-# Suppress pandas_ta warning
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="pandas_ta")
-
 # Configuración e Inicialización
 load_dotenv()
+GPT_MODEL = "gpt-4o-mini"
 DB_NAME = "trading_real.db"
 
 # Lista de monedas establecidas
@@ -69,17 +67,16 @@ exchange = ccxt.binance({
     'options': {'defaultType': 'spot', 'adjustForTimeDifference': True}
 })
 
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 logger = logging.getLogger("inversion_binance")
 logger.setLevel(logging.DEBUG)
-handler = logging.FileHandler(os.path.expanduser("~/hobbies/trading.log"))
+log_filename = os.path.expanduser(f"~/hobbies/trading_{datetime.now().strftime('%Y%m%d')}.log")
+handler = logging.handlers.RotatingFileHandler(log_filename, maxBytes=1024*1024, backupCount=5)
 handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 logger.addHandler(handler)
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-logger.addHandler(console_handler)
 logger.info("Prueba de escritura en trading.log al iniciar")
 
 # Constantes
@@ -104,12 +101,12 @@ def get_market_sentiment():
             return score, classification
         return 0, "Neutral"
     except Exception as e:
-        logging.error(f"Error fetching market sentiment: {e}")
+        logger.error(f"Error fetching market sentiment: {e}")
         return 0, "Neutral"
 
 def detect_support_level(data, price_series, window=15, max_threshold_multiplier=2.5):
     if len(price_series) < window:
-        logging.warning(f"Series too short for {price_series.name}: {len(price_series)} < {window}")
+        logger.warning(f"Series too short for {price_series.name}: {len(price_series)} < {window}")
         return None
 
     recent_prices = price_series[-window:]
@@ -119,7 +116,7 @@ def detect_support_level(data, price_series, window=15, max_threshold_multiplier
     ]
 
     if not local_mins:
-        logging.warning(f"No local minima found in the last {window} candles for {price_series.name}")
+        logger.warning(f"No local minima found in the last {window} candles for {price_series.name}")
         return None
 
     support_level = min(local_mins)
@@ -136,12 +133,12 @@ def detect_support_level(data, price_series, window=15, max_threshold_multiplier
 
     if atr_value is None:
         atr_value = price_series.pct_change().std() * current_price if len(price_series) > 10 else current_price * 0.02
-        logging.warning(f"No ATR calculado para {price_series.name}, usando volatilidad estimada: {atr_value}")
+        logger.warning(f"No ATR calculado para {price_series.name}, usando volatilidad estimada: {atr_value}")
 
     threshold = 1 + (atr_value * max_threshold_multiplier / current_price) if current_price > 0 else 1.02
     threshold = min(threshold, 1.03)
 
-    logging.debug(f"Soporte detectado: precio={current_price}, soporte={support_level}, umbral={threshold:.3f}")
+    logger.debug(f"Soporte detectado: precio={current_price}, soporte={support_level}, umbral={threshold:.3f}")
     return support_level if current_price <= support_level * threshold else None
 
 def detect_bullish_candlestick(data, timeframe='1h'):
@@ -183,20 +180,20 @@ def calculate_volume_behavior(data, timeframe='1h', window=5):
 
 def calculate_short_volume_trend(data, window=3):
     if '15m' not in data or data['15m'].empty or len(data['15m']) < window:
-        logging.warning("Datos de 15m no disponibles o insuficientes para calcular short_volume_trend")
+        logger.warning("Datos de 15m no disponibles o insuficientes para calcular short_volume_trend")
         return "insufficient_data"
 
     volume_series = data['15m']['volume']
     
     if len(volume_series) < window:
-        logging.warning(f"Series de volumen 15m demasiado corta: {len(volume_series)} < {window}")
+        logger.warning(f"Series de volumen 15m demasiado corta: {len(volume_series)} < {window}")
         return "insufficient_data"
     
     last_volume = volume_series.iloc[-1]
     avg_volume = volume_series[-window:-1].mean()
     
     if avg_volume == 0:
-        logging.warning("Promedio de volumen es 0, no se puede calcular short_volume_trend")
+        logger.warning("Promedio de volumen es 0, no se puede calcular short_volume_trend")
         return "insufficient_data"
     
     if last_volume > avg_volume * 1.10:
@@ -217,8 +214,6 @@ def fetch_order_book_data(symbol, limit=100):
         imbalance = bid_volume / ask_volume if ask_volume > 0 else None
         current_price = fetch_price(symbol) or 1
         depth = (bid_volume + ask_volume) * current_price  # Convert to USDT
-        logging.info(f"Order book data for {symbol}: spread={spread}, imbalance={imbalance}, depth={depth}")
-        print(f"Order book for {symbol}: Spread={spread}, Imbalance={imbalance}, Depth={depth}")
         return {
             'spread': spread,
             'bid_volume': bid_volume,
@@ -227,21 +222,19 @@ def fetch_order_book_data(symbol, limit=100):
             'depth': depth
         }
     except Exception as e:
-        logging.error(f"Error al obtener order book para {symbol}: {e}")
-        print(f"Error fetching order book for {symbol}: {e}")
+        logger.error(f"Error al obtener order book para {symbol}: {e}")
         return None
 
 def send_telegram_message(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.warning("Telegram no configurado.")
+        logger.warning("Telegram no configurado.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
         requests.post(url, json=payload, timeout=3)
-        logging.info(f"Telegram message sent: {message[:50]}...")
     except Exception as e:
-        logging.error(f"Error al enviar a Telegram: {e}")
+        logger.error(f"Error al enviar a Telegram: {e}")
 
 def get_colombia_timestamp():
     colombia_tz = pytz.timezone("America/Bogota")
@@ -251,11 +244,11 @@ def fetch_price(symbol):
     try:
         ticker = exchange.fetch_ticker(symbol)
         price = ticker['last']
-        logging.info(f"Price for {symbol}: {price}")
+        logger.info(f"Price for {symbol}: {price}")
         print(f"Current price for {symbol}: {price}")
         return price
     except Exception as e:
-        logging.error(f"Error al obtener precio de {symbol}: {e}")
+        logger.error(f"Error al obtener precio de {symbol}: {e}")
         print(f"Error fetching price for {symbol}: {e}")
         return None
 
@@ -263,27 +256,27 @@ def fetch_volume(symbol):
     try:
         ticker = exchange.fetch_ticker(symbol)
         volume = ticker['quoteVolume']
-        logging.info(f"Volume for {symbol}: {volume}")
+        logger.info(f"Volume for {symbol}: {volume}")
         print(f"24h volume for {symbol}: {volume}")
         return volume
     except Exception as e:
-        logging.error(f"Error al obtener volumen de {symbol}: {e}")
+        logger.error(f"Error al obtener volumen de {symbol}: {e}")
         print(f"Error fetching volume for {symbol}: {e}")
         return None
 
 def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, roc_length=7, limit=100):
     timeframes = ['15m', '1h', '4h', '1d']
     data = {}
-    logging.debug(f"Inicio de fetch_and_prepare_data para {symbol}")
+    logger.debug(f"Inicio de fetch_and_prepare_data para {symbol}")
     print(f"Fetching and preparing data for {symbol}")
 
     for tf in timeframes:
         try:
-            logging.debug(f"Iniciando fetch_ohlcv para {symbol} en {tf} con limit={limit}")
+            logger.debug(f"Iniciando fetch_ohlcv para {symbol} en {tf} con limit={limit}")
             print(f"Fetching OHLCV for {symbol} on {tf} timeframe")
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
             if not ohlcv or len(ohlcv) == 0:
-                logging.warning(f"Datos vacíos para {symbol} en {tf}")
+                logger.warning(f"Datos vacíos para {symbol} en {tf}")
                 print(f"No data for {symbol} on {tf}")
                 continue
 
@@ -291,11 +284,11 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
             df.sort_index(inplace=True)
-            logging.debug(f"DataFrame para {symbol} en {tf} creado con {len(df)} velas.")
+            logger.debug(f"DataFrame para {symbol} en {tf} creado con {len(df)} velas.")
             print(f"Data frame created for {symbol} on {tf} with {len(df)} candles")
 
             if len(df) < max(atr_length, rsi_length, bb_length, roc_length, 15):
-                logging.warning(f"Datos insuficientes (<{max(atr_length, rsi_length, bb_length, roc_length, 15)} velas) para {symbol} en {tf}")
+                logger.warning(f"Datos insuficientes (<{max(atr_length, rsi_length, bb_length, roc_length, 15)} velas) para {symbol} en {tf}")
                 print(f"Insufficient data for {symbol} on {tf}")
                 continue
 
@@ -304,7 +297,7 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
             if len(expected_index) > len(df.index):
                 gap_ratio = (len(expected_index) - len(df.index)) / len(expected_index)
                 if gap_ratio > 0.1:
-                    logging.error(f"Demasiados gaps en {symbol} en {tf} (ratio: {gap_ratio:.2f}), omitiendo timeframe")
+                    logger.error(f"Demasiados gaps en {symbol} en {tf} (ratio: {gap_ratio:.2f}), omitiendo timeframe")
                     print(f"Too many gaps in data for {symbol} on {tf}, skipping")
                     continue
                 df = df.reindex(expected_index, method='ffill').dropna(how='all')
@@ -399,17 +392,14 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
                     df['obv_increasing'] = False
 
             data[tf] = df
-            logging.info(f"Indicators for {symbol} on {tf}: RSI={df['RSI'].iloc[-1] if 'RSI' in df else 'N/A'}, ATR={df['ATR'].iloc[-1] if 'ATR' in df else 'N/A'}")
-            print(f"Indicators for {symbol} on {tf}: RSI={df['RSI'].iloc[-1] if 'RSI' in df else 'N/A'}, ATR={df['ATR'].iloc[-1] if 'ATR' in df else 'N/A'}")
+            logger.info(f"Indicators for {symbol} on {tf}: RSI={df['RSI'].iloc[-1] if 'RSI' in df else 'N/A'}, ATR={df['ATR'].iloc[-1] if 'ATR' in df else 'N/A'}")
 
         except Exception as e:
-            logging.error(f"Error procesando {symbol} en {tf}: {e}")
-            print(f"Error processing {symbol} on {tf}: {e}")
+            logger.error(f"Error procesando {symbol} en {tf}: {e}")
             continue
 
     if not data:
-        logging.error(f"No se obtuvieron datos válidos para {symbol} en ningún timeframe")
-        print(f"No valid data for {symbol} in any timeframe")
+        logger.error(f"No se obtuvieron datos válidos para {symbol} en ningún timeframe")
         return None, None
 
     has_valid_indicators = any(
@@ -417,19 +407,16 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
         for df in data.values()
     )
     if not has_valid_indicators:
-        logging.error(f"No hay indicadores válidos para {symbol}")
-        print(f"No valid indicators for {symbol}")
+        logger.error(f"No hay indicadores válidos para {symbol}")
         return None, None
 
     for tf in ['15m', '1h', '4h', '1d']:
         if tf in data and not data[tf].empty:
             price_series = data[tf]['close']
-            logging.debug(f"Seleccionada serie de precios para soporte: {tf} con {len(price_series)} velas")
-            print(f"Price series selected for support on {tf} with {len(price_series)} candles")
+            logger.debug(f"Seleccionada serie de precios para soporte: {tf} con {len(price_series)} velas")
             break
     else:
-        logging.error(f"No se pudieron obtener series de precios para {symbol}")
-        print(f"No price series for {symbol}")
+        logger.error(f"No se pudieron obtener series de precios para {symbol}")
         return None, None
 
     return data, price_series
@@ -438,12 +425,10 @@ def calculate_adx(df):
     try:
         adx = ta.adx(df['high'], df['low'], df['close'], length=14)
         adx_value = adx['ADX_14'].iloc[-1] if not pd.isna(adx['ADX_14'].iloc[-1]) else None
-        logging.info(f"ADX calculated: {adx_value}")
-        print(f"ADX: {adx_value}")
+        logger.info(f"ADX: {adx_value}")
         return adx_value
     except Exception as e:
-        logging.error(f"Error al calcular ADX: {e}")
-        print(f"Error calculating ADX: {e}")
+        logger.error(f"Error al calcular ADX: {e}")
         return None
 
 def detect_momentum_divergences(price_series, rsi_series):
@@ -460,12 +445,10 @@ def detect_momentum_divergences(price_series, rsi_series):
                   rsi[i] > rsi[i-window]):
                 divergences.append(("bullish", i))
         result = "bullish" if any(d[0] == "bullish" for d in divergences) else "bearish" if any(d[0] == "bearish" for d in divergences) else "none"
-        logging.info(f"Momentum divergences: {result}")
-        print(f"Momentum divergences: {result}")
+        logger.info(f"Momentum divergences: {result}")
         return result
     except Exception as e:
-        logging.error(f"Error en divergencias: {e}")
-        print(f"Error in divergences: {e}")
+        logger.error(f"Error en divergencias: {e}")
         return "none"
 
 def get_bb_position(price, bb_upper, bb_middle, bb_lower):
@@ -487,8 +470,7 @@ def has_recent_macd_crossover(macd_series, signal_series, lookback=5):
         if i < -len(macd_series) or i-1 < -len(macd_series):
             break
         if macd_series.iloc[i-1] <= signal_series.iloc[i-1] and macd_series.iloc[i] > signal_series.iloc[i]:
-            logging.info(f"Recent MACD crossover found, candles since: {abs(i)}")
-            print(f"Recent MACD crossover, candles since: {abs(i)}")
+            logger.info(f"Recent MACD crossover found, candles since: {abs(i)}")
             return True, abs(i)
     return False, None
 
@@ -499,20 +481,17 @@ def get_open_trades():
     count = cursor.fetchone()[0]
     cursor.execute("SELECT symbol, timestamp, trade_id FROM transactions_new WHERE action='buy' AND status='open'")
     trades = cursor.fetchall()
-    logging.info(f"Operaciones abiertas: {count}. Detalles: {trades}")
-    print(f"Open trades: {count}. Details: {trades}")
+    logger.info(f"Operaciones abiertas: {count}. Detalles: {trades}")
     conn.close()
     return count
 
 def execute_order_buy(symbol, amount, indicators, confidence):
     try:
-        print(f"Executing buy order for {symbol}, amount={amount}, confidence={confidence}")
         order = exchange.create_market_buy_order(symbol, amount)
         price = order.get("price", fetch_price(symbol))
         executed_amount = order.get("filled", amount)
         if price is None:
-            logging.error(f"No se pudo obtener precio para {symbol} después de la orden")
-            print(f"Error: No price after order for {symbol}")
+            logger.error(f"No se pudo obtener precio para {symbol} después de la orden")
             send_telegram_message(f"❌ *Error en Compra* `{symbol}`\nNo se obtuvo precio tras la orden.")
             return None
         timestamp = datetime.now(timezone.utc).isoformat()
@@ -540,31 +519,26 @@ def execute_order_buy(symbol, amount, indicators, confidence):
         conn.commit()
         conn.close()
         
-        logging.info(f"Compra ejecutada: {symbol} a {price} por {executed_amount} (ID: {trade_id})")
-        print(f"Buy executed: {symbol} at {price} for {executed_amount} (ID: {trade_id})")
+        logger.info(f"Compra ejecutada: {symbol} a {price} por {executed_amount} (ID: {trade_id})")
         send_telegram_message(f"✅ *Compra* `{symbol}`\nPrecio: `{price}`\nCantidad: `{executed_amount}`\nConfianza: `{confidence}%`")
         return {"price": price, "filled": executed_amount, "trade_id": trade_id, "indicators": indicators}
     except Exception as e:
-        logging.error(f"Error al ejecutar orden de compra para {symbol}: {e}")
-        print(f"Error executing buy for {symbol}: {e}")
+        logger.error(f"Error al ejecutar orden de compra para {symbol}: {e}")
         send_telegram_message(f"❌ *Fallo en Compra* `{symbol}`\nError: `{str(e)}`\nCantidad intentada: `{amount}`")
         return None
 
 def sell_symbol(symbol, amount, trade_id):
     try:
-        print(f"Executing sell order for {symbol}, amount={amount}, trade_id={trade_id}")
         base_asset = symbol.split('/')[0]
         balance_info = exchange.fetch_balance()
         available = balance_info['free'].get(base_asset, 0)
         if available < amount:
-            logging.warning(f"Balance insuficiente para {symbol}: se intenta vender {amount} pero disponible es {available}. Ajustando cantidad.")
-            print(f"Insufficient balance for {symbol}: adjusting amount to {available}")
+            logger.warning(f"Balance insuficiente para {symbol}: se intenta vender {amount} pero disponible es {available}. Ajustando cantidad.")
             amount = available
             try:
                 amount = float(exchange.amount_to_precision(symbol, amount))
             except Exception as ex:
-                logging.warning(f"No se pudo redondear la cantidad para {symbol}: {ex}")
-                print(f"Error precision amount for {symbol}: {ex}")
+                logger.warning(f"No se pudo redondear la cantidad para {symbol}: {ex}")
 
         data, price_series = fetch_and_prepare_data(symbol)
         if data is None:
@@ -601,13 +575,11 @@ def sell_symbol(symbol, amount, trade_id):
         conn.commit()
         conn.close()
         
-        logging.info(f"Venta ejecutada: {symbol} a {sell_price} (ID: {trade_id})")
-        print(f"Sell executed: {symbol} at {sell_price} (ID: {trade_id})")
+        logger.info(f"Venta ejecutada: {symbol} a {sell_price} (ID: {trade_id})")
         send_telegram_message(f"✅ *Venta Ejecutada* para `{symbol}`\nPrecio: `{sell_price}`\nCantidad: `{amount}`")
         analyze_trade_outcome(trade_id)
     except Exception as e:
-        logging.error(f"Error al vender {symbol}: {e}")
-        print(f"Error selling {symbol}: {e}")
+        logger.error(f"Error al vender {symbol}: {e}")
 
 def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, indicators):
     def trailing_logic():
@@ -617,8 +589,7 @@ def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, indicators):
             stop_loss_price = purchase_price * 0.98
             data, price_series = fetch_and_prepare_data(symbol)
             if data is None or price_series is None:
-                logging.error(f"No data para trailing stop de {symbol}, forzando venta inmediata")
-                print(f"No data for trailing stop {symbol}, forcing sell")
+                logger.error(f"No data para trailing stop de {symbol}, forzando venta inmediata")
                 sell_symbol(symbol, amount, trade_id)
                 return
 
@@ -629,21 +600,18 @@ def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, indicators):
             while True:
                 current_price = fetch_price(symbol)
                 if current_price is None:
-                    logging.warning(f"No se pudo obtener precio para {symbol}, reintentando en 15s")
-                    print(f"No price for {symbol}, retrying in 15s")
-                    time.sleep(15)
+                    logger.warning(f"No se pudo obtener precio para {symbol}, reintentando en 60s")
+                    time.sleep(60)
                     continue
 
                 if current_price <= stop_loss_price:
                     sell_symbol(symbol, amount, trade_id)
-                    logging.info(f"Stop-loss alcanzado para {symbol} a {current_price}")
-                    print(f"Stop-loss hit for {symbol} at {current_price}")
+                    logger.info(f"Stop-loss alcanzado para {symbol} a {current_price}")
                     break
 
                 if current_price >= take_profit_price:
                     sell_symbol(symbol, amount, trade_id)
-                    logging.info(f"Take-profit alcanzado para {symbol} a {current_price}")
-                    print(f"Take-profit hit for {symbol} at {current_price}")
+                    logger.info(f"Take-profit alcanzado para {symbol} a {current_price}")
                     break
 
                 support_distance = (current_price - support_level) / support_level if support_level and current_price > 0 else float('inf')
@@ -656,17 +624,15 @@ def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, indicators):
                     highest_price = current_price
                 trailing_stop_price = highest_price * (1 - trailing_percent / 100)
 
-                logging.info(f"Trailing stop {symbol}: precio actual={current_price}, máximo={highest_price}, stop={trailing_stop_price}, trailing_percent={trailing_percent:.2f}%")
-                print(f"Trailing stop for {symbol}: Current={current_price}, High={highest_price}, Stop={trailing_stop_price}, Percent={trailing_percent:.2f}%")
+                logger.info(f"Trailing stop {symbol}: precio actual={current_price}, máximo={highest_price}, stop={trailing_stop_price}, trailing_percent={trailing_percent:.2f}%")
 
                 if current_price <= trailing_stop_price:
                     sell_symbol(symbol, amount, trade_id)
                     break
-                time.sleep(15)  # Shortened for faster checks
+                time.sleep(60)
 
         except Exception as e:
-            logging.error(f"Error en trailing stop para {symbol}: {e}")
-            print(f"Error in trailing stop for {symbol}: {e}")
+            logger.error(f"Error en trailing stop para {symbol}: {e}")
             sell_symbol(symbol, amount, trade_id)
 
     threading.Thread(target=trailing_logic, daemon=True).start()
@@ -681,8 +647,7 @@ def calculate_established_strategy(indicators, data=None):
     adx = indicators.get('adx', None)
     symbol = indicators.get('symbol', 'desconocido')
 
-    logging.info(f"Calculating strategy for {symbol}: RSI={rsi}, Relative Volume={relative_volume}, ADX={adx}")
-    print(f"Strategy calc for {symbol}: RSI={rsi}, Rel Vol={relative_volume}, ADX={adx}")
+    logger.info(f"Calculating strategy for {symbol}: RSI={rsi}, Relative Volume={relative_volume}, ADX={adx}")
 
     # Adjusted thresholds for established coins
     MIN_ADX = 20
@@ -726,7 +691,7 @@ def calculate_established_strategy(indicators, data=None):
 
     # Weighted scoring (simplified)
     weighted_signals = [
-        3 * (relative_volume > 0.5 if relative_volume else False),
+        3 * (relative_volume > 1.0 if relative_volume else False),
         2 * (short_volume_trend == "increasing"),
         1 * (price_trend == "increasing"),
         3 * (support_distance <= 0.03),
@@ -736,8 +701,7 @@ def calculate_established_strategy(indicators, data=None):
         1 * volume_spike
     ]
     signals_score = sum(weighted_signals)
-    logging.info(f"Strategy score for {symbol}: {signals_score}, Oversold={oversold}, Volume Spike={volume_spike}")
-    print(f"Strategy score for {symbol}: {signals_score}, Oversold={oversold}, Volume Spike={volume_spike}")
+    logger.info(f"Strategy score for {symbol}: {signals_score}, Oversold={oversold}, Volume Spike={volume_spike}")
 
     # Decision with adjusted threshold
     if signals_score >= 5:  # Lowered to allow more trades
@@ -752,7 +716,7 @@ def calculate_established_strategy(indicators, data=None):
     return action, confidence, explanation
 
 def evaluate_missed_opportunity(symbol, initial_price, confidence, explanation, indicators):
-    time.sleep(1800)  # Shortened to 30 min for quicker feedback
+    time.sleep(1800)
     final_price = fetch_price(symbol)
     if final_price and initial_price:
         price_change = ((final_price - initial_price) / initial_price) * 100
@@ -773,17 +737,9 @@ def evaluate_missed_opportunity(symbol, initial_price, confidence, explanation, 
                 "depth": indicators.get('depth', 0),
                 "spread": indicators.get('spread', float('inf'))
             }
-            logging.info(f"Missed opportunity for {symbol}: Change={price_change:.2f}%")
-            print(f"Missed opportunity for {symbol}: Change={price_change:.2f}%")
+            logger.info(f"Missed opportunity for {symbol}: Change={price_change:.2f}%")
             with open("missed_opportunities.csv", "a", newline='') as f:
                 f.write(f"{missed_opportunity['initial_timestamp']},{missed_opportunity['symbol']},{missed_opportunity['initial_price']},{missed_opportunity['final_price']},{missed_opportunity['price_change']:.2f},{missed_opportunity['confidence']},{missed_opportunity['explanation']},{json.dumps(missed_opportunity)}\n")
-            print(f"\n=== Oportunidad Perdida Confirmada ===\n"
-                  f"Símbolo: {symbol}\n"
-                  f"Precio Inicial: {initial_price:.4f} USDT\n"
-                  f"Precio Final: {final_price:.4f} USDT\n"
-                  f"Cambio: {price_change:.2f}%\n"
-                  f"Confianza: {confidence}%\n"
-                  f"Explicación: {explanation}\n")
             send_telegram_message(f"⚠️ *Oportunidad Perdida Confirmada* `{symbol}`\nPrecio Inicial: `{initial_price:.4f}`\nPrecio Final: `{final_price:.4f}`\nCambio: `{price_change:.2f}%`\nConfianza: `{confidence}%`\nExplicación: `{explanation}`")
 
             with open("trade_stats.csv", "a", newline='') as f:
@@ -810,96 +766,108 @@ def fetch_ohlcv_with_retry(symbol, timeframe, limit=100, max_retries=3):
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
             if ohlcv and len(ohlcv) > 0:
-                logging.info(f"OHLCV fetched for {symbol} on {timeframe}, length={len(ohlcv)}")
-                print(f"OHLCV fetched for {symbol} on {timeframe}, length={len(ohlcv)}")
+                logger.info(f"OHLCV fetched for {symbol} on {timeframe}, length={len(ohlcv)}")
                 return ohlcv
-            logging.warning(f"Datos vacíos o None para {symbol} en {timeframe}, intento {attempt + 1}/{max_retries}")
-            print(f"No data for {symbol} on {timeframe}, attempt {attempt + 1}")
+            logger.warning(f"Datos vacíos o None para {symbol} en {timeframe}, intento {attempt + 1}/{max_retries}")
         except Exception as e:
-            logging.error(f"Error al obtener OHLCV para {symbol} en {timeframe}, intento {attempt + 1}/{max_retries}: {e}")
-            print(f"Error fetching OHLCV for {symbol} on {timeframe}: {e}")
-        time.sleep(2 ** attempt)  # Exponential backoff, short
+            logger.error(f"Error al obtener OHLCV para {symbol} en {timeframe}, intento {attempt + 1}/{max_retries}: {e}")
+        time.sleep(2 ** attempt)
     return None
 
 buy_lock = threading.Lock()
 
+def startup_cleanup():
+    logger.info("Iniciando cleanup en startup: vendiendo posiciones abiertas y cerrando DB.")
+    balance = exchange.fetch_balance()['free']
+    non_usdt = {k: v for k, v in balance.items() if k != 'USDT' and v > 0}
+    
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    for asset, amt in non_usdt.items():
+        symbol = f"{asset}/USDT"
+        try:
+            order = exchange.create_market_sell_order(symbol, amt)
+            sell_price = order.get('price', fetch_price(symbol))
+            timestamp = datetime.now(timezone.utc).isoformat()
+            cursor.execute("SELECT trade_id FROM transactions_new WHERE symbol=? AND action='buy' AND status='open'", (symbol,))
+            trade_id_row = cursor.fetchone()
+            trade_id = trade_id_row[0] if trade_id_row else f"startup_{asset}"
+            
+            cursor.execute('''
+                INSERT INTO transactions_new (symbol, action, price, amount, timestamp, trade_id, status)
+                VALUES (?, 'sell', ?, ?, ?, ?, 'closed')
+            ''', (symbol, sell_price, amt, timestamp, trade_id))
+            cursor.execute("UPDATE transactions_new SET status='closed' WHERE symbol=? AND action='buy' AND status='open'", (symbol,))
+            conn.commit()
+            logger.info(f"Vendido {asset} ({symbol}) durante startup: cantidad={amt}, precio={sell_price}")
+            send_telegram_message(f"🔒 *Startup Cleanup*: Vendido `{symbol}` cantidad `{amt}` a `{sell_price}`")
+        except Exception as e:
+            logger.error(f"Error vendiendo {symbol} en startup: {e}")
+    
+    conn.close()
+
 def demo_trading():
-    logging.info("Iniciando trading en segundo plano para los activos establecidos...")
-    print("Starting trading loop...")
+    logger.info("Iniciando trading en segundo plano para los activos establecidos...")
     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
-    logging.info(f"Saldo USDT disponible: {usdt_balance}")
-    print(f"USDT balance: {usdt_balance}")
+    logger.info(f"Saldo USDT disponible: {usdt_balance}")
     
     reserve = 150
     available_for_trading = max(usdt_balance - reserve, 0)
     if available_for_trading < MIN_NOTIONAL:
-        logging.warning(f"Disponible para trading insuficiente ({available_for_trading}) después de reserva.")
-        print(f"Insufficient trading balance: {available_for_trading}")
+        logger.warning(f"Disponible para trading insuficiente ({available_for_trading}) después de reserva.")
         return False
 
     open_trades = get_open_trades()
-    logging.info(f"Operaciones abiertas actualmente: {open_trades}")
-    print(f"Current open trades: {open_trades}")
+    logger.info(f"Operaciones abiertas actualmente: {open_trades}")
     if open_trades >= MAX_OPEN_TRADES:
-        logging.info("Límite de operaciones abiertas alcanzado.")
-        print("Max open trades reached.")
+        logger.info("Límite de operaciones abiertas alcanzado.")
         return False
 
     budget_per_trade = available_for_trading / (MAX_OPEN_TRADES - open_trades) if (MAX_OPEN_TRADES - open_trades) > 0 else available_for_trading
-    logging.info(f"Presupuesto por operación: {budget_per_trade}")
-    print(f"Budget per trade: {budget_per_trade}")
+    logger.info(f"Presupuesto por operación: {budget_per_trade}")
     balance = exchange.fetch_balance()['free']
-    logging.info(f"Balance actual: {balance}")
-    print(f"Current balance: {balance}")
+    logger.info(f"Balance actual: {balance}")
 
     failed_conditions_count = {}
     symbols_processed = 0
 
     for symbol in SELECTED_CRYPTOS:
         try:
-            print(f"\n--- Processing symbol: {symbol} ---")
             open_trades = get_open_trades()
-            logging.info(f"Operaciones abiertas antes de procesar {symbol}: {open_trades}")
-            print(f"Open trades before processing {symbol}: {open_trades}")
+            logger.info(f"Operaciones abiertas antes de procesar {symbol}: {open_trades}")
             if open_trades >= MAX_OPEN_TRADES:
-                logging.info("Límite de operaciones abiertas alcanzado.")
-                print("Max open trades reached, skipping.")
+                logger.info("Límite de operaciones abiertas alcanzado.")
                 return False
 
             base_asset = symbol.split('/')[0]
-            if base_asset in balance and balance[base_asset] > 0.001:  # Ignore dust
-                logging.info(f"Se omite {symbol} porque ya tienes una posición abierta.")
-                print(f"Skipping {symbol}: Position already open.")
+            if base_asset in balance and balance[base_asset] > 0.001:
+                logger.info(f"Se omite {symbol} porque ya tienes una posición abierta.")
                 continue
 
             conditions = {}
             daily_volume = fetch_volume(symbol)
             conditions['daily_volume >= 250000'] = daily_volume is not None and daily_volume >= 250000
             if not conditions['daily_volume >= 250000']:
-                logging.info(f"Se omite {symbol} por volumen insuficiente: {daily_volume}")
-                print(f"Skipping {symbol}: Insufficient volume {daily_volume}")
+                logger.info(f"Se omite {symbol} por volumen insuficiente: {daily_volume}")
                 failed_conditions_count['daily_volume >= 250000'] = failed_conditions_count.get('daily_volume >= 250000', 0) + 1
                 continue
 
             order_book_data = fetch_order_book_data(symbol)
             conditions['order_book_available'] = order_book_data is not None
             if not conditions['order_book_available']:
-                logging.warning(f"Se omite {symbol} por fallo en datos del libro de órdenes")
-                print(f"Skipping {symbol}: Order book fetch failed")
+                logger.warning(f"Se omite {symbol} por fallo en datos del libro de órdenes")
                 failed_conditions_count['order_book_available'] = failed_conditions_count.get('order_book_available', 0) + 1
                 continue
 
             conditions['depth >= 100000'] = order_book_data['depth'] >= 100000
             if not conditions['depth >= 100000']:
-                logging.warning(f"Profundidad baja para {symbol}: {order_book_data['depth']}, pero se evalúa de todos modos")
-            else:
-                logging.info(f"Profundidad aceptable para {symbol}: {order_book_data['depth']}")
+                logger.warning(f"Profundidad baja para {symbol}: {order_book_data['depth']}, pero se evalúa de todos modos")
 
             current_price = fetch_price(symbol)
             conditions['price_available'] = current_price is not None
             if not conditions['price_available']:
-                logging.warning(f"Se omite {symbol} por no obtener precio")
-                print(f"Skipping {symbol}: No price available")
+                logger.warning(f"Se omite {symbol} por no obtener precio")
                 failed_conditions_count['price_available'] = failed_conditions_count.get('price_available', 0) + 1
                 continue
 
@@ -909,34 +877,28 @@ def demo_trading():
                 imbalance = float(order_book_data['imbalance']) if order_book_data['imbalance'] is not None else 0
                 depth = float(order_book_data['depth'])
             except (ValueError, TypeError) as e:
-                logging.error(f"Error al convertir datos numéricos para {symbol}: {e}")
-                print(f"Error converting numeric data for {symbol}: {e}")
+                logger.error(f"Error al convertir datos numéricos para {symbol}: {e}")
                 continue
 
             conditions['spread <= 0.005 * price'] = spread <= 0.005 * current_price
             if not conditions['spread <= 0.005 * price']:
-                logging.info(f"Se omite {symbol} por spread alto: {spread}")
-                print(f"Skipping {symbol}: High spread {spread}")
+                logger.info(f"Se omite {symbol} por spread alto: {spread}")
                 failed_conditions_count['spread <= 0.005 * price'] = failed_conditions_count.get('spread <= 0.005 * price', 0) + 1
                 continue
 
             conditions['imbalance >= 1.0'] = imbalance >= 1.0 if imbalance is not None else False
             if not conditions['imbalance >= 1.0']:
-                logging.warning(f"Imbalance bajo para {symbol}: {imbalance}, pero se evalúa de todos modos")
-            else:
-                logging.info(f"Imbalance aceptable para {symbol}: {imbalance}")
+                logger.warning(f"Imbalance bajo para {symbol}: {imbalance}, pero se evalúa de todos modos")
 
             data, price_series = fetch_and_prepare_data(symbol)
             if data is None or price_series is None:
-                logging.warning(f"Se omite {symbol} por datos insuficientes")
-                print(f"Skipping {symbol}: Insufficient data")
+                logger.warning(f"Se omite {symbol} por datos insuficientes")
                 failed_conditions_count['data_available'] = failed_conditions_count.get('data_available', 0) + 1
                 continue
 
             df_slice = data.get('1h', data.get('4h', data.get('1d')))
             if df_slice.empty:
-                logging.warning(f"No hay datos válidos en ningún timeframe para {symbol}")
-                print(f"No valid data in any timeframe for {symbol}")
+                logger.warning(f"No hay datos válidos en ningún timeframe para {symbol}")
                 failed_conditions_count['timeframe_available'] = failed_conditions_count.get('timeframe_available', 0) + 1
                 continue
             df_slice = df_slice.iloc[-100:]
@@ -963,35 +925,28 @@ def demo_trading():
                 try:
                     slope_volume, _, _, _, _ = linregress(range(10), last_10_volume)
                     volume_trend = "increasing" if slope_volume > 0.01 else "decreasing" if slope_volume < -0.01 else "stable"
-                    logging.debug(f"Volume trend calculado para {symbol}: slope={slope_volume}, trend={volume_trend}")
-                    print(f"Volume trend for {symbol}: {volume_trend}")
+                    logger.debug(f"Volume trend calculado para {symbol}: slope={slope_volume}, trend={volume_trend}")
                 except Exception as e:
-                    logging.error(f"Error al calcular volume_trend para {symbol}: {e}", exc_info=True)
-                    print(f"Error calculating volume trend for {symbol}: {e}")
+                    logger.error(f"Error al calcular volume_trend para {symbol}: {e}", exc_info=True)
                     volume_trend = "insufficient_data"
             else:
-                logging.debug(f"No hay suficientes datos para calcular volume_trend para {symbol}: {len(volume_series)} velas")
-                print(f"Insufficient data for volume trend {symbol}")
+                logger.debug(f"No hay suficientes datos para calcular volume_trend para {symbol}: {len(volume_series)} velas")
 
             if len(price_series) >= 10:
                 last_10_price = price_series[-10:]
                 try:
                     slope_price, _, _, _, _ = linregress(range(10), last_10_price)
                     price_trend = "increasing" if slope_price > 0.01 else "decreasing" if slope_price < -0.01 else "stable"
-                    logging.debug(f"Price trend calculado para {symbol}: slope={slope_price}, trend={price_trend}")
-                    print(f"Price trend for {symbol}: {price_trend}")
+                    logger.debug(f"Price trend calculado para {symbol}: slope={slope_price}, trend={price_trend}")
                 except Exception as e:
-                    logging.error(f"Error al calcular price_trend para {symbol}: {e}", exc_info=True)
-                    print(f"Error calculating price trend for {symbol}: {e}")
+                    logger.error(f"Error al calcular price_trend para {symbol}: {e}", exc_info=True)
                     price_trend = "insufficient_data"
             else:
-                logging.debug(f"No hay suficientes datos para calcular price_trend para {symbol}: {len(price_series)} velas")
-                print(f"Insufficient data for price trend {symbol}")
+                logger.debug(f"No hay suficientes datos para calcular price_trend para {symbol}: {len(price_series)} velas")
 
             support_level = detect_support_level(data, price_series, window=15, max_threshold_multiplier=1.0)
             support_distance = (current_price - support_level) / support_level if support_level and current_price > 0 else None
-            logging.info(f"Support level for {symbol}: {support_level}, distance={support_distance}")
-            print(f"Support level for {symbol}: {support_level}, distance={support_distance}")
+            logger.info(f"Support level for {symbol}: {support_level}, distance={support_distance}")
 
             indicators = {
                 "adx": adx,
@@ -1014,23 +969,17 @@ def demo_trading():
                 "symbol": symbol
             }
 
-            # Print full indicators for screen debug
-            print(f"Indicators for {symbol}: {indicators}")
-
             conditions_str = "\n".join([f"{key}: {'Sí' if value is True else 'No' if value is False else 'Desconocido'}" for key, value in sorted(conditions.items())])
-            logging.info(f"Condiciones evaluadas para {symbol}:\n{conditions_str}")
-            print(f"Conditions for {symbol}:\n{conditions_str}")
+            logger.info(f"Condiciones evaluadas para {symbol}:\n{conditions_str}")
 
             for key, value in conditions.items():
-                logging.debug(f"Condición {key} para {symbol}: valor={value}, tipo={type(value)}")
+                logger.debug(f"Condición {key} para {symbol}: valor={value}, tipo={type(value)}")
 
             action, confidence, explanation = calculate_established_strategy(indicators, data)
-            logging.info(f"Decisión para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
-            print(f"Decision for {symbol}: {action} (Confidence: {confidence}%) - {explanation}")
+            logger.info(f"Decisión para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
 
             sentiment_score, classification = get_market_sentiment()
-            logging.info(f"Market sentiment: Score={sentiment_score}, Classification={classification} for {symbol}")
-            print(f"Market sentiment for {symbol}: Score={sentiment_score}, Class={classification}")
+            logger.info(f"Market sentiment: Score={sentiment_score}, Classification={classification} for {symbol}")
             if sentiment_score > 50:  # Greed/positive
                 confidence = min(confidence + 10, 100)
                 explanation += f" (Market sentiment positive: {classification}, Score={sentiment_score})"
@@ -1039,36 +988,31 @@ def demo_trading():
                 confidence = 50
                 explanation += f" (Market sentiment negative: {classification}, Score={sentiment_score}, overriding to hold)"
 
-            logging.info(f"Final decision for {symbol}: {action} (Confidence: {confidence}%) - {explanation}")
-            print(f"Final decision for {symbol}: {action} (Confidence: {confidence}%) - {explanation}")
-            logging.debug(f"Verificación post-decisión para {symbol}: action={action}, confidence={confidence}, explanation={explanation}, conditions={conditions}")
+            logger.info(f"Decisión final para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
+            logger.debug(f"Verificación post-decisión para {symbol}: action={action}, confidence={confidence}, explanation={explanation}, conditions={conditions}")
 
-            if action == "comprar" and confidence >= 75:
+            if action == "comprar" and confidence >= 80:
                 with buy_lock:
                     open_trades = get_open_trades()
                     if open_trades >= MAX_OPEN_TRADES:
-                        logging.info(f"Límite de operaciones abiertas alcanzado, no se ejecuta compra para {symbol}.")
-                        print(f"Max open trades, no buy for {symbol}")
+                        logger.info(f"Límite de operaciones abiertas alcanzado, no se ejecuta compra para {symbol}.")
                         return False
 
                     usdt_balance = exchange.fetch_balance()['free'].get('USDT', 0)
                     available_for_trading = max(usdt_balance - reserve, 0)
                     if available_for_trading < MIN_NOTIONAL:
-                        logging.warning(f"Disponible para trading insuficiente ({available_for_trading}) para {symbol}.")
-                        print(f"Insufficient trading balance for {symbol}")
+                        logger.warning(f"Disponible para trading insuficiente ({available_for_trading}) para {symbol}.")
                         continue
 
                     confidence_factor = confidence / 100
                     if current_price is None or current_price <= 0:
-                        logging.error(f"Precio actual inválido para {symbol} ({current_price}), omitiendo operación")
-                        print(f"Invalid price for {symbol}, skipping")
+                        logger.error(f"Precio actual inválido para {symbol} ({current_price}), omitiendo operación")
                         continue
 
                     atr_value = atr if atr is not None else 0.02 * current_price
                     if atr_value <= 0 or current_price <= 0:
                         volatility_factor = 1.0
-                        logging.warning(f"ATR o precio inválido para {symbol}, usando volatility_factor por defecto: {volatility_factor}")
-                        print(f"Invalid ATR/price for {symbol}, default volatility")
+                        logger.warning(f"ATR o precio inválido para {symbol}, usando volatility_factor por defecto: {volatility_factor}")
                     else:
                         volatility_factor = min(2.0, (atr_value / current_price * 100))
                     size_multiplier = confidence_factor * volatility_factor
@@ -1079,13 +1023,11 @@ def demo_trading():
                     amount = min(target_amount, 0.10 * usdt_balance / current_price)
                     trade_value = amount * current_price
 
-                    logging.info(f"Intentando compra para {symbol}: amount={amount}, trade_value={trade_value}, confidence={confidence}%, volatility_factor={volatility_factor:.2f}x")
-                    print(f"Attempting buy for {symbol}: Amount={amount}, Value={trade_value}, Conf={confidence}%, Vol Factor={volatility_factor:.2f}")
+                    logger.info(f"Intentando compra para {symbol}: amount={amount}, trade_value={trade_value}, confidence={confidence}%, volatility_factor={volatility_factor:.2f}x")
                     if trade_value >= MIN_NOTIONAL or (trade_value < MIN_NOTIONAL and trade_value >= usdt_balance):
                         order = execute_order_buy(symbol, amount, indicators, confidence)
                         if order:
-                            logging.info(f"Compra ejecutada para {symbol}: {explanation}")
-                            print(f"Buy executed for {symbol}: {explanation}")
+                            logger.info(f"Compra ejecutada para {symbol}: {explanation}")
                             send_telegram_message(f"✅ *Compra* `{symbol}`\nConfianza: `{confidence}%`\nCantidad: `{amount}`\nExplicación: `{explanation}`")
                             dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], indicators)
                             # Actualizar presupuesto después de compra
@@ -1093,14 +1035,11 @@ def demo_trading():
                             available_for_trading = max(usdt_balance - reserve, 0)
                             remaining_slots = MAX_OPEN_TRADES - get_open_trades()
                             budget_per_trade = available_for_trading / remaining_slots if remaining_slots > 0 else available_for_trading
-                            logging.info(f"Presupuesto actualizado después de compra: {budget_per_trade}")
-                            print(f"Budget updated after buy: {budget_per_trade}")
+                            logger.info(f"Presupuesto actualizado después de compra: {budget_per_trade}")
                         else:
-                            logging.error(f"Error al ejecutar compra para {symbol}: orden no completada")
-                            print(f"Error executing buy for {symbol}")
+                            logger.error(f"Error al ejecutar compra para {symbol}: orden no completada")
                     else:
-                        logging.info(f"Compra no ejecutada para {symbol}: valor de la operación ({trade_value}) < MIN_NOTIONAL ({MIN_NOTIONAL}) y saldo insuficiente")
-                        print(f"No buy for {symbol}: Value < min notional")
+                        logger.info(f"Compra no ejecutada para {symbol}: valor de la operación ({trade_value}) < MIN_NOTIONAL ({MIN_NOTIONAL}) y saldo insuficiente")
 
             failed_conditions = [key for key, value in conditions.items() if not value]
             for condition in failed_conditions:
@@ -1108,8 +1047,7 @@ def demo_trading():
             symbols_processed += 1
 
         except Exception as e:
-            logging.error(f"Error en demo_trading para {symbol}: {e}", exc_info=True)
-            print(f"Error in demo_trading for {symbol}: {e}")
+            logger.error(f"Error en demo_trading para {symbol}: {e}", exc_info=True)
             continue
 
     if symbols_processed > 0 and failed_conditions_count:
@@ -1118,19 +1056,16 @@ def demo_trading():
         summary_message = (f"Resumen final: Después de procesar {symbols_processed} símbolos, "
                            f"la condición más común que impidió operaciones fue '{most_common_condition}' "
                            f"con {most_common_count} ocurrencias ({(most_common_count / symbols_processed) * 100:.1f}%).")
-        logging.info(summary_message)
-        print(summary_message)
+        logger.info(summary_message)
 
         with open("trade_blockers_summary.txt", "a") as f:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             f.write(f"{timestamp} - {summary_message}\n")
             f.write(f"Detalles de condiciones fallidas: {dict(failed_conditions_count)}\n\n")
     else:
-        logging.info("No se procesaron símbolos o no hubo condiciones fallidas para analizar.")
-        print("No symbols processed or no failed conditions.")
+        logger.info("No se procesaron símbolos o no hubo condiciones fallidas para analizar.")
 
-    logging.info("Trading ejecutado correctamente en segundo plano para los activos establecidos")
-    print("Trading cycle completed.")
+    logger.info("Trading ejecutado correctamente en segundo plano para los activos establecidos")
     return True
 
 def analyze_trade_outcome(trade_id):
@@ -1152,13 +1087,11 @@ def analyze_trade_outcome(trade_id):
         trade_data = cursor.fetchone()
         
         if not trade_data:
-            logging.warning(f"No se encontraron datos para el trade_id: {trade_id}")
-            print(f"No data for trade_id: {trade_id}")
+            logger.warning(f"No se encontraron datos para el trade_id: {trade_id}")
             return
         
         if trade_data[20] is None:
-            logging.info(f"Trade {trade_id} no tiene venta registrada aún")
-            print(f"Trade {trade_id} no sale yet")
+            logger.info(f"Trade {trade_id} no tiene venta registrada aún")
             return
 
         buy_data = {
@@ -1196,30 +1129,146 @@ def analyze_trade_outcome(trade_id):
             RSI_THRESHOLD = 70
         if profit_loss > 0 and buy_data['rsi'] and buy_data['rsi'] < 80:
             RSI_THRESHOLD = max(65, RSI_THRESHOLD - 5)
-            logging.info(f"RSI_THRESHOLD reducido a {RSI_THRESHOLD} por operación rentable con RSI temprano")
-            print(f"RSI_THRESHOLD reduced to {RSI_THRESHOLD}")
+            logger.info(f"RSI_THRESHOLD reducido a {RSI_THRESHOLD} por operación rentable con RSI temprano")
         elif profit_loss < 0 and buy_data['rsi'] and buy_data['rsi'] > 75:
             RSI_THRESHOLD = min(85, RSI_THRESHOLD + 5)
-            logging.info(f"RSI_THRESHOLD aumentado a {RSI_THRESHOLD} por operación perdedora con RSI tardío")
-            print(f"RSI_THRESHOLD increased to {RSI_THRESHOLD}")
+            logger.info(f"RSI_THRESHOLD aumentado a {RSI_THRESHOLD} por operación perdedora con RSI tardío")
+
+        gpt_prompt = f"""
+        Analiza esta transacción de `{buy_data['symbol']}` (ID: {trade_id}) para determinar por qué fue un éxito o un fracaso, si es exito dime cual fue el acierto y si fue un fracaso dime que se deberia corregir en los datos agregar para tomar un amejor decision:
+        - Precio de compra: {buy_data['buy_price']}
+        - Precio de venta: {sell_price}
+        - Cantidad: {buy_data['amount']}
+        - Ganancia/Pérdida: {profit_loss:.2f} USDT
+        - RSI: {buy_data['rsi'] if buy_data['rsi'] else 'N/A'}
+        - ADX: {buy_data['adx'] if buy_data['adx'] else 'N/A'}
+        - ATR: {buy_data['atr'] if buy_data['atr'] else 'N/A'}
+        - Volumen relativo: {buy_data['relative_volume'] if buy_data['relative_volume'] else 'N/A'}
+        - Divergencia: {buy_data['divergence'] if buy_data['divergence'] else 'N/A'}
+        - Posición BB: {buy_data['bb_position'] if buy_data['bb_position'] else 'N/A'}
+        - Confianza: {buy_data['confidence'] if buy_data['confidence'] else 'N/A'}
+        - Cruce MACD: {'Sí' if buy_data['has_macd_crossover'] else 'No'}
+        - Velas desde cruce MACD: {buy_data['candles_since_crossover'] if buy_data['candles_since_crossover'] else 'N/A'}
+        - Tendencia de volumen: {buy_data['volume_trend'] if buy_data['volume_trend'] else 'N/A'}
+        - Tendencia de precio: {buy_data['price_trend'] if buy_data['price_trend'] else 'N/A'}
+        - Tendencia de volumen corto: {buy_data['short_volume_trend'] if buy_data['short_volume_trend'] else 'N/A'}
+        - Nivel de soporte: {buy_data['support_level'] if buy_data['support_level'] else 'N/A'}
+        - Spread: {buy_data['spread'] if buy_data['spread'] else 'N/A'}
+        - Imbalance: {buy_data['imbalance'] if buy_data['imbalance'] else 'N/A'}
+        - Profundidad: {buy_data['depth'] if buy_data['depth'] else 'N/A'}
+        Responde SOLO con un JSON válido sin etiqueta '''json''':
+        {{"resultado": "éxito", "razon": "Compramos {buy_data['symbol']} a {buy_data['buy_price']} con RSI {buy_data['rsi']} y volumen fuerte {buy_data['relative_volume']}, vendimos a {sell_price} por una ganancia de {profit_loss:.2f} USDT gracias a un timing efectivo.", "confianza": 85}}
+        o
+        {{"resultado": "fracaso", "razon": "Compramos {buy_data['symbol']} a {buy_data['buy_price']} con RSI {buy_data['rsi']} y volumen débil {buy_data['relative_volume']}, vendimos a {sell_price} por una pérdida de {profit_loss:.2f} USDT por falta de momentum.", "confianza": 75}}
+        """
+
+        response = client.chat.completions.create(
+            model=GPT_MODEL,
+            messages=[{"role": "user", "content": gpt_prompt}],
+            temperature=0
+        )
+        raw_response = response.choices[0].message.content.strip()
+        send_telegram_message(raw_response)
+        outcome = json.loads(raw_response)
+        
+        resultado = outcome.get("resultado", "desconocido").lower()
+        razon = outcome.get("razon", "Sin análisis disponible")
+        confianza = outcome.get("confianza", 50)
 
         telegram_message = f"📊 *Análisis de Resultado* `{buy_data['symbol']}` (ID: {trade_id})\n" \
                           f"Resultado: {'Éxito' if is_profitable else 'Fracaso'}\n" \
                           f"Ganancia/Pérdida: {profit_loss:.2f} USDT\n" \
-                          f"Confianza: {buy_data['confidence'] if buy_data['confidence'] else 'N/A'}%"
+                          f"Razón: {razon}\n" \
+                          f"Confianza: {confianza}%"
         send_telegram_message(telegram_message)
-        logging.info(f"Análisis de transacción {trade_id}: {'Éxito' if is_profitable else 'Fracaso'} - P/L {profit_loss:.2f}")
+        logger.info(f"Análisis de transacción {trade_id}: {resultado} - {razon} (Confianza: {confianza}%)")
 
     except Exception as e:
-        logging.error(f"Error al analizar el resultado de la transacción {trade_id}: {e}")
-        print(f"Error analyzing trade {trade_id}: {e}")
+        logger.error(f"Error al analizar el resultado de la transacción {trade_id}: {e}")
     finally:
         conn.close()
+
+def gpt_prepare_data(data, indicators):
+    combined_data = ""
+    for tf, df in data.items():
+        if not df.empty:
+            combined_data += f"\nDatos de {tf} (últimos 3):\n{df.tail(3).to_string(index=False)}\n"
+    prompt = f"""
+    Analiza los datos y decide si comprar esta criptomoneda para maximizar ganancias a corto plazo en cualquier activo USDT en Binance:
+    {combined_data}
+    Indicadores actuales:
+    - RSI: {indicators.get('rsi', 'No disponible')}
+    - ADX: {indicators.get('adx', 'No disponible')}
+    - Divergencias: {indicators.get('divergence', 'No disponible')}
+    - Volumen relativo: {indicators.get('relative_volume', 'No disponible')}
+    - Precio actual: {indicators.get('current_price', 'No disponible')}
+    - Cruce alcista reciente de MACD: {indicators.get('has_macd_crossover', 'No disponible')}
+    - Velas desde el cruce: {indicators.get('candles_since_crossover', 'No disponible')}
+    - Spread: {indicators.get('spread', 'No disponible')}
+    - Imbalance (bids/asks): {indicators.get('imbalance', 'No disponible')}
+    - Profundidad del libro: {indicators.get('depth', 'No disponible')}
+    - Tendencia de volumen: {indicators.get('volume_trend', 'No disponible')}
+    - Tendencia de precio: {indicators.get('price_trend', 'No disponible')}
+    - Tendencia de volumen corto: {indicators.get('short_volume_trend', 'No disponible')}
+    - Nivel de soporte: {indicators.get('support_level', 'No disponible')}
+    - ROC: {indicators.get('roc', 'No disponible')}
+    """
+    logger.debug(f"GPT prompt prepared: {prompt[:200]}...")
+    return prompt
+
+def gpt_decision_buy(prepared_text):
+    prompt = f"""
+    Eres un experto en trading de criptomonedas de alto riesgo. Basándote en los datos para un activo USDT en Binance:
+    {prepared_text}
+    Decide si "comprar" o "mantener" para maximizar ganancias a corto plazo. Prioriza tendencias fuertes con volumen relativo alto (> 3.0) y proximidad al soporte (<= 0.15). Responde SOLO con un JSON válido sin '''json''' asi:
+    {{"accion": "comprar", "confianza": 85, "explicacion": "Volumen relativo > 3.0, short_volume_trend 'increasing', price_trend 'increasing', distancia al soporte <= 0.15, indican oportunidad de ganancia rápida"}}
+    Criterios ajustados:
+    - Compra si: volumen relativo > 3.0, short_volume_trend es 'increasing' o 'stable', price_trend es 'increasing', distancia relativa al soporte <= 0.15, profundidad > 3000, y spread <= 0.5% del precio (0.005 * precio). RSI > 70 es un bono, no un requisito.
+    - Mantener si: volumen relativo <= 3.0, short_volume_trend es 'decreasing', price_trend no es 'increasing', distancia relativa al soporte > 0.15, profundidad <= 3000, o spread > 0.5% del precio.
+    - Evalúa liquidez con profundidad (>3000) y spread (<=0.5% del precio).
+    - Asigna confianza >80 solo si volumen relativo > 3.0, soporte cercano (<= 0.15), y al menos 3 condiciones se cumplen; usa 60-79 para riesgos moderados (al menos 2 condiciones); de lo contrario, usa 50. Suma 10 a la confianza si RSI > 70.
+    - Ignora el cruce MACD como requisito; prioriza momentum y soporte.
+    """
+
+    max_retries = 2
+    timeout_sec = 5
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model=GPT_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0
+            )
+            raw_response = response.choices[0].message.content.strip()
+            decision = json.loads(raw_response)
+
+            accion = decision.get("accion", "mantener").lower()
+            confianza = decision.get("confianza", 50)
+            explicacion = decision.get("explicacion", "Respuesta incompleta")
+
+            if accion not in ["comprar", "mantener"]:
+                accion = "mantener"
+            if not isinstance(confianza, (int, float)) or confianza < 50 or confianza > 100:
+                confianza = 50
+                explicacion = "Confianza fuera de rango, ajustada a 50"
+
+            return accion, confianza, explicacion
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Intento {attempt + 1} fallido: Respuesta de GPT no es JSON válido - {raw_response}")
+            if attempt == max_retries:
+                return "mantener", 50, f"Error en formato JSON tras {max_retries + 1} intentos"
+        except Exception as e:
+            logger.error(f"Error en GPT (intento {attempt + 1}): {e}")
+            if attempt == max_retries:
+                return "mantener", 50, "Error al procesar respuesta de GPT"
+        time.sleep(2 ** attempt)
 
 def send_periodic_summary():
     while True:
         try:
-            with open("trading.log", "r") as log_file:
+            with open(log_filename, "r") as log_file:
                 lines = log_file.readlines()[-100:]
                 buys_attempted = sum(1 for line in lines if "Intentando compra para" in line)
                 buys_executed = sum(1 for line in lines if "Compra ejecutada para" in line)
@@ -1232,10 +1281,8 @@ def send_periodic_summary():
                       f"Errores recientes: `{errors}`\n"
                       f"Símbolos evaluados: `{len(symbols)}` (e.g., {', '.join(list(symbols)[:3])}...)")
             send_telegram_message(message)
-            print(f"Periodic summary sent: Attempts={buys_attempted}, Executed={buys_executed}, Errors={errors}")
         except Exception as e:
-            logging.error(f"Error en resumen periódico: {e}")
-            print(f"Error in periodic summary: {e}")
+            logger.error(f"Error en resumen periódico: {e}")
             send_telegram_message(f"⚠️ *Error en Resumen* `{str(e)}`")
         time.sleep(3600)
 
@@ -1245,7 +1292,6 @@ def daily_summary():
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
             
-            # Total P/L from closed trades
             cursor.execute("""
                 SELECT SUM((t2.price - t1.price) * t1.amount) FROM transactions_new t1
                 JOIN transactions_new t2 ON t1.trade_id = t2.trade_id AND t2.action = 'sell'
@@ -1253,11 +1299,10 @@ def daily_summary():
             """)
             total_pl = cursor.fetchone()[0] or 0.0
 
-            # Win rate: profitable closed trades / total closed
             cursor.execute("""
                 SELECT COUNT(*) FROM transactions_new t1
                 JOIN transactions_new t2 ON t1.trade_id = t2.trade_id AND t2.action = 'sell'
-                WHERE t1.action = 'buy' AND t1.status = 'closed' AND (t2.price - t1.price) > 0
+                WHERE t1.action = 'buy' AND t1.status = 'closed' AND (t2.price - t1.price) * t1.amount > 0
             """)
             wins = cursor.fetchone()[0]
             
@@ -1267,13 +1312,11 @@ def daily_summary():
                 WHERE t1.action = 'buy' AND t1.status = 'closed'
             """)
             total_closed = cursor.fetchone()[0]
-            win_rate = (wins / total_closed * 100) if total_closed > 0 else 0
+            win_rate = (wins / total_closed * 100) if total_closed > 0 else 0.0
 
-            # Total trade volume (executed trades)
             cursor.execute("SELECT COUNT(*) FROM transactions_new WHERE action='buy'")
             total_trades = cursor.fetchone()[0]
 
-            # Missed opps count from CSV (or DB if logged)
             missed_count = sum(1 for line in open("missed_opportunities.csv", "r") if line.strip()) if os.path.exists("missed_opportunities.csv") else 0
 
             message = (f"📊 *Resumen Diario del Bot* ({get_colombia_timestamp()})\n"
@@ -1282,16 +1325,15 @@ def daily_summary():
                        f"Volumen Total de Trades: {total_trades}\n"
                        f"Oportunidades Perdidas: {missed_count}")
             send_telegram_message(message)
-            logging.info(message)
-            print(message)
+            logger.info(message)
             conn.close()
         except Exception as e:
-            logging.error(f"Error en resumen diario: {e}")
-            print(f"Error in daily summary: {e}")
+            logger.error(f"Error en resumen diario: {e}")
             send_telegram_message(f"⚠️ *Error en Resumen Diario* `{str(e)}`")
-        time.sleep(86400)  # 24 hours
+        time.sleep(86400)
 
 if __name__ == "__main__":
+    startup_cleanup()  # Run cleanup on startup
     threading.Thread(target=send_periodic_summary, daemon=True).start()
     threading.Thread(target=daily_summary, daemon=True).start()
     try:
@@ -1299,7 +1341,7 @@ if __name__ == "__main__":
             demo_trading()
             time.sleep(30)
     except (KeyboardInterrupt, SystemExit):
-        logging.shutdown()
+        logger.shutdown()
         for handler in logger.handlers[:]:
             handler.close()
             logger.removeHandler(handler)
