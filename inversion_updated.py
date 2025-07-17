@@ -77,11 +77,11 @@ logger = logging.getLogger("inversion_binance")
 logger.setLevel(logging.DEBUG)
 log_filename = os.path.expanduser(f"~/hobbies/trading_{datetime.now().strftime('%Y%m%d')}.log")
 handler = logging.handlers.TimedRotatingFileHandler(
-    log_base,
-    when='midnight',  # Rotate at midnight
-    interval=1,  # Every 1 day
-    backupCount=30,  # Keep 30 days
-    utc=True  # Use UTC to avoid timezone issues
+    os.path.expanduser(log_base),
+    when='midnight',
+    interval=1,
+    backupCount=30,
+    utc=True
 )
 handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 logger.addHandler(handler)
@@ -1280,7 +1280,8 @@ def gpt_decision_buy(prepared_text):
 def send_periodic_summary():
     while True:
         try:
-            with open(log_filename, "r") as log_file:
+            with open(os.path.expanduser(log_base), "a+") as log_file:
+                log_file.seek(0)  # Read from start after opening
                 lines = log_file.readlines()[-100:]
                 buys_attempted = sum(1 for line in lines if "Intentando compra para" in line)
                 buys_executed = sum(1 for line in lines if "Compra ejecutada para" in line)
