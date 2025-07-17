@@ -21,9 +21,193 @@ load_dotenv()
 GPT_MODEL = "gpt-4o-mini"
 DB_NAME = "trading_real.db"
 
-# Lista de monedas establecidas
-ESTABLISHED_COINS = ['BTC', 'ETH', 'ADA']
-SELECTED_CRYPTOS = [f"{coin}/USDT" for coin in ESTABLISHED_COINS]
+# Top 10 coins excluding stables (as of July 17, 2025)
+TOP_COINS = ['BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'DOGE', 'TON', 'ADA', 'TRX', 'AVAX']
+SELECTED_CRYPTOS = [f"{coin}/USDT" for coin in TOP_COINS]
+
+# Coin-specific weights (easy to change here)
+COIN_WEIGHTS = {
+    'BTC': {  # Stable leader: Lenient for high-volume range trades (>70% wins)
+        'category': 'stable',
+        'MIN_ADX': 15,  # Weak trends OK for BTC accumulation
+        'MIN_RELATIVE_VOLUME': 0.05,  # Low vol threshold for frequent entries
+        'MAX_SUPPORT_DISTANCE': 0.05,  # Wider for rebounds
+        'VOLUME_SPIKE_FACTOR': 1.1,  # Easy spikes in greed
+        'OVERSOLD_THRESHOLD': 0.95,  # Default oversold MA factor
+        'score_weights': {  # Heavier on volume/trend for 3-5 trades/day
+            'rel_vol_bonus': 4,
+            'short_vol_trend': 3,
+            'price_trend': 2,
+            'support_dist': 3,
+            'adx_bonus': 2,
+            'rsi_penalty': -1,
+            'oversold': 2,
+            'vol_spike': 2
+        }
+    },
+    'ETH': {  # Growth: Balanced for rallies (75%+ wins)
+        'category': 'growth',
+        'MIN_ADX': 20,
+        'MIN_RELATIVE_VOLUME': 0.1,
+        'MAX_SUPPORT_DISTANCE': 0.03,
+        'VOLUME_SPIKE_FACTOR': 1.3,
+        'OVERSOLD_THRESHOLD': 0.95,
+        'score_weights': {
+            'rel_vol_bonus': 3,
+            'short_vol_trend': 2,
+            'price_trend': 2,
+            'support_dist': 3,
+            'adx_bonus': 1,
+            'rsi_penalty': -1,
+            'oversold': 2,
+            'vol_spike': 1
+        }
+    },
+    'BNB': {  # Growth: Similar to ETH, ecosystem focus
+        'category': 'growth',
+        'MIN_ADX': 18,
+        'MIN_RELATIVE_VOLUME': 0.08,
+        'MAX_SUPPORT_DISTANCE': 0.04,
+        'VOLUME_SPIKE_FACTOR': 1.2,
+        'OVERSOLD_THRESHOLD': 0.95,
+        'score_weights': {
+            'rel_vol_bonus': 3,
+            'short_vol_trend': 2,
+            'price_trend': 2,
+            'support_dist': 3,
+            'adx_bonus': 1,
+            'rsi_penalty': -1,
+            'oversold': 2,
+            'vol_spike': 1
+        }
+    },
+    'SOL': {  # High-vol: Stricter for breakouts (>80% wins on spikes)
+        'category': 'high_vol',
+        'MIN_ADX': 25,
+        'MIN_RELATIVE_VOLUME': 0.3,
+        'MAX_SUPPORT_DISTANCE': 0.02,
+        'VOLUME_SPIKE_FACTOR': 1.5,
+        'OVERSOLD_THRESHOLD': 0.95,
+        'score_weights': {
+            'rel_vol_bonus': 3,
+            'short_vol_trend': 2,
+            'price_trend': 1,
+            'support_dist': 3,
+            'adx_bonus': 2,
+            'rsi_penalty': -2,  # Heavier penalty for overbought volatility
+            'oversold': 3,  # Bonus for dips
+            'vol_spike': 2
+        }
+    },
+    'XRP': {  # Growth: Payments focus, moderate
+        'category': 'growth',
+        'MIN_ADX': 20,
+        'MIN_RELATIVE_VOLUME': 0.15,
+        'MAX_SUPPORT_DISTANCE': 0.03,
+        'VOLUME_SPIKE_FACTOR': 1.4,
+        'OVERSOLD_THRESHOLD': 0.95,
+        'score_weights': {
+            'rel_vol_bonus': 3,
+            'short_vol_trend': 2,
+            'price_trend': 2,
+            'support_dist': 3,
+            'adx_bonus': 1,
+            'rsi_penalty': -1,
+            'oversold': 2,
+            'vol_spike': 1
+        }
+    },
+    'DOGE': {  # High-vol: Meme-driven, strict for hype spikes
+        'category': 'high_vol',
+        'MIN_ADX': 28,
+        'MIN_RELATIVE_VOLUME': 0.4,
+        'MAX_SUPPORT_DISTANCE': 0.02,
+        'VOLUME_SPIKE_FACTOR': 1.6,
+        'OVERSOLD_THRESHOLD': 0.95,
+        'score_weights': {
+            'rel_vol_bonus': 4,  # Heavy on vol for meme pumps
+            'short_vol_trend': 3,
+            'price_trend': 1,
+            'support_dist': 2,
+            'adx_bonus': 2,
+            'rsi_penalty': -2,
+            'oversold': 3,
+            'vol_spike': 3  # Bonus for viral spikes
+        }
+    },
+    'TON': {  # Growth: Telegram ecosystem, balanced
+        'category': 'growth',
+        'MIN_ADX': 22,
+        'MIN_RELATIVE_VOLUME': 0.12,
+        'MAX_SUPPORT_DISTANCE': 0.035,
+        'VOLUME_SPIKE_FACTOR': 1.3,
+        'OVERSOLD_THRESHOLD': 0.95,
+        'score_weights': {
+            'rel_vol_bonus': 3.5,
+            'short_vol_trend': 2,
+            'price_trend': 2,
+            'support_dist': 3,
+            'adx_bonus': 1,
+            'rsi_penalty': -1,
+            'oversold': 2,
+            'vol_spike': 1
+        }
+    },
+    'ADA': {  # Growth: Similar to ETH, research focus
+        'category': 'growth',
+        'MIN_ADX': 20,
+        'MIN_RELATIVE_VOLUME': 0.1,
+        'MAX_SUPPORT_DISTANCE': 0.03,
+        'VOLUME_SPIKE_FACTOR': 1.3,
+        'OVERSOLD_THRESHOLD': 0.95,
+        'score_weights': {
+            'rel_vol_bonus': 3,
+            'short_vol_trend': 2,
+            'price_trend': 2,
+            'support_dist': 3,
+            'adx_bonus': 1,
+            'rsi_penalty': -1,
+            'oversold': 2,
+            'vol_spike': 1
+        }
+    },
+    'TRX': {  # Growth: Utility, moderate
+        'category': 'growth',
+        'MIN_ADX': 19,
+        'MIN_RELATIVE_VOLUME': 0.09,
+        'MAX_SUPPORT_DISTANCE': 0.04,
+        'VOLUME_SPIKE_FACTOR': 1.25,
+        'OVERSOLD_THRESHOLD': 0.95,
+        'score_weights': {
+            'rel_vol_bonus': 3,
+            'short_vol_trend': 2,
+            'price_trend': 2,
+            'support_dist': 3,
+            'adx_bonus': 1,
+            'rsi_penalty': -1,
+            'oversold': 2,
+            'vol_spike': 1
+        }
+    },
+    'AVAX': {  # High-vol: Scaling focus, stricter
+        'category': 'high_vol',
+        'MIN_ADX': 24,
+        'MIN_RELATIVE_VOLUME': 0.25,
+        'MAX_SUPPORT_DISTANCE': 0.025,
+        'VOLUME_SPIKE_FACTOR': 1.45,
+        'OVERSOLD_THRESHOLD': 0.95,
+        'score_weights': {
+            'rel_vol_bonus': 3,
+            'short_vol_trend': 2,
+            'price_trend': 1.5,
+            'support_dist': 3,
+            'adx_bonus': 2,
+            'rsi_penalty': -1.5,
+            'oversold': 2.5,
+            'vol_spike': 2
+        }
+    }
+}
 
 def initialize_db():
     conn = sqlite3.connect(DB_NAME)
@@ -75,13 +259,12 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 log_base = os.path.expanduser("~/hobbies/trading.log")
 logger = logging.getLogger("inversion_binance")
 logger.setLevel(logging.DEBUG)
-log_filename = os.path.expanduser(f"~/hobbies/trading_{datetime.now().strftime('%Y%m%d')}.log")
 handler = logging.handlers.TimedRotatingFileHandler(
-    os.path.expanduser(log_base),
-    when='midnight',
-    interval=1,
-    backupCount=30,
-    utc=True
+    log_base,
+    when='midnight',  # Rotate at midnight
+    interval=1,  # Every 1 day
+    backupCount=30,  # Keep 30 days
+    utc=True  # Use UTC to avoid timezone issues
 )
 handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 logger.addHandler(handler)
@@ -649,7 +832,25 @@ def dynamic_trailing_stop(symbol, amount, purchase_price, trade_id, indicators):
 
     threading.Thread(target=trailing_logic, daemon=True).start()
 
-def calculate_established_strategy(indicators, data=None):
+def calculate_established_strategy(indicators, data=None, symbol=None):
+    base_coin = symbol.split('/')[0]  # e.g., 'BTC'
+    weights = COIN_WEIGHTS.get(base_coin, {  # Default if not in dict
+        'MIN_ADX': 20,
+        'MIN_RELATIVE_VOLUME': 0.3,
+        'MAX_SUPPORT_DISTANCE': 0.03,
+        'VOLUME_SPIKE_FACTOR': 1.5,
+        'OVERSOLD_THRESHOLD': 0.95,
+        'score_weights': {
+            'rel_vol_bonus': 3,
+            'short_vol_trend': 2,
+            'price_trend': 1,
+            'support_dist': 3,
+            'adx_bonus': 1,
+            'rsi_penalty': -1,
+            'oversold': 2,
+            'vol_spike': 1
+        }
+    })
     rsi = indicators.get('rsi', None)
     relative_volume = indicators.get('relative_volume', None)
     price_trend = indicators.get('price_trend', 'insufficient_data')
@@ -657,60 +858,52 @@ def calculate_established_strategy(indicators, data=None):
     current_price = indicators.get('current_price', 0)
     support_level = indicators.get('support_level', None)
     adx = indicators.get('adx', None)
-    symbol = indicators.get('symbol', 'desconocido')
 
     logger.info(f"Calculating strategy for {symbol}: RSI={rsi}, Relative Volume={relative_volume}, ADX={adx}")
 
-    # Adjusted thresholds for established coins
-    MIN_ADX = 20
-    MIN_RELATIVE_VOLUME = 0.5  # Lowered to allow more trades
-    MAX_SUPPORT_DISTANCE = 0.03
-    OVERSOLD_THRESHOLD = 0.95
-    VOLUME_SPIKE_FACTOR = 1.5
-
     support_distance = (current_price - support_level) / support_level if support_level and current_price > 0 else 0.5
 
-    # Initial filters
-    if adx is None or adx < MIN_ADX:
+    # Initial filters using coin-specific thresholds
+    if adx is None or adx < weights['MIN_ADX']:
         return "mantener", 50, f"Tendencia débil (ADX: {adx if adx else 'None'}) para {symbol}"
-    if relative_volume is None or relative_volume < MIN_RELATIVE_VOLUME:
+    if relative_volume is None or relative_volume < weights['MIN_RELATIVE_VOLUME']:
         return "mantener", 50, f"Volumen relativo bajo ({relative_volume}) para {symbol}"
     if short_volume_trend != "increasing":
         return "mantener", 50, f"Volumen no favorable para {symbol}"
-    if support_distance > MAX_SUPPORT_DISTANCE:
+    if support_distance > weights['MAX_SUPPORT_DISTANCE']:
         return "mantener", 50, f"Lejos del soporte ({support_distance:.2%}) para {symbol}"
     if rsi is None or rsi < 30:
         return "mantener", 50, f"RSI bajo ({rsi}) para {symbol}"
 
-    # Volume spike filter
+    # Volume spike filter using coin-specific factor
     volume_spike = False
     if data and '1h' in data:
         df = data['1h']
         if len(df) >= 10:
             avg_volume_10 = df['volume'].rolling(window=10).mean().iloc[-1]
             current_volume = df['volume'].iloc[-1]
-            volume_spike = current_volume > avg_volume_10 * VOLUME_SPIKE_FACTOR
+            volume_spike = current_volume > avg_volume_10 * weights['VOLUME_SPIKE_FACTOR']
         if not volume_spike:
             return "mantener", 50, f"Sin pico de volumen para {symbol}"
 
-    # Oversold condition
+    # Oversold condition using coin-specific threshold
     oversold = False
     if data and '1h' in data:
         df = data['1h']
         if len(df) >= 7:
             ma7 = df['close'].rolling(window=7).mean().iloc[-1]
-            oversold = current_price < ma7 * OVERSOLD_THRESHOLD
+            oversold = current_price < ma7 * weights['OVERSOLD_THRESHOLD']
 
-    # Weighted scoring (simplified)
+    # Weighted scoring using coin-specific weights
     weighted_signals = [
-        3 * (relative_volume > 1.0 if relative_volume else False),
-        2 * (short_volume_trend == "increasing"),
-        1 * (price_trend == "increasing"),
-        3 * (support_distance <= 0.03),
-        1 * (adx > 30 if adx else False),
-        -1 * (rsi > 70 if rsi else False),  # Penalty for overbought
-        2 * oversold,
-        1 * volume_spike
+        weights['score_weights']['rel_vol_bonus'] * (relative_volume > 1.0 if relative_volume else False),
+        weights['score_weights']['short_vol_trend'] * (short_volume_trend == "increasing"),
+        weights['score_weights']['price_trend'] * (price_trend == "increasing"),
+        weights['score_weights']['support_dist'] * (support_distance <= weights['MAX_SUPPORT_DISTANCE']),
+        weights['score_weights']['adx_bonus'] * (adx > 30 if adx else False),
+        weights['score_weights']['rsi_penalty'] * (rsi > 70 if rsi else False),
+        weights['score_weights']['oversold'] * oversold,
+        weights['score_weights']['vol_spike'] * volume_spike
     ]
     signals_score = sum(weighted_signals)
     logger.info(f"Strategy score for {symbol}: {signals_score}, Oversold={oversold}, Volume Spike={volume_spike}")
@@ -987,7 +1180,7 @@ def demo_trading():
             for key, value in conditions.items():
                 logger.debug(f"Condición {key} para {symbol}: valor={value}, tipo={type(value)}")
 
-            action, confidence, explanation = calculate_established_strategy(indicators, data)
+            action, confidence, explanation = calculate_established_strategy(indicators, data, symbol)
             logger.info(f"Decisión para {symbol}: {action} (Confianza: {confidence}%) - {explanation}")
 
             sentiment_score, classification = get_market_sentiment()
@@ -1280,13 +1473,13 @@ def gpt_decision_buy(prepared_text):
 def send_periodic_summary():
     while True:
         try:
-            with open(os.path.expanduser(log_base), "a+") as log_file:
-                log_file.seek(0)  # Read from start after opening
+            with open(os.path.expanduser(log_base), "a+") as log_file:  # 'a+' creates if missing
+                log_file.seek(0)
                 lines = log_file.readlines()[-100:]
                 buys_attempted = sum(1 for line in lines if "Intentando compra para" in line)
                 buys_executed = sum(1 for line in lines if "Compra ejecutada para" in line)
                 errors = sum(1 for line in lines if "Error" in line)
-                symbols = set(line.split("para ")[1].split(":")[0] for line in lines if "Procesando" in line)
+                symbols = set(line.split("para ")[1].split(":")[0] for line in lines if "Procesando" in line or "para " in line)
 
             message = (f"📈 *Resumen del Bot* ({get_colombia_timestamp()})\n"
                       f"Compras intentadas: `{buys_attempted}`\n"
