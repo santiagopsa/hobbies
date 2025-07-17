@@ -72,13 +72,19 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+log_base = os.path.expanduser("~/hobbies/trading.log")
 logger = logging.getLogger("inversion_binance")
 logger.setLevel(logging.DEBUG)
 log_filename = os.path.expanduser(f"~/hobbies/trading_{datetime.now().strftime('%Y%m%d')}.log")
-handler = logging.handlers.RotatingFileHandler(log_filename, maxBytes=1024*1024, backupCount=5)
+handler = logging.handlers.TimedRotatingFileHandler(
+    log_base,
+    when='midnight',  # Rotate at midnight
+    interval=1,  # Every 1 day
+    backupCount=30,  # Keep 30 days
+    utc=True  # Use UTC to avoid timezone issues
+)
 handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 logger.addHandler(handler)
-logger.info("Prueba de escritura en trading.log al iniciar")
 
 # Constantes
 MAX_OPEN_TRADES = 10
@@ -90,6 +96,11 @@ VOLUME_GROWTH_THRESHOLD = 0.5
 # Cache de decisiones
 decision_cache = {}
 CACHE_EXPIRATION = 300
+
+# To also rotate on size (1MB), add a check in your main loop (demo_trading or while loop)
+def check_log_rotation():
+    if os.path.getsize(handler.baseFilename) > 1024 * 1024:
+        handler.doRollover()  # Force size-based rotation
 
 def get_market_sentiment():
     try:
@@ -1339,6 +1350,7 @@ if __name__ == "__main__":
     threading.Thread(target=daily_summary, daemon=True).start()
     try:
         while True:
+            check_log_rotation()
             demo_trading()
             time.sleep(30)
     except (KeyboardInterrupt, SystemExit):

@@ -9,3 +9,8 @@ gcloud compute ssh instance-20241230-162850 --zone=southamerica-west1-a
 
 para descargar un archivo 
 gcloud compute scp instance-20241230-162850:/home/santiagopsa/hobbies/trading.db "S:\Python hobbies\Crypto trader\hobbies" --zone=southamerica-west1-a
+
+para obtener trading_*.log archivos
+scp -i cryptopair.pem ec2-user@54.251.176.134:~/hobbies/trading_*.log .
+
+scp -i cryptopair.pem ec2-user@54.251.176.134:~/hobbies/trading_real.db .
