@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MaxReturn Crypto Bot Platform</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f8f9fa;
+            color: #212529;
+        }
+        .header {
+            background-color: #007bff;
+            color: white;
+            padding: 15px;
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+        }
+        .take-rate {
+            background-color: #ffc107;
+            color: #212529;
+            padding: 10px;
+            margin-bottom: 20px;
+            font-weight: bold;
+        }
+        .form-section {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .dashboard-card {
+            background-color: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .win-green {
+            color: #28a745;
+        }
+        .loss-red {
+            color: #dc3545;
+        }
+        .footer {
+            background-color: #f8f9fa;
+            padding: 15px;
+            text-align: center;
+            margin-top: 20px;
+        }
+        .mode-toggle {
+            margin-right: 10px;
+        }
+        /* Dark mode styles */
+        body.dark-mode {
+            background-color: #212529;
+            color: #f8f9fa;
+        }
+        body.dark-mode .header {
+            background-color: #0056b3;
+        }
+        body.dark-mode .take-rate {
+            background-color: #ffca2c;
+            color: #212529;
+        }
+        body.dark-mode .form-section,
+        body.dark-mode .dashboard-card {
+            background-color: #343a40;
+        }
+        body.dark-mode .footer {
+            background-color: #212529;
+        }
+    </style>
+</head>
+<body>
+    <!-- Header Section -->
+    <header class="header d-flex justify-content-between align-items-center">
+        <div>
+            <h3>MaxReturn Crypto Bot</h3>
+            <p>Unlock High-Return Trading: High-Volume (100+ Trades/Day) + High-Prob Wins (65%+ Avg)</p>
+        </div>
+        <div>
+            <div class="form-check form-switch mode-toggle">
+                <input class="form-check-input" type="checkbox" id="testnetSwitch" checked>
+                <label class="form-check-label" for="testnetSwitch">Testnet Mode</label>
+            </div>
+            <button class="btn btn-outline-light btn-sm mode-toggle" id="themeToggle">🌙 Dark Mode</button>
+            <button class="btn btn-outline-danger btn-sm">Logout</button>
+        </div>
+    </header>
+
+    <!-- Take Rate Disclosure -->
+    <div class="container take-rate text-center">
+        Platform Fee: 15% on Net Profits from Wins Only – No Fees on Losses. Aligned for Your High-Return Success.
+    </div>
+
+    <!-- Input Form Section -->
+    <section class="container form-section mb-4">
+        <h4 class="mb-3">Setup Your High-Return Bot</h4>
+        <form>
+            <div class="mb-3">
+                <label for="openaiKey" class="form-label">OPENAI_API_KEY <span class="badge bg-info" data-bs-toggle="tooltip" title="Powers AI signals for high-prob trade predictions (e.g., sentiment analysis on volume spikes).">?</span></label>
+                <input type="password" class="form-control" id="openaiKey" placeholder="Enter your OpenAI API Key">
+            </div>
+            <h5>Testnet Binance Keys</h5>
+            <div class="mb-3">
+                <label for="binanceTestKey" class="form-label">BINANCE_API_KEY_TESTNET</label>
+                <input type="password" class="form-control" id="binanceTestKey" placeholder="Enter Testnet API Key">
+            </div>
+            <div class="mb-3">
+                <label for="binanceTestSecret" class="form-label">BINANCE_SECRET_KEY_TESTNET</label>
+                <input type="password" class="form-control" id="binanceTestSecret" placeholder="Enter Testnet Secret Key">
+            </div>
+            <h5>Live Binance Keys</h5>
+            <div class="mb-3">
+                <label for="binanceRealKey" class="form-label">BINANCE_API_KEY_REAL</label>
+                <input type="password" class="form-control" id="binanceRealKey" placeholder="Enter Live API Key" disabled>
+            </div>
+            <div class="mb-3">
+                <label for="binanceRealSecret" class="form-label">BINANCE_SECRET_KEY_REAL</label>
+                <input type="password" class="form-control" id="binanceRealSecret" placeholder="Enter Live Secret Key" disabled>
+            </div>
+            <h5>Telegram Settings</h5>
+            <div class="mb-3">
+                <label for="telegramApiId" class="form-label">TELEGRAM_API_ID</label>
+                <input type="text" class="form-control" id="telegramApiId" placeholder="Enter Telegram API ID">
+            </div>
+            <div class="mb-3">
+                <label for="telegramApiHash" class="form-label">TELEGRAM_API_HASH</label>
+                <input type="text" class="form-control" id="telegramApiHash" placeholder="Enter Telegram API Hash">
+            </div>
+            <div class="mb-3">
+                <label for="telegramBotToken" class="form-label">TELEGRAM_BOT_TOKEN</label>
+                <input type="password" class="form-control" id="telegramBotToken" placeholder="Enter Telegram Bot Token">
+            </div>
+            <div class="mb-3">
+                <label for="telegramChatId" class="form-label">TELEGRAM_CHAT_ID</label>
+                <input type="text" class="form-control" id="telegramChatId" placeholder="Enter Telegram Chat ID">
+            </div>
+            <div class="mb-3">
+                <label for="dailyBet" class="form-label">Daily Bet Amount (USDT) <span class="badge bg-info" data-bs-toggle="tooltip" title="USDT to risk/day – e.g., $500 for 200+ trades at 0.5% risk each, targeting 70%+ win rate.">?</span></label>
+                <input type="number" class="form-control" id="dailyBet" min="10" step="10" value="100">
+            </div>
+            <button type="submit" class="btn btn-primary">Save & Activate Bot</button>
+            <a href="#" class="ms-2">Test Connection</a>
+            <a href="#" class="ms-2 text-muted">Reset Form</a>
+        </form>
+    </section>
+
+    <!-- Dashboard Section -->
+    <section class="container">
+        <h4 class="mb-3">High-Return Dashboard: Monitor Wins & Optimize Volume/Prob</h4>
+        <div class="row">
+            <div class="col-md-3 mb-3">
+                <div class="dashboard-card">
+                    <h5>Current Balance</h5>
+                    <p class="fs-4">$1,234.56 USDT</p>
+                    <a href="#">View Breakdown</a>
+                </div>
+            </div>
+            <div class="col-md-3 mb-3">
+                <div class="dashboard-card">
+                    <h5>Daily P/L</h5>
+                    <p class="fs-4 win-green">+$45.67 (+3.2%)</p>
+                    <p>After 72 high-volume trades</p>
+                </div>
+            </div>
+            <div class="col-md-3 mb-3">
+                <div class="dashboard-card">
+                    <h5>Win/Loss Ratio</h5>
+                    <p class="fs-4">68% Wins (45/66)</p>
+                    <div class="progress">
+                        <div class="progress-bar bg-success" role="progressbar" style="width: 68%"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3 mb-3">
+                <div class="dashboard-card">
+                    <h5>Trade Volume & Projection</h5>
+                    <p class="fs-4">72 Trades Today</p>
+                    <p>Projected ROI: +4.1%</p>
+                </div>
+            </div>
+        </div>
+        <div class="mt-4">
+            <h5>Historical Performance</h5>
+            <table class="table table-striped">
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Trades (Volume)</th>
+                        <th>Win Prob (%)</th>
+                        <th>P/L After Fee</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>2025-07-17</td>
+                        <td>85 (High)</td>
+                        <td>72%</td>
+                        <td class="win-green">+$32.10</td>
+                        <td><a href="#">Details</a></td>
+                    </tr>
+                    <!-- Add more rows as needed -->
+                </tbody>
+            </table>
+        </div>
+        <div class="mt-3 d-flex justify-content-between">
+            <button class="btn btn-warning">Pause Bot</button>
+            <button class="btn btn-success">Withdraw Profits</button>
+            <div class="dropdown">
+                <button class="btn btn-info dropdown-toggle" type="button" data-bs-toggle="dropdown">Optimize Strategy</button>
+                <ul class="dropdown-menu">
+                    <li><a class="dropdown-item" href="#">Boost Volume</a></li>
+                    <li><a class="dropdown-item" href="#">Focus High-Prob Pairs</a></li>
+                </ul>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer Section -->
+    <footer class="footer">
+        <p>Trading risks high loss. Past high-volume/prob wins no guarantee. <a href="#">Terms of Service</a></p>
+        <p>Help? <a href="#">Contact via Telegram</a></p>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
+    <script>
+        // Theme Toggle
+        document.getElementById('themeToggle').addEventListener('click', function() {
+            document.body.classList.toggle('dark-mode');
+            this.textContent = document.body.classList.contains('dark-mode') ? '☀️ Light Mode' : '🌙 Dark Mode';
+        });
+
+        // Testnet Switch (enable/disable live keys)
+        document.getElementById('testnetSwitch').addEventListener('change', function() {
+            const liveKeys = document.querySelectorAll('#binanceRealKey, #binanceRealSecret');
+            liveKeys.forEach(key => key.disabled = this.checked);
+        });
+
+        // Tooltips
+        const tooltipTriggerList = document.querySelectorAll('[data-bs-toggle="tooltip"]');
+        tooltipTriggerList.forEach(tooltipTriggerEl => new bootstrap.Tooltip(tooltipTriggerEl));
+    </script>
+</body>
+</html>

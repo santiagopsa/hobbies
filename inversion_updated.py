@@ -44,7 +44,7 @@ COIN_WEIGHTS = {
             'adx_bonus': 2,
             'rsi_penalty': -1,
             'oversold': 2,
-            'vol_spike': 2
+            'vol_spike': 3  # Boosted to 3 for high-vol priority
         }
     },
     'ETH': {  # Growth: Balanced for rallies (75%+ wins) - lowered for more volume
@@ -62,7 +62,7 @@ COIN_WEIGHTS = {
             'adx_bonus': 1,
             'rsi_penalty': -1,
             'oversold': 2,
-            'vol_spike': 1
+            'vol_spike': 3  # Boosted
         }
     },
     'BNB': {  # Growth: Similar to ETH - lowered for volume
@@ -80,7 +80,7 @@ COIN_WEIGHTS = {
             'adx_bonus': 1,
             'rsi_penalty': -1,
             'oversold': 2,
-            'vol_spike': 1
+            'vol_spike': 3  # Boosted
         }
     },
     'SOL': {  # High-vol: Stricter for breakouts - lowered ADX to 20 for more trades
@@ -98,7 +98,7 @@ COIN_WEIGHTS = {
             'adx_bonus': 2,
             'rsi_penalty': -2,
             'oversold': 3,
-            'vol_spike': 2
+            'vol_spike': 3  # Boosted
         }
     },
     'XRP': {  # Growth: Moderate - lowered to 0.08 for volume
@@ -116,7 +116,7 @@ COIN_WEIGHTS = {
             'adx_bonus': 1,
             'rsi_penalty': -1,
             'oversold': 2,
-            'vol_spike': 1
+            'vol_spike': 3  # Boosted
         }
     },
     'DOGE': {  # High-vol: Strict for spikes - lowered ADX to 20
@@ -134,7 +134,7 @@ COIN_WEIGHTS = {
             'adx_bonus': 2,
             'rsi_penalty': -2,
             'oversold': 3,
-            'vol_spike': 3
+            'vol_spike': 3  # Boosted
         }
     },
     'TON': {  # Growth: Balanced - lowered to 0.07
@@ -152,7 +152,7 @@ COIN_WEIGHTS = {
             'adx_bonus': 1,
             'rsi_penalty': -1,
             'oversold': 2,
-            'vol_spike': 1
+            'vol_spike': 3  # Boosted
         }
     },
     'ADA': {  # Growth: Research focus - lowered to 0.06
@@ -170,7 +170,7 @@ COIN_WEIGHTS = {
             'adx_bonus': 1,
             'rsi_penalty': -1,
             'oversold': 2,
-            'vol_spike': 1
+            'vol_spike': 3  # Boosted
         }
     },
     'TRX': {  # Growth: Utility - lowered to 0.07
@@ -188,7 +188,7 @@ COIN_WEIGHTS = {
             'adx_bonus': 1,
             'rsi_penalty': -1,
             'oversold': 2,
-            'vol_spike': 1
+            'vol_spike': 3  # Boosted
         }
     },
     'AVAX': {  # High-vol: Scaling - lowered ADX to 20, rel vol to 0.2 for volume
@@ -206,7 +206,7 @@ COIN_WEIGHTS = {
             'adx_bonus': 2,
             'rsi_penalty': -1.5,
             'oversold': 2.5,
-            'vol_spike': 2
+            'vol_spike': 3  # Boosted
         }
     }
 }
@@ -510,7 +510,7 @@ def fetch_and_prepare_data(symbol, atr_length=7, rsi_length=14, bb_length=20, ro
                 df = df.sort_index()
 
             if len(df) >= atr_length:
-                df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=atr_length).ffill().bfill()
+                df['ATR'] = ta.atr(df['high'], df['low', 'close'], length=atr_length).ffill().bfill()
             else:
                 df['ATR'] = np.nan
 
@@ -850,7 +850,7 @@ def calculate_established_strategy(indicators, data=None, symbol=None):
             'adx_bonus': 1,
             'rsi_penalty': -1,
             'oversold': 2,
-            'vol_spike': 1
+            'vol_spike': 3  # Boosted default
         }
     })
     rsi = indicators.get('rsi', None)
@@ -869,6 +869,21 @@ def calculate_established_strategy(indicators, data=None, symbol=None):
     logger.info(f"Calculating strategy for {symbol}: RSI={rsi}, Relative Volume={relative_volume}, ADX={adx}")
 
     support_distance = (current_price - support_level) / support_level if support_level and current_price > 0 else 0.5
+
+    # Add OBV to short_vol_trend (improve vol detection)
+    obv_increasing = False
+    if data and '15m' in data:
+        df = data['15m']
+        if len(df) >= 2:
+            df['OBV'] = ta.obv(df['close'], df['volume'])
+            obv_slope = df['OBV'].diff().rolling(3).mean().iloc[-1]
+            obv_increasing = obv_slope > 0
+    if obv_increasing:
+        short_volume_trend = "increasing"  # Override for better prediction
+
+    # Relax vol if oversold + close support
+    if rsi < 50 and support_distance < 0:
+        min_rel_vol_adjusted *= 0.5  # Halve for rebounds
 
     # Initial filters using adjusted thresholds
     if adx is None or adx < min_adx_adjusted:
@@ -901,6 +916,15 @@ def calculate_established_strategy(indicators, data=None, symbol=None):
             ma7 = df['close'].rolling(window=7).mean().iloc[-1]
             oversold = current_price < ma7 * weights['OVERSOLD_THRESHOLD']
 
+    # Require MACD crossover for buy (high-win momentum)
+    if not indicators.get('has_macd_crossover', False):
+        return "mantener", 50, f"No MACD crossover for {symbol}"
+
+    # Add EMA crossover bonus
+    ema_crossover = False
+    if '15m' in data and len(data['15m']) >= 20:
+        ema_crossover = data['15m']['ema_crossover'].iloc[-1]
+
     # Weighted scoring using coin-specific weights, with +3 boost for increasing short_vol_trend
     vol_trend_boost = 3 if short_volume_trend == "increasing" else 0
     weighted_signals = [
@@ -911,7 +935,8 @@ def calculate_established_strategy(indicators, data=None, symbol=None):
         weights['score_weights']['adx_bonus'] * (adx > 30 if adx else False),
         weights['score_weights']['rsi_penalty'] * (rsi > 70 if rsi else False),
         weights['score_weights']['oversold'] * oversold,
-        weights['score_weights']['vol_spike'] * volume_spike
+        weights['score_weights']['vol_spike'] * volume_spike,
+        2 if ema_crossover else 0  # +2 EMA bonus for rises
     ]
     signals_score = sum(weighted_signals)
     logger.info(f"Strategy score for {symbol}: {signals_score}, Oversold={oversold}, Volume Spike={volume_spike}")
