@@ -16,7 +16,7 @@ import pytz
 import pandas_ta as ta
 from scipy.stats import linregress
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_model_selection import GridSearchCV, train_test_split  # Added for ML/backtest
+from sklearn.model_selection import GridSearchCV, train_test_split  # Added for ML/backtest
 from sklearn.metrics import accuracy_score, classification_report  # For ML eval
 
 # Configuración e Inicialización
