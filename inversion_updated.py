@@ -16,7 +16,8 @@ import pytz
 import pandas_ta as ta
 from scipy.stats import linregress
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_model_selection import GridSearchCV, train_test_split  # Added for ML/backtest
+from sklearn.metrics import accuracy_score, classification_report  # For ML eval
 
 # Configuración e Inicialización
 load_dotenv()
@@ -1492,9 +1493,9 @@ def send_periodic_summary():
                 log_file.seek(0)
                 lines = log_file.readlines()[-100:]
                 buys_attempted = sum(1 for line in lines if "Intentando compra para" in line)
-                buys_executed = sum(1 for line in lines if "Compra ejecutada para" in line)
+                buys_executed = sum(1 for line in lines if "Compra ejecutada:" in line)  # Fixed: match colon in log "Compra ejecutada: {symbol}"
                 errors = sum(1 for line in lines if "Error" in line)
-                symbols = set(line.split("para ")[1].split(":")[0] for line in lines if "Procesando" in line or "para " in line)
+                symbols = set(line.split("procesar ")[1].split(":")[0] if "procesar " in line else "" for line in lines if "Operaciones abiertas antes de procesar" in line)  # Fixed: parse from "procesar {symbol}"
 
             message = (f"📈 *Resumen del Bot* ({get_colombia_timestamp()})\n"
                       f"Compras intentadas: `{buys_attempted}`\n"
