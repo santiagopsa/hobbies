@@ -1445,7 +1445,7 @@ def gpt_decision_buy(prepared_text):
     Criterios ajustados:
     - Compra si: volumen relativo > 3.0, short_volume_trend es 'increasing' o 'stable', price_trend es 'increasing', distancia relativa al soporte <= 0.15, profundidad > 3000, y spread <= 0.5% del precio (0.005 * precio). RSI > 70 es un bono, no un requisito.
     - Mantener si: volumen relativo <= 3.0, short_volume_trend es 'decreasing', price_trend no es 'increasing', distancia relativa al soporte > 0.15, profundidad <= 3000, o spread > 0.5% del precio.
-    - Evalúa liquidez con profundidad (>3000) and spread (<=0.5% del precio).
+    - Evalúa liquidez with profundidad (>3000) and spread (<=0.5% del precio).
     - Asigna confianza >80 solo si volumen relativo > 3.0, soporte cercano (<= 0.15), y al menos 3 condiciones se cumplen; usa 60-79 para riesgos moderados (al menos 2 condiciones); de lo contrario, usa 50. Suma 10 a la confianza si RSI > 70.
     - Ignora el cruce MACD como requisito; prioriza momentum y soporte.
     """
