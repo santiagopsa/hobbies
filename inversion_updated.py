@@ -243,11 +243,10 @@ def initialize_db():
             status TEXT DEFAULT 'open'
         )
     ''')
-    # Added: Create optimized_weights for persistent tuning
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS optimized_weights (
             symbol TEXT PRIMARY KEY,
-            weights TEXT NOT NULL,  
+            weights TEXT NOT NULL,
             last_optimized TEXT NOT NULL
         )
     ''')
@@ -1199,7 +1198,7 @@ def demo_trading():
             }
 
             conditions_str = "\n".join([f"{key}: {'Sí' if value is True else 'No' if value is False else 'Desconocido'}" for key, value in sorted(conditions.items())])
-            logger.info(f"Condiciones evaluadas para {symbol}:\n{conditions_str}")
+            logger.info(f"Condiciones evaluadas para {symbol}: \n{conditions_str}")
 
             for key, value in conditions.items():
                 logger.debug(f"Condición {key} para {symbol}: valor={value}, tipo={type(value)}")
