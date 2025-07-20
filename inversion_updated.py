@@ -6,7 +6,6 @@ import pandas as pd
 import numpy as np
 import pandas_ta as ta
 from scipy.stats import linregress
-import xgboost as xgb  # XGBoost for better crypto time-series
 from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.metrics import accuracy_score
 import statsmodels.api as sm  # For OLS in cointegration
