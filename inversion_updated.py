@@ -1,35 +1,34 @@
-import sqlite3
-import json
-from datetime import datetime
 import ccxt
 import pandas as pd
 import numpy as np
+import sqlite3
+import os
+import time
+import requests
+import json
+import logging
+import logging.handlers
+import threading
+from datetime import datetime, timezone, timedelta
+from dotenv import load_dotenv
+from openai import OpenAI
+import pytz
 import pandas_ta as ta
 from scipy.stats import linregress
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GridSearchCV, train_test_split
-from sklearn.metrics import accuracy_score
-import statsmodels.api as sm  # For OLS in cointegration
-import os
-import sqlite3
-import logging
-import requests
-from openai import OpenAI
+from sklearn.metrics import accuracy_score, classification_report
 
+# Configuración e Inicialización
+load_dotenv()
+GPT_MODEL = "gpt-4o-mini"
 DB_NAME = "trading_real.db"
 
-# Create optimized_weights if missing
-conn = sqlite3.connect(DB_NAME)
-cursor = conn.cursor()
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS optimized_weights (
-        symbol TEXT PRIMARY KEY,
-        weights TEXT NOT NULL,
-        last_optimized TEXT NOT NULL
-    )
-''')
-conn.commit()
+# Top 10 coins excluding stables (as of July 20, 2025)
+TOP_COINS = ['BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'DOGE', 'TON', 'ADA', 'TRX', 'AVAX']
+SELECTED_CRYPTOS = [f"{coin}/USDT" for coin in TOP_COINS]
 
-# Coin-specific weights (full for standalone)
+# Coin-specific weights (easy to change here) with recommendations integrated
 COIN_WEIGHTS = {
     'BTC': {
         'category': 'stable',
