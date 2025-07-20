@@ -208,30 +208,79 @@ COIN_WEIGHTS = {
     }
 }
 
+# Initial weights from user/forums (high winrate start: ADX>30 for strong trends, rel_vol>1.2 for spikes, support<0.02 for rebounds)
+INITIAL_WEIGHTS = {
+    "BTC/USDT": {
+      "MIN_ADX": 30,
+      "MIN_RELATIVE_VOLUME": 1.2,
+      "MAX_SUPPORT_DISTANCE": 0.02,
+      "VOLUME_SPIKE_FACTOR": 1.5
+    },
+    "ETH/USDT": {
+      "MIN_ADX": 30,
+      "MIN_RELATIVE_VOLUME": 1.2,
+      "MAX_SUPPORT_DISTANCE": 0.02,
+      "VOLUME_SPIKE_FACTOR": 1.3
+    },
+    "BNB/USDT": {
+      "MIN_ADX": 30,
+      "MIN_RELATIVE_VOLUME": 1.2,
+      "MAX_SUPPORT_DISTANCE": 0.02,
+      "VOLUME_SPIKE_FACTOR": 1.2
+    },
+    "SOL/USDT": {
+      "MIN_ADX": 30,
+      "MIN_RELATIVE_VOLUME": 1.2,
+      "MAX_SUPPORT_DISTANCE": 0.02,
+      "VOLUME_SPIKE_FACTOR": 1.5
+    },
+    "XRP/USDT": {
+      "MIN_ADX": 30,
+      "MIN_RELATIVE_VOLUME": 1.2,
+      "MAX_SUPPORT_DISTANCE": 0.02,
+      "VOLUME_SPIKE_FACTOR": 1.4
+    },
+    "DOGE/USDT": {
+      "MIN_ADX": 30,
+      "MIN_RELATIVE_VOLUME": 1.2,
+      "MAX_SUPPORT_DISTANCE": 0.02,
+      "VOLUME_SPIKE_FACTOR": 1.6
+    },
+    "TON/USDT": {
+      "MIN_ADX": 30,
+      "MIN_RELATIVE_VOLUME": 1.2,
+      "MAX_SUPPORT_DISTANCE": 0.02,
+      "VOLUME_SPIKE_FACTOR": 1.3
+    },
+    "ADA/USDT": {
+      "MIN_ADX": 30,
+      "MIN_RELATIVE_VOLUME": 1.2,
+      "MAX_SUPPORT_DISTANCE": 0.02,
+      "VOLUME_SPIKE_FACTOR": 1.3
+    },
+    "TRX/USDT": {
+      "MIN_ADX": 30,
+      "MIN_RELATIVE_VOLUME": 1.2,
+      "MAX_SUPPORT_DISTANCE": 0.02,
+      "VOLUME_SPIKE_FACTOR": 1.25
+    },
+    "AVAX/USDT": {
+      "MIN_ADX": 30,
+      "MIN_RELATIVE_VOLUME": 1.2,
+      "MAX_SUPPORT_DISTANCE": 0.02,
+      "VOLUME_SPIKE_FACTOR": 1.45
+    }
+}
+
 # Dummy get_market_sentiment for standalone
 def get_market_sentiment():
-    return 70, "Greed"  # Assume greed for test; in bot, real API
+    return 70, "Greed"  # Assume greed for test
 
-# calculate_established_strategy (full for standalone, with imbalance)
+# calculate_established_strategy (full, with imbalance for prob)
 def calculate_established_strategy(indicators, data=None, symbol=None):
     base_coin = symbol.split('/')[0]
-    weights = COIN_WEIGHTS.get(base_coin, {
-        'MIN_ADX': 20,
-        'MIN_RELATIVE_VOLUME': 0.3,
-        'MAX_SUPPORT_DISTANCE': 0.03,
-        'VOLUME_SPIKE_FACTOR': 1.5,
-        'OVERSOLD_THRESHOLD': 0.95,
-        'score_weights': {
-            'rel_vol_bonus': 3,
-            'short_vol_trend': 2,
-            'price_trend': 1,
-            'support_dist': 3,
-            'adx_bonus': 1,
-            'rsi_penalty': -1,
-            'oversold': 2,
-            'vol_spike': 1
-        }
-    })
+    weights = INITIAL_WEIGHTS.get(symbol, COIN_WEIGHTS.get(base_coin, INITIAL_WEIGHTS.get(symbol, {})))  # Prioritize initial/user
+
     rsi = indicators.get('rsi', None)
     relative_volume = indicators.get('relative_volume', None)
     price_trend = indicators.get('price_trend', 'insufficient_data')
@@ -241,8 +290,8 @@ def calculate_established_strategy(indicators, data=None, symbol=None):
     adx = indicators.get('adx', None)
 
     sentiment_score, _ = get_market_sentiment()
-    min_adx_adjusted = weights['MIN_ADX'] * 0.85 if sentiment_score > 70 else weights['MIN_ADX']
-    min_rel_vol_adjusted = weights['MIN_RELATIVE_VOLUME'] * 0.85 if sentiment_score > 70 else weights['MIN_RELATIVE_VOLUME']
+    min_adx_adjusted = weights.get('MIN_ADX', 30) * 0.85 if sentiment_score > 70 else weights.get('MIN_ADX', 30)
+    min_rel_vol_adjusted = weights.get('MIN_RELATIVE_VOLUME', 1.2) * 0.85 if sentiment_score > 70 else weights.get('MIN_RELATIVE_VOLUME', 1.2)
 
     support_distance = (current_price - support_level) / support_level if support_level and current_price > 0 else 0.5
 
@@ -252,7 +301,7 @@ def calculate_established_strategy(indicators, data=None, symbol=None):
         return "mantener", 50, "Volumen relativo bajo"
     if short_volume_trend != "increasing":
         return "mantener", 50, "Volumen no favorable"
-    if support_distance > weights['MAX_SUPPORT_DISTANCE']:
+    if support_distance > weights.get('MAX_SUPPORT_DISTANCE', 0.02):
         return "mantener", 50, "Lejos del soporte"
     if rsi is None or rsi < 30:
         return "mantener", 50, "RSI bajo"
@@ -263,31 +312,32 @@ def calculate_established_strategy(indicators, data=None, symbol=None):
         if len(df) >= 10:
             avg_volume_10 = df['volume'].rolling(window=10).mean().iloc[-1]
             current_volume = df['volume'].iloc[-1]
-            volume_spike = current_volume > avg_volume_10 * weights['VOLUME_SPIKE_FACTOR']
+            volume_spike = current_volume > avg_volume_10 * weights.get('VOLUME_SPIKE_FACTOR', 1.5)
 
     oversold = False
     if data and '1h' in data:
         df = data['1h']
         if len(df) >= 7:
             ma7 = df['close'].rolling(window=7).mean().iloc[-1]
-            oversold = current_price < ma7 * weights['OVERSOLD_THRESHOLD']
+            oversold = current_price < ma7 * weights.get('OVERSOLD_THRESHOLD', 0.95)
 
+    score_weights = weights.get('score_weights', COIN_WEIGHTS.get(base_coin, {}).get('score_weights', {}))
     vol_trend_boost = 3 if short_volume_trend == "increasing" else 0
     weighted_signals = [
-        weights['score_weights']['rel_vol_bonus'] * (relative_volume > 1.0 if relative_volume else False),
-        weights['score_weights']['short_vol_trend'] * (short_volume_trend == "increasing") + vol_trend_boost,
-        weights['score_weights']['price_trend'] * (price_trend == "increasing"),
-        weights['score_weights']['support_dist'] * (support_distance <= weights['MAX_SUPPORT_DISTANCE']),
-        weights['score_weights']['adx_bonus'] * (adx > 30 if adx else False),
-        weights['score_weights']['rsi_penalty'] * (rsi > 70 if rsi else False),
-        weights['score_weights']['oversold'] * oversold,
-        weights['score_weights']['vol_spike'] * volume_spike
+        score_weights.get('rel_vol_bonus', 3) * (relative_volume > 1.0 if relative_volume else False),
+        score_weights.get('short_vol_trend', 2) * (short_volume_trend == "increasing") + vol_trend_boost,
+        score_weights.get('price_trend', 1) * (price_trend == "increasing"),
+        score_weights.get('support_dist', 3) * (support_distance <= weights.get('MAX_SUPPORT_DISTANCE', 0.02)),
+        score_weights.get('adx_bonus', 1) * (adx > 30 if adx else False),
+        score_weights.get('rsi_penalty', -1) * (rsi > 70 if rsi else False),
+        score_weights.get('oversold', 2) * oversold,
+        score_weights.get('vol_spike', 1) * volume_spike
     ]
     signals_score = sum(weighted_signals)
 
     imbalance = indicators.get('imbalance', 1.0)
     if imbalance > 1.1:
-        signals_score += 1  # Boost for high prob demand
+        signals_score += 1  # Boost for demand, high prob
 
     if signals_score >= 5:
         action = "comprar"
@@ -300,7 +350,7 @@ def calculate_established_strategy(indicators, data=None, symbol=None):
 
     return action, confidence, explanation
 
-# Backtest function (as before)
+# Backtest function (iterative optimization loop)
 def backtest_strategy(symbol, historical_data=None):
     if historical_data is None:
         exchange = ccxt.binance()
@@ -317,13 +367,13 @@ def backtest_strategy(symbol, historical_data=None):
     df['support_level'] = df['close'].rolling(15).min()
     df['support_dist'] = (df['close'] - df['support_level']) / df['support_level']
     df['vol_trend'] = np.where(df['volume'].pct_change() > 0.01, 1, 0)  # Add for prob
-    df['imbalance'] = 1.1  # Dummy; integrate fetch_order_book_data in bot for real
+    df['imbalance'] = 1.1  # Dummy; integrate in bot
 
     features = df[['RSI', 'ADX', 'rel_vol', 'support_dist', 'vol_trend', 'imbalance']].dropna()
     labels = (df['close'].shift(-1) > df['close']).astype(int)
-    labels = labels.loc[features.index].dropna()  # Align to features, drop NaN
+    labels = labels.loc[features.index].dropna()
 
-    features = features.loc[labels.index]  # Exact match (e.g., ~973 samples)
+    features = features.loc[labels.index]
 
     if len(features) < 20:
         print(f"Insufficient data for {symbol}: {len(features)} samples")
@@ -339,46 +389,84 @@ def backtest_strategy(symbol, historical_data=None):
     acc = accuracy_score(y_test, grid.predict(X_test))
     print(f"ML accuracy for {symbol}: {acc*100:.1f}%")
 
-    # Simulate trades with full strategy for metrics
-    trades = []
-    positions = []
-    data = {'1h': df}  # Mimic bot
-    for i in range(len(df) - 5):
-        indicators_i = {
-            'rsi': df['RSI'].iloc[i],
-            'adx': df['ADX'].iloc[i],
-            'relative_volume': df['rel_vol'].iloc[i],
-            'price_trend': 'increasing' if df['close'].iloc[i] > df['close'].iloc[max(0, i-1)] else 'decreasing',
-            'short_volume_trend': 'increasing' if df['volume'].iloc[i] > df['volume'].iloc[max(0, i-1)] else 'decreasing',
-            'support_level': df['support_level'].iloc[i],
-            'current_price': df['close'].iloc[i],
-            'imbalance': df['imbalance'].iloc[i]
-        }
-        action, _, _ = calculate_established_strategy(indicators_i, data, symbol)
-        if action == "comprar":
-            pl = (df['close'].iloc[i+5] - df['close'].iloc[i]) / df['close'].iloc[i] * 100
-            trades.append(pl > 0)
-            positions.append(pl)
+    # Iterative optimization: Start with initial, test variations, save best (high winrate + max trades for volume)
+    best_winrate = 0
+    best_profit_factor = 0
+    best_max_drawdown = float('inf')
+    best_num_trades = 0
+    best_weights = INITIAL_WEIGHTS.get(symbol, {})
 
-    winrate = sum(trades) / len(trades) * 100 if trades else 0
-    profits = [p for p in positions if p > 0]
-    losses = [abs(p) for p in positions if p <= 0]
-    profit_factor = sum(profits) / sum(losses) if losses else float('inf')
-    equity_curve = np.cumprod(1 + np.array(positions)/100)
-    drawdown = (np.maximum.accumulate(equity_curve) - equity_curve) / np.maximum.accumulate(equity_curve)
-    max_drawdown = drawdown.max() * 100
+    # Ranges to iterate (from forums: rel_vol 1.0-1.5, ADX 25-35, etc for high win)
+    rel_vol_ranges = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
+    adx_ranges = [25, 30, 35]
+    support_dist_ranges = [0.015, 0.02, 0.025]
+    vol_spike_ranges = [1.2, 1.3, 1.4, 1.5, 1.6]
 
-    print(f"Backtest for {symbol}: Winrate {winrate:.1f}%, Profit Factor {profit_factor:.2f}, Max Drawdown {max_drawdown:.1f}%")
+    for min_rel_vol in rel_vol_ranges:
+        for min_adx in adx_ranges:
+            for max_support in support_dist_ranges:
+                for vol_spike in vol_spike_ranges:
+                    temp_weights = {
+                        'MIN_ADX': min_adx,
+                        'MIN_RELATIVE_VOLUME': min_rel_vol,
+                        'MAX_SUPPORT_DISTANCE': max_support,
+                        'VOLUME_SPIKE_FACTOR': vol_spike,
+                        'OVERSOLD_THRESHOLD': 0.95,  # Fixed from forums
+                        'score_weights': best_weights.get('score_weights', {})
+                    }
 
-    # Tune/save weights if improved (customize; e.g., lower rel_vol if winrate high for volume)
-    optimized_weights = {"MIN_RELATIVE_VOLUME": 0.05 if winrate > 80 else 0.1, "score_weights": {"rel_vol_bonus": 4 if profit_factor > 2 else 3}}
+                    # Simulate with temp_weights
+                    trades = []
+                    positions = []
+                    data = {'1h': df}
+                    for i in range(len(df) - 5):
+                        indicators_i = {
+                            'rsi': df['RSI'].iloc[i],
+                            'adx': df['ADX'].iloc[i],
+                            'relative_volume': df['rel_vol'].iloc[i],
+                            'price_trend': 'increasing' if df['close'].iloc[i] > df['close'].iloc[max(0, i-1)] else 'decreasing',
+                            'short_volume_trend': 'increasing' if df['volume'].iloc[i] > df['volume'].iloc[max(0, i-1)] else 'decreasing',
+                            'support_level': df['support_level'].iloc[i],
+                            'current_price': df['close'].iloc[i],
+                            'imbalance': df['imbalance'].iloc[i]
+                        }
+                        action, _, _ = calculate_established_strategy(indicators_i, data, symbol)
+                        if action == "comprar":
+                            pl = (df['close'].iloc[i+5] - df['close'].iloc[i]) / df['close'].iloc[i] * 100
+                            trades.append(pl > 0)
+                            positions.append(pl)
+
+                    num_trades = len(trades)
+                    if num_trades == 0:
+                        continue
+
+                    winrate = sum(trades) / num_trades * 100
+                    profits = [p for p in positions if p > 0]
+                    losses = [abs(p) for p in positions if p <= 0]
+                    profit_factor = sum(profits) / sum(losses) if losses else float('inf')
+                    equity_curve = np.cumprod(1 + np.array(positions)/100)
+                    drawdown = (np.maximum.accumulate(equity_curve) - equity_curve) / np.maximum.accumulate(equity_curve)
+                    max_drawdown = drawdown.max() * 100
+
+                    # Save if better (high winrate + max trades for volume, factor>2, drawdown<15)
+                    if winrate > best_winrate and winrate > 80 and profit_factor > 2 and max_drawdown < 15 and num_trades > best_num_trades:
+                        best_winrate = winrate
+                        best_profit_factor = profit_factor
+                        best_max_drawdown = max_drawdown
+                        best_num_trades = num_trades
+                        best_weights = temp_weights
+                        print(f"Improved iteration for {symbol}: Winrate {winrate:.1f}%, Factor {profit_factor:.2f}, Drawdown {max_drawdown:.1f}%, Trades {num_trades}")
+
+    print(f"Best for {symbol}: Winrate {best_winrate:.1f}%, Factor {best_profit_factor:.2f}, Drawdown {best_max_drawdown:.1f}%, Trades {best_num_trades}")
+
+    # Save best
     cursor.execute('''
         INSERT OR REPLACE INTO optimized_weights (symbol, weights, last_optimized)
         VALUES (?, ?, ?)
-    ''', (symbol, json.dumps(optimized_weights), datetime.now().isoformat()))
+    ''', (symbol, json.dumps(best_weights), datetime.now().isoformat()))
     conn.commit()
 
-    return winrate
+    return best_winrate
 
 # Run backtest to populate
 backtest_strategy('BTC/USDT')
