@@ -247,7 +247,7 @@ def initialize_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS optimized_weights (
             symbol TEXT PRIMARY KEY,
-            weights TEXT NOT NULL,  # JSON of dict
+            weights TEXT NOT NULL,  
             last_optimized TEXT NOT NULL
         )
     ''')
