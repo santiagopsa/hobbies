@@ -243,6 +243,14 @@ def initialize_db():
             status TEXT DEFAULT 'open'
         )
     ''')
+    # Added: Create optimized_weights for persistent tuning
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS optimized_weights (
+            symbol TEXT PRIMARY KEY,
+            weights TEXT NOT NULL,  # JSON of dict
+            last_optimized TEXT NOT NULL
+        )
+    ''')
     conn.commit()
     conn.close()
 
