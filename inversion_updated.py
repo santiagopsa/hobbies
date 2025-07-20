@@ -9,6 +9,11 @@ from scipy.stats import linregress
 from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.metrics import accuracy_score
 import statsmodels.api as sm  # For OLS in cointegration
+import os
+import sqlite3
+import logging
+import requests
+from openai import OpenAI
 
 DB_NAME = "trading_real.db"
 
