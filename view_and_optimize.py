@@ -18,13 +18,13 @@ cursor = conn.cursor()
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS optimized_weights (
         symbol TEXT PRIMARY KEY,
-        weights TEXT NOT NULL,
+        weights TEXT NOT NULL,  # JSON dict
         last_optimized TEXT NOT NULL
     )
 ''')
 conn.commit()
 
-# Backtest function (integrated for tuning)
+# Backtest function (fixed length mismatch)
 def backtest_strategy(symbol, historical_data=None):
     if historical_data is None:
         exchange = ccxt.binance()
@@ -42,13 +42,16 @@ def backtest_strategy(symbol, historical_data=None):
     df['support_dist'] = (df['close'] - df['support_level']) / df['support_level']
 
     features = df[['RSI', 'ADX', 'rel_vol', 'support_dist']].dropna()
-    labels = (df['close'].shift(-1) > df['close']).astype(int).dropna()
+    labels = (df['close'].shift(-1) > df['close']).astype(int).loc[features.index].dropna()  # Align to features, drop NaN (last row)
+
+    features = features.loc[labels.index]  # Ensure exact match
 
     if len(features) < 20:
-        print(f"Insufficient data for {symbol}")
+        print(f"Insufficient data for {symbol}: {len(features)} samples")
         return None
 
-    X_train, X_test, y_train, y_test = train_test_split(features[:-1], labels[:-1], test_size=0.2)
+    X_train, X_test, y_train, y_test = train_test_split(features, labels, test_size=0.2)  # Now lengths match
+
     model = LogisticRegression()
     param_grid = {'C': [0.1, 1, 10]}
     grid = GridSearchCV(model, param_grid, cv=5)
@@ -84,6 +87,8 @@ backtest_strategy('BTC/USDT')
 cursor.execute("SELECT symbol, weights, last_optimized FROM optimized_weights ORDER BY last_optimized DESC")
 rows = cursor.fetchall()
 print("Optimized Weights (Latest First):")
+if not rows:
+    print("No entries yet—run backtest_strategy to populate.")
 for row in rows:
     symbol, weights_json, timestamp = row
     weights = json.loads(weights_json)
