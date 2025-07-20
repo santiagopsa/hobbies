@@ -1,43 +1,40 @@
+import sqlite3
+import json
+from datetime import datetime
 import ccxt
 import pandas as pd
 import numpy as np
-import sqlite3
-import os
-import time
-import requests
-import json
-import logging
-import logging.handlers  # Added for RotatingFileHandler
-import threading
-from datetime import datetime, timezone, timedelta
-from dotenv import load_dotenv
-from openai import OpenAI
-import pytz
 import pandas_ta as ta
 from scipy.stats import linregress
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import GridSearchCV, train_test_split  # Added for ML/backtest
-from sklearn.metrics import accuracy_score, classification_report  # For ML eval
+import xgboost as xgb  # XGBoost for better crypto time-series
+from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.metrics import accuracy_score
+import statsmodels.api as sm  # For OLS in cointegration
 
-# Configuración e Inicialización
-load_dotenv()
-GPT_MODEL = "gpt-4o-mini"
 DB_NAME = "trading_real.db"
 
-# Top 10 coins excluding stables (as of July 17, 2025)
-TOP_COINS = ['BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'DOGE', 'TON', 'ADA', 'TRX', 'AVAX']
-SELECTED_CRYPTOS = [f"{coin}/USDT" for coin in TOP_COINS]
+# Create optimized_weights if missing
+conn = sqlite3.connect(DB_NAME)
+cursor = conn.cursor()
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS optimized_weights (
+        symbol TEXT PRIMARY KEY,
+        weights TEXT NOT NULL,
+        last_optimized TEXT NOT NULL
+    )
+''')
+conn.commit()
 
-# Coin-specific weights (easy to change here) with recommendations integrated
+# Coin-specific weights (full for standalone)
 COIN_WEIGHTS = {
-    'BTC': {  # Stable leader: Lenient for high-volume range trades (>70% wins)
+    'BTC': {
         'category': 'stable',
-        'MIN_ADX': 15,  # Weak trends OK for BTC accumulation
-        'MIN_RELATIVE_VOLUME': 0.05,  # Low vol threshold for frequent entries
-        'MAX_SUPPORT_DISTANCE': 0.05,  # Wider for rebounds
-        'VOLUME_SPIKE_FACTOR': 1.1,  # Easy spikes in greed
-        'OVERSOLD_THRESHOLD': 0.95,  # Default oversold MA factor
-        'score_weights': {  # Heavier on volume/trend for 3-5 trades/day
+        'MIN_ADX': 15,
+        'MIN_RELATIVE_VOLUME': 0.05,
+        'MAX_SUPPORT_DISTANCE': 0.05,
+        'VOLUME_SPIKE_FACTOR': 1.1,
+        'OVERSOLD_THRESHOLD': 0.95,
+        'score_weights': {
             'rel_vol_bonus': 4,
             'short_vol_trend': 3,
             'price_trend': 2,
@@ -48,16 +45,16 @@ COIN_WEIGHTS = {
             'vol_spike': 2
         }
     },
-    'ETH': {  # Growth: Balanced for rallies (75%+ wins) - lowered for more volume
+    'ETH': {
         'category': 'growth',
         'MIN_ADX': 20,
-        'MIN_RELATIVE_VOLUME': 0.06,  # Lowered to 0.06 for higher volume in greed
+        'MIN_RELATIVE_VOLUME': 0.06,
         'MAX_SUPPORT_DISTANCE': 0.03,
         'VOLUME_SPIKE_FACTOR': 1.3,
         'OVERSOLD_THRESHOLD': 0.95,
         'score_weights': {
             'rel_vol_bonus': 3,
-            'short_vol_trend': 2 + 3,  # Boost +3 for "increasing" trend
+            'short_vol_trend': 2 + 3,
             'price_trend': 2,
             'support_dist': 3,
             'adx_bonus': 1,
@@ -66,7 +63,7 @@ COIN_WEIGHTS = {
             'vol_spike': 1
         }
     },
-    'BNB': {  # Growth: Similar to ETH - lowered for volume
+    'BNB': {
         'category': 'growth',
         'MIN_ADX': 18,
         'MIN_RELATIVE_VOLUME': 0.06,
@@ -75,7 +72,7 @@ COIN_WEIGHTS = {
         'OVERSOLD_THRESHOLD': 0.95,
         'score_weights': {
             'rel_vol_bonus': 3,
-            'short_vol_trend': 2 + 3,  # Boost for increasing
+            'short_vol_trend': 2 + 3,
             'price_trend': 2,
             'support_dist': 3,
             'adx_bonus': 1,
@@ -84,16 +81,16 @@ COIN_WEIGHTS = {
             'vol_spike': 1
         }
     },
-    'SOL': {  # High-vol: Stricter for breakouts - lowered ADX to 20 for more trades
+    'SOL': {
         'category': 'high_vol',
-        'MIN_ADX': 20,  # Lowered to 20 for higher volume
+        'MIN_ADX': 20,
         'MIN_RELATIVE_VOLUME': 0.3,
         'MAX_SUPPORT_DISTANCE': 0.02,
         'VOLUME_SPIKE_FACTOR': 1.5,
         'OVERSOLD_THRESHOLD': 0.95,
         'score_weights': {
             'rel_vol_bonus': 3,
-            'short_vol_trend': 2 + 3,  # Boost for increasing
+            'short_vol_trend': 2 + 3,
             'price_trend': 1,
             'support_dist': 3,
             'adx_bonus': 2,
@@ -102,7 +99,7 @@ COIN_WEIGHTS = {
             'vol_spike': 2
         }
     },
-    'XRP': {  # Growth: Moderate - lowered to 0.08 for volume
+    'XRP': {
         'category': 'growth',
         'MIN_ADX': 20,
         'MIN_RELATIVE_VOLUME': 0.08,
@@ -120,7 +117,7 @@ COIN_WEIGHTS = {
             'vol_spike': 1
         }
     },
-    'DOGE': {  # High-vol: Strict for spikes - lowered ADX to 20
+    'DOGE': {
         'category': 'high_vol',
         'MIN_ADX': 20,
         'MIN_RELATIVE_VOLUME': 0.4,
@@ -138,7 +135,7 @@ COIN_WEIGHTS = {
             'vol_spike': 3
         }
     },
-    'TON': {  # Growth: Balanced - lowered to 0.07
+    'TON': {
         'category': 'growth',
         'MIN_ADX': 22,
         'MIN_RELATIVE_VOLUME': 0.07,
@@ -156,7 +153,7 @@ COIN_WEIGHTS = {
             'vol_spike': 1
         }
     },
-    'ADA': {  # Growth: Research focus - lowered to 0.06
+    'ADA': {
         'category': 'growth',
         'MIN_ADX': 20,
         'MIN_RELATIVE_VOLUME': 0.06,
@@ -174,7 +171,7 @@ COIN_WEIGHTS = {
             'vol_spike': 1
         }
     },
-    'TRX': {  # Growth: Utility - lowered to 0.07
+    'TRX': {
         'category': 'growth',
         'MIN_ADX': 19,
         'MIN_RELATIVE_VOLUME': 0.07,
@@ -192,7 +189,7 @@ COIN_WEIGHTS = {
             'vol_spike': 1
         }
     },
-    'AVAX': {  # High-vol: Scaling - lowered ADX to 20, rel vol to 0.2 for volume
+    'AVAX': {
         'category': 'high_vol',
         'MIN_ADX': 20,
         'MIN_RELATIVE_VOLUME': 0.2,
