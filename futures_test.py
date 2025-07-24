@@ -85,7 +85,12 @@ def log_trade_to_db(symbol, side, qty, entry_price, exit_price, pnl, result, ent
 # --- Symbol & Market Helpers ---
 def fetch_symbols():
     markets = exchange.load_markets()
-    return [s['symbol'] for s in markets if '/USDT' in s and 'PERP' in s and '1000' not in s and 'DOWN' not in s and 'UP' not in s]
+    return [
+        symbol for symbol in markets
+        if '/USDT' in symbol and 'PERP' in symbol and
+           '1000' not in symbol and 'DOWN' not in symbol and 'UP' not in symbol
+    ]
+
 
 def fetch_ohlcv(symbol):
     try:
@@ -206,6 +211,7 @@ def main():
     send_telegram("🤖 Breakout bot scanning for trades...")
 
     symbols = fetch_symbols()
+    print("Sample symbols:", symbols[:5])
     logger.info(f"{len(symbols)} symbols loaded.")
 
     trades_executed = 0
