@@ -1,4 +1,4 @@
-# Full upgraded futures trading bot with SL, TP, trailing stop, multi-timeframe filter, Telegram, SQLite logging
+# Full upgraded futures trading bot with cycle summary every 20 loops and global stats
 
 import ccxt
 import os
@@ -23,9 +23,10 @@ TRAILING_SL_PCT = 0.015
 MAX_HOLD_MINUTES = 30
 MAX_TRADES = 2
 TRADE_COOLDOWN_MINUTES = 30
-DRY_RUN = False  # Set True for simulation
+DRY_RUN = False
 
 load_dotenv()
+
 # === Exchange Setup ===
 exchange = ccxt.binanceusdm({
     'apiKey': os.getenv("BINANCE_API_KEY_REAL"),
@@ -56,6 +57,7 @@ def send_telegram(message):
         requests.post(url, json=payload, timeout=3)
     except Exception as e:
         logger.error(f"Error al enviar a Telegram: {e}")
+
 # === SQLite Setup ===
 db_path = os.path.expanduser("~/hobbies/breakout_trades.db")
 cooldowns = {}
@@ -92,22 +94,15 @@ def log_trade_to_db(symbol, side, qty, entry_price, exit_price, pnl, result, ent
 def fetch_symbols():
     markets = exchange.load_markets(True)
     symbols = []
-
     for symbol, meta in markets.items():
-        if (
-            meta.get('contract') and
-            meta.get('linear') and
-            meta.get('expiry') is None
-        ):
+        if meta.get('contract') and meta.get('linear') and meta.get('expiry') is None:
             vol = float(meta.get('info', {}).get('quoteVolume', 0))
             if vol > 0:
                 symbols.append((symbol, vol))
-
     symbols.sort(key=lambda x: x[1], reverse=True)
     top_symbols = [s[0] for s in symbols[:30]]
-    print(f"🔁 Fetched {len(top_symbols)} symbols:", top_symbols[:5])  # TEMP DEBUG
+    print(f"🔁 Fetched {len(top_symbols)} symbols:", top_symbols[:5])
     return top_symbols
-
 
 def fetch_ohlcv(symbol, timeframe='5m'):
     try:
@@ -135,7 +130,6 @@ def monitor_trade(symbol, entry_price, quantity):
     logger.info(f"⏱️ Monitoring {symbol}...")
     entry_time = datetime.utcnow()
     peak_price = entry_price
-
     while True:
         time.sleep(60)
         try:
@@ -143,10 +137,8 @@ def monitor_trade(symbol, entry_price, quantity):
             current_price = ticker['last']
             if current_price > peak_price:
                 peak_price = current_price
-
             change_pct = (current_price - entry_price) / entry_price
             drop_from_peak = (current_price - peak_price) / peak_price
-
             result = None
             if change_pct >= TP_PCT:
                 result = "TP"
@@ -156,7 +148,6 @@ def monitor_trade(symbol, entry_price, quantity):
                 result = "Trailing SL"
             elif (datetime.utcnow() - entry_time).seconds > MAX_HOLD_MINUTES * 60:
                 result = "Timeout"
-
             if result:
                 if not DRY_RUN:
                     exchange.create_market_sell_order(symbol, quantity)
@@ -165,7 +156,6 @@ def monitor_trade(symbol, entry_price, quantity):
                 log_trade_to_db(symbol, "LONG", quantity, entry_price, current_price, pnl, result, entry_time, exit_time)
                 send_telegram(f"📉 TRADE CLOSED ({result}) {symbol} PnL: ${pnl:.2f}")
                 break
-
             logger.info(f"[{symbol}] Δ: {change_pct:.4f}, Peak drop: {drop_from_peak:.4f}")
         except Exception as e:
             logger.error(f"[MONITOR ERROR] {symbol}: {e}")
@@ -175,7 +165,6 @@ def open_trade(symbol, leverage=10):
     try:
         if symbol in cooldowns and (datetime.utcnow() - cooldowns[symbol]).seconds < TRADE_COOLDOWN_MINUTES * 60:
             return False
-
         exchange.set_leverage(leverage, symbol)
         balance = exchange.fetch_balance()
         usdt_amount = balance['total']['USDT'] * 0.01
@@ -183,10 +172,8 @@ def open_trade(symbol, leverage=10):
         quantity = round(max(usdt_amount, MIN_NOTIONAL) / price, 3)
         if quantity <= 0:
             return False
-
         if not DRY_RUN:
             exchange.create_market_buy_order(symbol, quantity)
-
         cooldowns[symbol] = datetime.utcnow()
         send_telegram(f"✅ TRADE OPENED {symbol} | Qty: {quantity} | Price: {price:.4f}")
         monitor_trade(symbol, price, quantity)
@@ -207,9 +194,13 @@ def report_pnl():
         send_telegram(f"📊 Total PnL: ${df['pnl'].sum():.2f} | Trades: {len(df)}")
 
 # === Main Loop ===
+global_cycle = 0
+global_stats = {"scanned": 0, "signals": 0, "trades": 0, "skipped": 0}
+
 def main():
     init_db()
     send_telegram("🤖 Upgraded Futures Bot activated.")
+    global global_cycle, global_stats
     while True:
         if Path("stop_bot.txt").exists():
             send_telegram("🛑 Manual stop triggered.")
@@ -221,7 +212,6 @@ def main():
             total_scanned = 0
             signals_found = 0
             skipped_due_to_rsi = 0
-
             for symbol in symbols:
                 print(f"🔍 Checking {symbol}")
                 if trades_executed >= MAX_TRADES:
@@ -231,14 +221,12 @@ def main():
                 if df is None or df_1h is None:
                     logger.warning(f"⚠️ Skipping {symbol} due to missing OHLCV")
                     continue
-
                 rsi_1h = RSIIndicator(df_1h['close'], window=14).rsi().iloc[-1]
                 total_scanned += 1
                 if rsi_1h < 50:
                     skipped_due_to_rsi += 1
                     logger.info(f"❌ {symbol} skipped (1h RSI too low: {rsi_1h:.2f})")
                     continue
-
                 if check_breakout_conditions(df):
                     signals_found += 1
                     print(f"✅ Breakout detected on {symbol}")
@@ -248,25 +236,29 @@ def main():
                         logger.info(f"✅ Trade executed on {symbol}")
                 else:
                     logger.info(f"⬛ No breakout signal for {symbol}")
-
-            summary = (
-                f"📊 Cycle Summary\n"
-                f"Scanned: {total_scanned} symbols\n"
-                f"Signals found: {signals_found}\n"
-                f"Trades executed: {trades_executed}\n"
-                f"Skipped (low RSI): {skipped_due_to_rsi}\n"
-                f"🕒 Time: {datetime.utcnow().strftime('%H:%M:%S')} UTC"
-            )
-            print(summary)
-            send_telegram(summary)
+            global_cycle += 1
+            global_stats["scanned"] += total_scanned
+            global_stats["signals"] += signals_found
+            global_stats["trades"] += trades_executed
+            global_stats["skipped"] += skipped_due_to_rsi
+            print(f"📊 Cycle {global_cycle} Summary\nScanned: {total_scanned}\nSignals: {signals_found}\nTrades: {trades_executed}\nSkipped: {skipped_due_to_rsi}")
+            if global_cycle % 20 == 0:
+                summary = (
+                    f"📊 [Bot Report Every 20 Cycles]\n"
+                    f"Total cycles: {global_cycle}\n"
+                    f"Total symbols scanned: {global_stats['scanned']}\n"
+                    f"Total signals found: {global_stats['signals']}\n"
+                    f"Trades executed: {global_stats['trades']}\n"
+                    f"Skipped (low RSI): {global_stats['skipped']}\n"
+                    f"Last report: {datetime.utcnow().strftime('%H:%M:%S')} UTC"
+                )
+                send_telegram(summary)
             logger.info("🛌 Sleeping for 5 min...")
             time.sleep(5 * 60)
-
         except Exception as e:
             logger.exception("💥 Error in main loop")
             send_telegram(f"❌ Error in main loop:\n{e}")
             time.sleep(30)
-
 
 if __name__ == "__main__":
     main()
