@@ -89,12 +89,13 @@ def fetch_symbols():
         symbol for symbol, meta in markets.items()
         if meta.get('contract') is True
         and meta.get('future') is True
+        and meta.get('info', {}).get('contractType') == 'PERPETUAL'
         and '/USDT' in symbol
-        and symbol.endswith(':USDT')
         and '1000' not in symbol
         and 'DOWN' not in symbol
         and 'UP' not in symbol
     ]
+
 
 
 def fetch_ohlcv(symbol):
