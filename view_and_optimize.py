@@ -15,7 +15,7 @@ import optuna
 import joblib
 import concurrent.futures
 import logging
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt  # Commented out to avoid GUI issues
 import os
 
 DB_NAME = "trading_real.db"
@@ -526,11 +526,16 @@ def simulate_backtest(df, grid, temp_weights, ml_probs, symbol):
     max_drawdown = drawdown.max() * 100
 
     # Plot equity curve for visualization (optional, comment if not needed)
-    # plt.figure(figsize=(10, 5))
-    # plt.plot(equity_curve)
-    # plt.title(f"Equity Curve for {symbol}")
-    # plt.savefig(f"{symbol.replace('/', '_')}_equity_curve.png")
-    # plt.close()
+    # To fix FileNotFoundError and GUI warning, disable plotting or save to a valid path
+    # try:
+    #     plt.figure(figsize=(10, 5))
+    #     plt.plot(equity_curve)
+    #     plt.title(f"Equity Curve for {symbol}")
+    #     safe_symbol = symbol.replace('/', '_')
+    #     plt.savefig(f"{safe_symbol}_equity_curve.png")
+    #     plt.close()
+    # except Exception as e:
+    #     logger.warning(f"Plotting failed for {symbol}: {e}")
 
     return winrate, profit_factor, max_drawdown, num_trades
 
