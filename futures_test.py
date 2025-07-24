@@ -86,9 +86,13 @@ def log_trade_to_db(symbol, side, qty, entry_price, exit_price, pnl, result, ent
 def fetch_symbols():
     markets = exchange.load_markets()
     return [
-        symbol for symbol in markets
-        if '/USDT' in symbol and 'PERP' in symbol and
-           '1000' not in symbol and 'DOWN' not in symbol and 'UP' not in symbol
+        symbol for symbol, meta in markets.items()
+        if meta.get('contract') is True
+        and meta.get('future') is True
+        and '/USDT' in symbol
+        and '1000' not in symbol
+        and 'DOWN' not in symbol
+        and 'UP' not in symbol
     ]
 
 
