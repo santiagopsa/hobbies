@@ -13,6 +13,7 @@ from ta.momentum import RSIIndicator
 from ta.trend import MACD
 from datetime import datetime
 from pathlib import Path
+from dotenv import load_dotenv
 
 # === Configuration ===
 MIN_NOTIONAL = 10
@@ -24,6 +25,7 @@ MAX_TRADES = 2
 TRADE_COOLDOWN_MINUTES = 30
 DRY_RUN = False  # Set True for simulation
 
+load_dotenv()
 # === Exchange Setup ===
 exchange = ccxt.binanceusdm({
     'apiKey': os.getenv("BINANCE_API_KEY_REAL"),
