@@ -19,15 +19,13 @@ MAX_HOLD_MINUTES = 30      # Timeout exit
 MAX_TRADES = 2             # Max trades per run
 
 # --- Exchange (Binance Futures) ---
-exchange = ccxt.binance({
+exchange = ccxt.binanceusdm({
     'apiKey': os.getenv("BINANCE_API_KEY_REAL"),
     'secret': os.getenv("BINANCE_SECRET_KEY_REAL"),
     'enableRateLimit': True,
-    'options': {
-        'defaultType': 'future',  # still correct
-        'adjustForTimeDifference': True
-    }
+    'options': {'adjustForTimeDifference': True}
 })
+
 
 # --- Logging Setup ---
 log_path = os.path.expanduser("~/hobbies/breakout_trades.log")
@@ -87,16 +85,14 @@ def log_trade_to_db(symbol, side, qty, entry_price, exit_price, pnl, result, ent
 
 # --- Symbol & Market Helpers ---
 def fetch_symbols():
-    markets = exchange.load_markets()
+    markets = exchange.load_markets(True)
     symbols = []
 
     for symbol, meta in markets.items():
         if (
-            meta.get('future') is True and
             meta.get('contract') is True and
             meta.get('linear') is True and
-            meta.get('expiry') is None and
-            symbol.endswith(":USDT")
+            meta.get('expiry') is None
         ):
             symbols.append(symbol)
 
