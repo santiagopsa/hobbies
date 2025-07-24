@@ -87,16 +87,22 @@ def log_trade_to_db(symbol, side, qty, entry_price, exit_price, pnl, result, ent
 def fetch_symbols():
     markets = exchange.load_markets(True)
     symbols = []
+
     for symbol, meta in markets.items():
-        if meta.get('contract') and meta.get('linear') and meta.get('expiry') is None:
-            try:
-                vol = float(meta.get('info', {}).get('quoteVolume', 0))
-                if vol > 0:
-                    symbols.append((symbol, vol))
-            except:
-                continue
+        if (
+            meta.get('contract') and
+            meta.get('linear') and
+            meta.get('expiry') is None
+        ):
+            vol = float(meta.get('info', {}).get('quoteVolume', 0))
+            if vol > 0:
+                symbols.append((symbol, vol))
+
     symbols.sort(key=lambda x: x[1], reverse=True)
-    return [s[0] for s in symbols[:30]]
+    top_symbols = [s[0] for s in symbols[:30]]
+    print(f"🔁 Fetched {len(top_symbols)} symbols:", top_symbols[:5])  # TEMP DEBUG
+    return top_symbols
+
 
 def fetch_ohlcv(symbol, timeframe='5m'):
     try:
