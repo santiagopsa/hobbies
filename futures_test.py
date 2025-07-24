@@ -204,27 +204,58 @@ def main():
             send_telegram("🛑 Manual stop triggered.")
             break
         try:
+            logger.info("🚀 Starting new scan...")
             symbols = fetch_symbols()
             trades_executed = 0
+            total_scanned = 0
+            signals_found = 0
+            skipped_due_to_rsi = 0
+
             for symbol in symbols:
+                print(f"🔍 Checking {symbol}")
                 if trades_executed >= MAX_TRADES:
                     break
                 df = fetch_ohlcv(symbol)
                 df_1h = fetch_ohlcv(symbol, timeframe='1h')
                 if df is None or df_1h is None:
+                    logger.warning(f"⚠️ Skipping {symbol} due to missing OHLCV")
                     continue
+
                 rsi_1h = RSIIndicator(df_1h['close'], window=14).rsi().iloc[-1]
+                total_scanned += 1
                 if rsi_1h < 50:
+                    skipped_due_to_rsi += 1
+                    logger.info(f"❌ {symbol} skipped (1h RSI too low: {rsi_1h:.2f})")
                     continue
+
                 if check_breakout_conditions(df):
+                    signals_found += 1
+                    print(f"✅ Breakout detected on {symbol}")
+                    send_telegram(f"🚨 Breakout signal: {symbol}")
                     if open_trade(symbol):
                         trades_executed += 1
-            send_telegram(f"🔍 Scan done. Trades: {trades_executed}")
+                        logger.info(f"✅ Trade executed on {symbol}")
+                else:
+                    logger.info(f"⬛ No breakout signal for {symbol}")
+
+            summary = (
+                f"📊 Cycle Summary\n"
+                f"Scanned: {total_scanned} symbols\n"
+                f"Signals found: {signals_found}\n"
+                f"Trades executed: {trades_executed}\n"
+                f"Skipped (low RSI): {skipped_due_to_rsi}\n"
+                f"🕒 Time: {datetime.utcnow().strftime('%H:%M:%S')} UTC"
+            )
+            print(summary)
+            send_telegram(summary)
+            logger.info("🛌 Sleeping for 5 min...")
             time.sleep(5 * 60)
+
         except Exception as e:
-            logger.exception("Main loop error")
-            send_telegram(f"❌ Error: {e}")
+            logger.exception("💥 Error in main loop")
+            send_telegram(f"❌ Error in main loop:\n{e}")
             time.sleep(30)
+
 
 if __name__ == "__main__":
     main()
