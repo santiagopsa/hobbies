@@ -4,20 +4,16 @@
 """
 Hybrid Crypto Spot Trader (Binance via ccxt)
 
-Key features:
-- Startup cleanup: sells leftover non-USDT balances, ties to open trades when possible,
-  sends Telegram, captures exit features, runs analysis/learning.
-- BUY: executes with hybrid scoring; records rich features; Telegram summary + JSON bundle.
-- SELL: trailing stop; records rich features; Telegram summary + JSON bundle.
-- Analysis: PnL, duration, entry vs exit indicators; gentle per-symbol learning nudges.
-- Observability: console + file logs, cycle summaries, and status.json snapshots.
+Características:
+- Startup cleanup: vende saldos no-USDT, cierra BUYs abiertos asociados, guarda SELL,
+  y captura features + análisis si corresponde.
+- Reconciliación: cierra en BD BUYs abiertos sin balance real (status='closed_orphan').
+- BUY: decisión híbrida (tendencia + volumen relativo + RSI/ADX), sizing por confianza,
+  captura de features y envío por Telegram (mensaje + JSON).
+- SELL: trailing stop (dinámico por ATR), captura de features y análisis + aprendizaje suave.
+- Observabilidad: logs a archivo/console, resumen por ciclo y status.json.
 
-ENV VARS:
-- BINANCE_API_KEY_REAL, BINANCE_SECRET_KEY_REAL
-- TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  (optional but recommended)
-- LOG_LEVEL (e.g., INFO, DEBUG)
-
-DISCLAIMER: This is example code. Trading crypto is risky. Use at your own risk.
+DISCLAIMER: Código de ejemplo; operar cripto implica riesgo. Úsalo bajo tu responsabilidad.
 """
 
 import os
@@ -45,32 +41,32 @@ load_dotenv()
 DB_NAME = "trading_real.db"
 LOG_PATH = os.path.expanduser("~/hobbies/trading.log")
 
-# Scan list (USDT pairs)
+# Lista a escanear (pares USDT)
 TOP_COINS = ['BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'DOGE', 'TON', 'ADA', 'TRX', 'AVAX']
 SELECTED_CRYPTOS = [f"{c}/USDT" for c in TOP_COINS]
 
-# Risk / execution
-MIN_NOTIONAL = 10.0           # minimum USDT per order
+# Ejecución / riesgo
+MIN_NOTIONAL = 10.0           # mínimo USDT por orden
 MAX_OPEN_TRADES = 10
-RESERVE_USDT = 150.0          # keep aside
+RESERVE_USDT = 150.0          # reserva de seguridad
 
-# Decision defaults (nudged via learning per symbol)
+# Parámetros de decisión (ajustables vía aprendizaje)
 DECISION_TIMEFRAME = "1h"
 SPREAD_MAX_PCT_DEFAULT = 0.005          # <= 0.5% spread
-MIN_QUOTE_VOL_24H_DEFAULT = 5_000_000   # safer 24h liquidity (USDT)
+MIN_QUOTE_VOL_24H_DEFAULT = 5_000_000   # 24h quote volume mínimo (USDT)
 ADX_MIN_DEFAULT = 20
 RSI_MIN_DEFAULT, RSI_MAX_DEFAULT = 45, 72
 RVOL_BASE_DEFAULT = 1.5
 
-# Learning bounds
+# Rangos de aprendizaje
 ADX_MIN_RANGE = (15, 35)
 RSI_MAX_RANGE = (60, 80)
 RVOL_BASE_RANGE = (1.2, 3.0)
 
 # Sizing
-RISK_FRACTION = 0.05  # 5% of USDT per signal (modulated by confidence)
+RISK_FRACTION = 0.05  # 5% del USDT por señal (modulado por confianza)
 
-# Optional Telegram
+# Telegram (opcional pero recomendado)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -98,7 +94,9 @@ def check_log_rotation(max_size_mb=1):
     except Exception:
         pass
 
+# =========================
 # DB schema
+# =========================
 def initialize_db():
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
@@ -118,7 +116,7 @@ def initialize_db():
             atr REAL,
             score REAL,
             confidence INTEGER,
-            status TEXT DEFAULT 'open'
+            status TEXT DEFAULT 'open'          -- 'open' | 'closed' | 'closed_orphan'
         )
     """)
 
@@ -163,7 +161,9 @@ def initialize_db():
 
 initialize_db()
 
+# =========================
 # Exchange
+# =========================
 exchange = ccxt.binance({
     'apiKey': os.getenv("BINANCE_API_KEY_REAL"),
     'secret': os.getenv("BINANCE_SECRET_KEY_REAL"),
@@ -194,7 +194,7 @@ def send_telegram_document(file_path: str, caption: str = ""):
             requests.post(url, files=files, data=data, timeout=60)
     except Exception as e:
         logger.error(f"Telegram sendDocument error: {e}")
-        # Fallback to inline snippet
+        # Fallback a snippet
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 raw = f.read()
@@ -204,7 +204,7 @@ def send_telegram_document(file_path: str, caption: str = ""):
             logger.error(f"Telegram fallback snippet error: {e2}")
 
 # =========================
-# Utilities
+# Utils
 # =========================
 def fetch_price(symbol: str):
     try:
@@ -287,7 +287,7 @@ def clamp(val, lo, hi):
     return max(lo, min(hi, val))
 
 # =========================
-# Indicator prep
+# Indicadores / Features
 # =========================
 def compute_timeframe_features(df: pd.DataFrame, label: str):
     features = {}
@@ -524,7 +524,7 @@ def set_learn_params(symbol_base: str, rsi_min: float, rsi_max: float, adx_min: 
     conn.close()
 
 # =========================
-# Decision rule (hybrid)
+# Decisión híbrida
 # =========================
 def fetch_and_prepare_data_hybrid(symbol: str, limit: int = 250, timeframe: str = DECISION_TIMEFRAME):
     ohlcv = fetch_ohlcv_with_retry(symbol, timeframe, limit=limit)
@@ -561,7 +561,7 @@ def hybrid_decision(symbol: str):
     RSI_MIN = lp["rsi_min"]; RSI_MAX = lp["rsi_max"]
     ADX_MIN = lp["adx_min"]; RVOL_BASE = lp["rvol_base"]
 
-    # Liquidity guard
+    # Liquidez (24h quote volume)
     try:
         t = exchange.fetch_ticker(symbol)
         qvol = float(t.get('quoteVolume', 0.0) or 0.0)
@@ -570,7 +570,7 @@ def hybrid_decision(symbol: str):
     except Exception as e:
         return "hold", 50, 0.0, f"ticker error: {e}"
 
-    # Spread guard
+    # Spread
     try:
         ob = exchange.fetch_order_book(symbol, limit=50)
         if percent_spread(ob) > SPREAD_MAX_PCT_DEFAULT:
@@ -584,11 +584,11 @@ def hybrid_decision(symbol: str):
 
     row = df.iloc[-1]
 
-    # Uptrend lane
+    # Carril alcista
     if not (row['EMA20'] > row['EMA50'] and row['close'] > row['EMA20']):
         return "hold", 55, 1.0, "not in uptrend lane (EMA20<=EMA50 or close<=EMA20)"
 
-    # Flexible score
+    # Score flexible
     score = 0.0
     notes = []
 
@@ -613,7 +613,7 @@ def hybrid_decision(symbol: str):
     if vol_slope > 0: score += 0.5
 
     if score >= 4.0:
-        conf = int(min(92, 70 + (score - 4.0)*5))  # 70..92
+        conf = int(min(92, 70 + (score - 4.0)*5))  # ~70..92
         msg = f"score={score:.1f} | " + ", ".join(notes) + f" | RSI={rsi:.1f} ADX={adx:.1f}"
         return "buy", conf, score, msg
 
@@ -623,7 +623,7 @@ def hybrid_decision(symbol: str):
     return "hold", 50, score, f"weak score={score:.1f}"
 
 # =========================
-# Feature persistence & Telegram bundle
+# Persistencia de features & Telegram bundle
 # =========================
 def save_trade_features(trade_id: str, symbol: str, side: str, features: dict):
     conn = sqlite3.connect(DB_NAME)
@@ -672,7 +672,7 @@ def send_feature_bundle_telegram(trade_id: str, symbol: str, side: str, features
         logger.error(f"send_feature_bundle_telegram error: {e}")
 
 # =========================
-# Execution & trailing
+# Ejecución & trailing
 # =========================
 def execute_order_buy(symbol: str, amount: float, signals: dict):
     try:
@@ -697,10 +697,10 @@ def execute_order_buy(symbol: str, amount: float, signals: dict):
         conn.commit()
         conn.close()
 
-        # BUY summary (you asked for Telegram on capture)
+        # BUY mensaje (captura)
         send_telegram_message(f"✅ BUY {symbol}\nPrice: {price}\nAmount: {filled}\nConf: {signals.get('confidence', 0)}%\nScore: {signals.get('score', 0):.1f}")
 
-        # Entry features
+        # Features de entrada
         features = build_rich_features(symbol)
         save_trade_features(trade_id, symbol, 'entry', features)
         send_feature_bundle_telegram(trade_id, symbol, 'entry', features)
@@ -730,12 +730,12 @@ def sell_symbol(symbol: str, amount: float, trade_id: str):
 
         send_telegram_message(f"✅ SELL {symbol}\nPrice: {sell_price}\nAmount: {amount}")
 
-        # Exit features
+        # Features de salida
         features_exit = build_rich_features(symbol)
         save_trade_features(trade_id, symbol, 'exit', features_exit)
         send_feature_bundle_telegram(trade_id, symbol, 'exit', features_exit)
 
-        # Analyze + learn
+        # Análisis + aprendizaje
         analyze_and_learn(trade_id, sell_price)
 
         logger.info(f"Sold {symbol} @ {sell_price} (trade {trade_id})")
@@ -749,7 +749,7 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
             atr_pct = (atr_abs / purchase_price) * 100 if purchase_price > 0 and atr_abs else 2.0
             trail_pct = max(1.5 * atr_pct, 2.0)
             trail_pct = min(trail_pct, 8.0)
-            take_profit = purchase_price * 1.05  # optional immediate TP
+            take_profit = purchase_price * 1.05  # TP opcional
 
             while True:
                 price = fetch_price(symbol)
@@ -777,7 +777,7 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
     threading.Thread(target=loop, daemon=True).start()
 
 # =========================
-# Post-trade analysis & learning
+# Análisis post-trade & aprendizaje
 # =========================
 def fetch_trade_legs(trade_id: str):
     conn = sqlite3.connect(DB_NAME)
@@ -852,7 +852,7 @@ def analyze_and_learn(trade_id: str, sell_price: float = None):
             },
         }
 
-        # Gentle learning
+        # Aprendizaje suave
         base = symbol.split('/')[0]
         lp = get_learn_params(base)
         rsi_min = lp["rsi_min"]; rsi_max = lp["rsi_max"]
@@ -900,7 +900,7 @@ def analyze_and_learn(trade_id: str, sell_price: float = None):
         if adjustments:
             set_learn_params(base, rsi_min, rsi_max, adx_min, rvol_base)
 
-        # Save analysis
+        # Guardar análisis
         conn = sqlite3.connect(DB_NAME)
         cur = conn.cursor()
         cur.execute("""
@@ -917,7 +917,7 @@ def analyze_and_learn(trade_id: str, sell_price: float = None):
         conn.commit()
         conn.close()
 
-        # Telegram summary + JSON doc
+        # Telegram
         outcome = "WIN ✅" if win else "LOSS ❌"
         lines = [
             f"📊 *Trade Analysis* {outcome}  {symbol}",
@@ -950,27 +950,27 @@ def analyze_and_learn(trade_id: str, sell_price: float = None):
 def size_position(price: float, usdt_balance: float, confidence: int) -> float:
     if not price or price <= 0:
         return 0.0
-    conf_mult = (confidence - 50) / 50.0  # 0..0.84 roughly
+    conf_mult = (confidence - 50) / 50.0  # 0..0.84 aprox
     conf_mult = max(0.0, min(conf_mult, 0.84))
     budget = usdt_balance * (RISK_FRACTION * (0.6 + 0.4 * conf_mult))
     amount = max(MIN_NOTIONAL / price, budget / price)
     return amount
 
 # =========================
-# Main trading step (+ reporting)
+# Step de trading + reporte
 # =========================
 buy_lock = threading.Lock()
 
 def trade_once_with_report(symbol: str):
     report = {"symbol": symbol, "action": "hold", "confidence": 50, "score": 0.0, "note": "", "executed": False}
     try:
-        # Skip if already holding this symbol
+        # Evitar duplicados si ya hay posición
         if has_open_position(symbol):
             report["note"] = "already holding (open position exists)"
             logger.info(f"{symbol}: {report['note']}")
             return report
 
-        # Slots
+        # Slots disponibles
         open_trades = get_open_trades_count()
         if open_trades >= MAX_OPEN_TRADES:
             report["note"] = "max open trades"
@@ -984,7 +984,7 @@ def trade_once_with_report(symbol: str):
             logger.info(report["note"])
             return report
 
-        # Decision
+        # Decisión
         action, conf, score, note = hybrid_decision(symbol)
         report.update({"action": action, "confidence": conf, "score": float(score), "note": note})
         logger.info(f"{symbol}: decision={action} conf={conf} score={score:.1f} note={note}")
@@ -992,7 +992,7 @@ def trade_once_with_report(symbol: str):
         if action != "buy":
             return report
 
-        # Execute under global lock
+        # Ejecutar bajo lock global
         with buy_lock:
             open_trades = get_open_trades_count()
             if open_trades >= MAX_OPEN_TRADES:
@@ -1072,16 +1072,69 @@ def write_status_json(decisions: list, path: str = "status.json"):
         logger.warning(f"write_status_json error: {e}")
 
 # =========================
+# Reconciliación de BUYs huérfanos
+# =========================
+def reconcile_orphan_open_buys():
+    """
+    Cierra en BD cualquier BUY 'open' sin balance real del activo.
+    NO inserta SELL ficticio; marca status='closed_orphan'.
+    Envía Telegram para transparencia.
+    """
+    try:
+        try:
+            exchange.load_markets()
+        except Exception as e:
+            logger.warning(f"load_markets warn (reconcile): {e}")
+
+        balances = exchange.fetch_balance() or {}
+        free = balances.get("free", {}) or {}
+
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT symbol, trade_id, amount
+            FROM transactions
+            WHERE side='buy' AND status='open'
+        """)
+        rows = cur.fetchall()
+
+        closed = 0
+        for symbol, trade_id, buy_amt in rows:
+            base = symbol.split('/')[0]
+            held = float(free.get(base, 0) or 0.0)
+
+            # umbral de polvo
+            min_amt = None
+            try:
+                if symbol in getattr(exchange, "markets", {}):
+                    min_amt = (exchange.markets[symbol].get("limits", {}) or {}).get("amount", {}).get("min", None)
+            except Exception:
+                pass
+            dust_eps = float(min_amt) if min_amt else 1e-10
+
+            if held <= dust_eps:
+                cur.execute("UPDATE transactions SET status='closed_orphan' WHERE trade_id=? AND side='buy'", (trade_id,))
+                conn.commit()
+                closed += 1
+                send_telegram_message(f"🧹 *Startup Reconcile*: Cerrado en BD trade `{trade_id}` ({symbol}) por falta de balance (status=closed_orphan)")
+                logger.info(f"Reconciled orphan BUY -> closed_orphan: {trade_id} {symbol}")
+
+        conn.close()
+        if closed:
+            logger.info(f"Reconcile: {closed} BUYs huérfanos cerrados.")
+    except Exception as e:
+        logger.error(f"reconcile_orphan_open_buys error: {e}", exc_info=True)
+
+# =========================
 # STARTUP CLEANUP
 # =========================
 def startup_cleanup():
     """
-    On boot:
-      - Sell any non-USDT free balances (spot) if value >= MIN_NOTIONAL.
-      - If a DB open BUY exists for that symbol, reuse its trade_id and close it.
-      - Insert SELL leg into `transactions`.
-      - Send Telegram.
-      - Capture EXIT features; if we closed an existing trade, run analyze_and_learn.
+    Al iniciar:
+      - Vende balances libres no-USDT (si value >= MIN_NOTIONAL).
+      - Si hay un BUY 'open' en BD para ese símbolo, reusa su trade_id y lo cierra.
+      - Inserta SELL en `transactions`, envía Telegram, captura exit features y analiza si corresponde.
+      - Finalmente reconcilia BUYs 'open' sin balance marcándolos 'closed_orphan'.
     """
     logger.info("Startup cleanup: closing non-USDT balances and syncing DB states...")
     try:
@@ -1104,7 +1157,7 @@ def startup_cleanup():
                 continue
 
             mkt = exchange.markets[symbol]
-            # min amount (limits)
+            # mínimo de amount
             min_amt = None
             try:
                 min_amt = (mkt.get("limits", {}) or {}).get("amount", {}).get("min", None)
@@ -1119,7 +1172,7 @@ def startup_cleanup():
                 logger.info(f"Skip {symbol}: no price on cleanup")
                 continue
 
-            # honor amount precision
+            # precisión amount
             try:
                 adj_amt = float(exchange.amount_to_precision(symbol, amt))
             except Exception:
@@ -1135,12 +1188,12 @@ def startup_cleanup():
                 continue
 
             try:
-                # sell it
+                # vender
                 order = exchange.create_market_sell_order(symbol, adj_amt)
                 sell_price = order.get("price", px) or px
                 ts = datetime.now(timezone.utc).isoformat()
 
-                # match open buy if exists
+                # buscar BUY abierto
                 cur.execute("""
                     SELECT trade_id FROM transactions
                     WHERE symbol=? AND side='buy' AND status='open'
@@ -1149,13 +1202,13 @@ def startup_cleanup():
                 row = cur.fetchone()
                 trade_id = row[0] if row else f"startup_{asset}"
 
-                # record sell
+                # registrar SELL
                 cur.execute("""
                     INSERT INTO transactions (symbol, side, price, amount, ts, trade_id, status)
                     VALUES (?, 'sell', ?, ?, ?, ?, 'closed')
                 """, (symbol, float(sell_price), float(adj_amt), ts, trade_id))
 
-                # close the buy leg (if any)
+                # cerrar BUY si existía
                 if row:
                     cur.execute("UPDATE transactions SET status='closed' WHERE trade_id=? AND side='buy'", (trade_id,))
 
@@ -1164,11 +1217,11 @@ def startup_cleanup():
                 # Telegram
                 send_telegram_message(f"🔒 *Startup Cleanup*: Vendido `{symbol}` cantidad `{adj_amt}` a `{sell_price}`")
 
-                # capture features
+                # features de salida
                 exit_feats = build_rich_features(symbol)
                 save_trade_features(trade_id, symbol, 'exit', exit_feats)
 
-                # analyze if matched
+                # análisis si tenía BUY relacionado
                 if row:
                     analyze_and_learn(trade_id, sell_price)
 
@@ -1178,6 +1231,10 @@ def startup_cleanup():
                 logger.error(f"Error selling {symbol} in startup_cleanup: {e}", exc_info=True)
 
         conn.close()
+
+        # reconciliar BUYs abiertos sin balance
+        reconcile_orphan_open_buys()
+
         logger.info("Startup cleanup done.")
     except Exception as e:
         logger.error(f"startup_cleanup fatal: {e}", exc_info=True)
@@ -1188,13 +1245,13 @@ def startup_cleanup():
 if __name__ == "__main__":
     logger.info("Starting hybrid trader...")
     try:
-        # Ensure markets loaded (needed for limits/precision)
+        # Cargar mercados (límites/precisión)
         try:
             exchange.load_markets()
         except Exception as e:
             logger.warning(f"load_markets warning: {e}")
 
-        # Clean up leftover balances & close DB open buys if possible
+        # Limpieza inicial + reconciliación
         startup_cleanup()
 
         while True:
@@ -1203,10 +1260,10 @@ if __name__ == "__main__":
             for sym in SELECTED_CRYPTOS:
                 report = trade_once_with_report(sym)
                 cycle_decisions.append(report)
-                time.sleep(1)   # light pacing to avoid bursts
+                time.sleep(1)   # pacing
             print_cycle_summary(cycle_decisions)
-            write_status_json(cycle_decisions)   # view current state
-            time.sleep(30)      # main cycle delay
+            write_status_json(cycle_decisions)   # snapshot para observar
+            time.sleep(30)      # delay del ciclo
     except (KeyboardInterrupt, SystemExit):
         logger.info("Shutting down gracefully.")
         logging.shutdown()
