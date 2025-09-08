@@ -46,9 +46,9 @@ TOP_COINS = ['BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'DOGE', 'TON', 'ADA', 'TRX', 'AV
 SELECTED_CRYPTOS = [f"{c}/USDT" for c in TOP_COINS]
 
 # Ejecución / riesgo
-MIN_NOTIONAL = 10.0           # mínimo USDT por orden
+MIN_NOTIONAL = 20.0           # mínimo USDT por orden
 MAX_OPEN_TRADES = 10
-RESERVE_USDT = 150.0          # reserva de seguridad
+RESERVE_USDT = 100.0          # reserva de seguridad
 
 # Parámetros de decisión (ajustables vía aprendizaje)
 DECISION_TIMEFRAME = "1h"
