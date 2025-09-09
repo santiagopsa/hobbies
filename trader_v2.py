@@ -34,7 +34,7 @@ SELECTED_CRYPTOS = [f"{c}/USDT" for c in TOP_COINS]
 MIN_NOTIONAL = 8.0
 MAX_OPEN_TRADES = 10
 RESERVE_USDT = 100.0
-RISK_FRACTION = 0.05             # base fraction of USDT per signal (modulated by confidence & controller)
+RISK_FRACTION = 0.12             # base fraction of USDT per signal (modulated by confidence & controller)
 
 # Decision params (default)
 DECISION_TIMEFRAME = "1h"
