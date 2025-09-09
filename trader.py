@@ -46,9 +46,14 @@ TOP_COINS = ['BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'DOGE', 'TON', 'ADA', 'TRX', 'AV
 SELECTED_CRYPTOS = [f"{c}/USDT" for c in TOP_COINS]
 
 # Ejecución / riesgo
-MIN_NOTIONAL = 10.0           # mínimo USDT por orden
+MIN_NOTIONAL = 8.0            # mínimo USDT por orden (exchange)
 MAX_OPEN_TRADES = 10
-RESERVE_USDT = 150.0          # reserva de seguridad
+RESERVE_USDT = 100.0          # reserva de seguridad que no se toca
+
+# Palancas de tamaño
+RISK_FRACTION = 0.10          # antes 0.05 -> sube el tamaño base
+MAX_BALANCE_FRACTION_PER_TRADE = 0.30  # tope duro por trade sobre el disponible
+TACTICAL_MIN_ORDER_USDT = 15.0        # mínimo táctico por orden (además de MIN_NOTIONAL)
 
 # Parámetros de decisión (ajustables vía aprendizaje)
 DECISION_TIMEFRAME = "1h"
@@ -62,9 +67,6 @@ RVOL_BASE_DEFAULT = 1.5
 ADX_MIN_RANGE = (15, 35)
 RSI_MAX_RANGE = (60, 80)
 RVOL_BASE_RANGE = (1.2, 3.0)
-
-# Sizing
-RISK_FRACTION = 0.05  # 5% del USDT por señal (modulado por confianza)
 
 # Telegram (opcional pero recomendado)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -674,8 +676,63 @@ def send_feature_bundle_telegram(trade_id: str, symbol: str, side: str, features
 # =========================
 # Ejecución & trailing
 # =========================
+def clamp_amount_to_market(symbol: str, amount: float, price: float, available_usdt: float) -> float:
+    """
+    Ajusta amount a límites del mercado, precisión y notional.
+    También asegura no pasarse del available_usdt.
+    """
+    if not amount or amount <= 0 or not price or price <= 0:
+        return 0.0
+
+    # No pasarse del available
+    max_by_available = available_usdt / price
+    amount = min(amount, max_by_available)
+
+    try:
+        market = getattr(exchange, "markets", {}).get(symbol, {}) or {}
+        limits = (market.get("limits", {}) or {})
+        min_amt = (limits.get("amount", {}) or {}).get("min", None)
+        max_amt = (limits.get("amount", {}) or {}).get("max", None)
+
+        if min_amt is not None:
+            amount = max(amount, float(min_amt))
+        if max_amt is not None:
+            amount = min(amount, float(max_amt))
+    except Exception:
+        pass
+
+    # Asegurar notional mínimo (exchange)
+    if amount * price < MIN_NOTIONAL:
+        amount = MIN_NOTIONAL / price
+
+    # Mínimo táctico (si hay margen)
+    if amount * price < TACTICAL_MIN_ORDER_USDT and available_usdt >= TACTICAL_MIN_ORDER_USDT:
+        amount = TACTICAL_MIN_ORDER_USDT / price
+
+    # Redondeo a precisión del mercado
+    try:
+        amount = float(exchange.amount_to_precision(symbol, amount))
+    except Exception:
+        pass
+
+    # Post chequeo de available
+    if amount * price > available_usdt:
+        amount = available_usdt / price
+        try:
+            amount = float(exchange.amount_to_precision(symbol, amount))
+        except Exception:
+            pass
+
+    return max(0.0, amount)
+
 def execute_order_buy(symbol: str, amount: float, signals: dict):
     try:
+        # Redondear por si llega sin precisión
+        try:
+            amount = float(exchange.amount_to_precision(symbol, amount))
+        except Exception:
+            pass
+
         order = exchange.create_market_buy_order(symbol, amount)
         price = order.get("price", fetch_price(symbol))
         filled = order.get("filled", amount)
@@ -714,6 +771,12 @@ def execute_order_buy(symbol: str, amount: float, signals: dict):
 def sell_symbol(symbol: str, amount: float, trade_id: str):
     try:
         price_now = fetch_price(symbol)
+        # Precisión de cantidad para vender
+        try:
+            amount = float(exchange.amount_to_precision(symbol, amount))
+        except Exception:
+            pass
+
         order = exchange.create_market_sell_order(symbol, amount)
         sell_price = order.get("price", price_now) or price_now or 0.0
         sell_ts = datetime.now(timezone.utc).isoformat()
@@ -947,13 +1010,31 @@ def analyze_and_learn(trade_id: str, sell_price: float = None):
 # =========================
 # Sizing
 # =========================
-def size_position(price: float, usdt_balance: float, confidence: int) -> float:
-    if not price or price <= 0:
+def size_position(price: float, free_usdt_available: float, confidence: int) -> float:
+    """
+    Calcula amount en base a:
+      - RISK_FRACTION (palanca principal)
+      - Confianza (modula el presupuesto)
+      - Cap MAX_BALANCE_FRACTION_PER_TRADE
+      - Mínimo táctico TACTICAL_MIN_ORDER_USDT
+    Devuelve 'amount' (cantidad de la cripto).
+    """
+    if not price or price <= 0 or free_usdt_available <= 0:
         return 0.0
-    conf_mult = (confidence - 50) / 50.0  # 0..0.84 aprox
-    conf_mult = max(0.0, min(conf_mult, 0.84))
-    budget = usdt_balance * (RISK_FRACTION * (0.6 + 0.4 * conf_mult))
-    amount = max(MIN_NOTIONAL / price, budget / price)
+
+    # 0..1 según confianza (>=50 empieza a subir)
+    conf_mult = clamp((confidence - 50) / 50.0, 0.0, 1.0)
+
+    # Presupuesto base modulado por confianza (lineal)
+    usd_budget = free_usdt_available * RISK_FRACTION * (0.6 + 0.4 * conf_mult)
+
+    # Cap duro por trade sobre el disponible
+    usd_cap = MAX_BALANCE_FRACTION_PER_TRADE * free_usdt_available
+
+    # Mínimo táctico además del MIN_NOTIONAL
+    usd_to_spend = max(TACTICAL_MIN_ORDER_USDT, min(usd_budget, usd_cap, free_usdt_available))
+
+    amount = usd_to_spend / price
     return amount
 
 # =========================
@@ -979,7 +1060,8 @@ def trade_once_with_report(symbol: str):
 
         balances = exchange.fetch_balance()
         usdt = float(balances.get('free', {}).get('USDT', 0.0))
-        if usdt - RESERVE_USDT < MIN_NOTIONAL:
+        available = max(usdt - RESERVE_USDT, 0.0)  # disponible real
+        if available < MIN_NOTIONAL:
             report["note"] = f"insufficient USDT after reserve ({usdt:.2f})"
             logger.info(report["note"])
             return report
@@ -1001,7 +1083,8 @@ def trade_once_with_report(symbol: str):
 
             balances = exchange.fetch_balance()
             usdt = float(balances.get('free', {}).get('USDT', 0.0))
-            if usdt - RESERVE_USDT < MIN_NOTIONAL:
+            available = max(usdt - RESERVE_USDT, 0.0)
+            if available < MIN_NOTIONAL:
                 report["note"] = "insufficient USDT (post-lock)"
                 return report
 
@@ -1014,11 +1097,21 @@ def trade_once_with_report(symbol: str):
             row = df.iloc[-1]
             atr_abs = float(row['ATR']) if pd.notna(row['ATR']) else price * 0.02
 
-            amount = size_position(price, usdt, conf)
+            # Sizing base
+            raw_amount = size_position(price, available, conf)
+
+            # Asegurar límites de mercado, notional, y no pasarse de available
+            amount = clamp_amount_to_market(symbol, raw_amount, price, available)
             trade_val = amount * price
-            if trade_val < MIN_NOTIONAL and trade_val < (usdt - RESERVE_USDT):
+
+            if trade_val < MIN_NOTIONAL:
                 report["note"] = f"trade value {trade_val:.2f} < MIN_NOTIONAL"
                 return report
+
+            # Tope por trade (redundante a nivel USD, pero dejamos validador extra)
+            if trade_val > MAX_BALANCE_FRACTION_PER_TRADE * available:
+                trade_val = MAX_BALANCE_FRACTION_PER_TRADE * available
+                amount = clamp_amount_to_market(symbol, trade_val / price, price, available)
 
             order = execute_order_buy(symbol, amount, {
                 'adx': float(row['ADX']) if pd.notna(row['ADX']) else None,
