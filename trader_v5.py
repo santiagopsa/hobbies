@@ -20,6 +20,7 @@ import ccxt, numpy as np, pandas as pd, pandas_ta as ta, requests
 from dotenv import load_dotenv
 from scipy.stats import linregress
 from typing import Tuple
+import math
 
 # =========================
 # Config & initialization
@@ -239,6 +240,42 @@ exchange = ccxt.binance({
     'enableRateLimit': True,
     'options': {'defaultType': 'spot', 'adjustForTimeDifference': True}
 })
+
+
+# =========================
+# Cleanup helpers
+# =========================
+
+def _bn_filters(symbol):
+    m = exchange.markets.get(symbol, {})
+    step = min_qty = min_notional = None
+    try:
+        for f in m.get('info', {}).get('filters', []):
+            if f.get('filterType') == 'LOT_SIZE':
+                step = float(f['stepSize'])
+                min_qty = float(f['minQty'])
+            # Binance may use NOTIONAL now (or MIN_NOTIONAL on older symbols)
+            if f.get('filterType') in ('NOTIONAL', 'MIN_NOTIONAL'):
+                min_notional = float(f.get('minNotional') or f.get('minNotional', 0))
+    except Exception:
+        pass
+    return step, min_qty, min_notional
+
+def _floor_to_step(x, step):
+    if not step or step <= 0: 
+        return x
+    return math.floor(x / step) * step
+
+def _prepare_sell_amount(symbol, desired_amt, px):
+    step, min_qty, min_notional = _bn_filters(symbol)
+    amt = desired_amt * 0.999  # safety buffer
+    if step: amt = _floor_to_step(amt, step)
+    if min_qty and amt < min_qty: 
+        return 0.0, "amount < minQty"
+    if min_notional and px and (amt * px) < min_notional:
+        return 0.0, "notional < minNotional"
+    return amt, None
+
 
 # =========================
 # Telegram helpers
@@ -1537,16 +1574,54 @@ def reconcile_orphan_open_buys():
     except Exception as e:
         logger.error(f"reconcile_orphan_open_buys error: {e}", exc_info=True)
 
+import math  # add this at the top with other imports
+
 # =========================
-# STARTUP CLEANUP
+# Binance filter helpers
+# =========================
+def _bn_filters(symbol):
+    m = exchange.markets.get(symbol, {})
+    step = min_qty = min_notional = None
+    try:
+        for f in m.get('info', {}).get('filters', []):
+            if f.get('filterType') == 'LOT_SIZE':
+                step = float(f['stepSize'])
+                min_qty = float(f['minQty'])
+            if f.get('filterType') in ('NOTIONAL', 'MIN_NOTIONAL'):
+                min_notional = float(f.get('minNotional') or f.get('minNotional', 0))
+    except Exception:
+        pass
+    return step, min_qty, min_notional
+
+def _floor_to_step(x, step):
+    if not step or step <= 0: 
+        return x
+    return math.floor(x / step) * step
+
+def _prepare_sell_amount(symbol, desired_amt, px):
+    step, min_qty, min_notional = _bn_filters(symbol)
+    amt = desired_amt * 0.999  # safety buffer
+    if step:
+        amt = _floor_to_step(amt, step)
+    if min_qty and amt < min_qty:
+        return 0.0, "amount < minQty"
+    if min_notional and px and (amt * px) < min_notional:
+        return 0.0, "notional < minNotional"
+    return amt, None
+
+# =========================
+# STARTUP CLEANUP (patched)
 # =========================
 def startup_cleanup():
     logger.info("Startup cleanup: closing non-USDT balances and syncing DB states...")
     try:
-        try: exchange.load_markets()
-        except Exception as e: logger.warning(f"load_markets warning: {e}")
+        try: 
+            exchange.load_markets()
+        except Exception as e: 
+            logger.warning(f"load_markets warning: {e}")
 
-        balances = exchange.fetch_balance() or {}; free = balances.get("free", {}) or {}
+        balances = exchange.fetch_balance() or {} 
+        free = balances.get("free", {}) or {}
         non_usdt = {a: amt for a, amt in free.items() if a != "USDT" and amt and amt > 0}
 
         conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
@@ -1554,61 +1629,67 @@ def startup_cleanup():
         for asset, amt in non_usdt.items():
             symbol = f"{asset}/USDT"
             if symbol not in getattr(exchange, "markets", {}):
-                logger.info(f"Skip {asset}: market {symbol} not found"); continue
-
-            mkt = exchange.markets[symbol]
-            min_amt = None
-            try: min_amt = (mkt.get("limits", {}) or {}).get("amount", {}).get("min", None)
-            except Exception: pass
-            if min_amt and amt < float(min_amt):
-                logger.info(f"Skip {symbol}: amount {amt} < min {min_amt}"); continue
+                logger.info(f"Skip {asset}: market {symbol} not found"); 
+                continue
 
             px = fetch_price(symbol)
-            if not px or px <= 0: logger.info(f"Skip {symbol}: no price on cleanup"); continue
+            if not px or px <= 0:
+                logger.info(f"Skip {symbol}: no price on cleanup"); 
+                continue
+
+            # Determine sellable amount respecting balance and filters
+            free_bal = float(free.get(asset, 0) or 0)
+            desired = min(free_bal, amt)
+            sell_amt, reason = _prepare_sell_amount(symbol, desired, px)
+            if sell_amt <= 0:
+                logger.info(f"Skip {symbol}: {reason} (free={free_bal}, desired={desired})")
+                continue
 
             try:
-                adj_amt = float(exchange.amount_to_precision(symbol, amt))
-            except Exception:
-                adj_amt = float(amt)
-            if adj_amt <= 0: logger.info(f"Skip {symbol}: adjusted amount <= 0"); continue
+                order = exchange.create_market_sell_order(symbol, sell_amt)
+            except ccxt.InsufficientFunds:
+                # retry with 0.5% less
+                sell_amt_retry, reason2 = _prepare_sell_amount(symbol, sell_amt * 0.995, px)
+                if sell_amt_retry > 0:
+                    try:
+                        order = exchange.create_market_sell_order(symbol, sell_amt_retry)
+                        sell_amt = sell_amt_retry
+                    except ccxt.InsufficientFunds:
+                        logger.info(f"Skip {symbol}: Insufficient after retry (amt={sell_amt_retry})")
+                        continue
+                else:
+                    logger.info(f"Skip {symbol}: {reason2} after insufficient funds retry")
+                    continue
 
-            trade_value = adj_amt * px
-            if trade_value < MIN_NOTIONAL:
-                logger.info(f"Skip {symbol}: value {trade_value:.2f} < MIN_NOTIONAL {MIN_NOTIONAL}"); continue
+            sell_price = order.get("price", px) or px
+            ts = datetime.now(timezone.utc).isoformat()
 
-            try:
-                order = exchange.create_market_sell_order(symbol, adj_amt)
-                sell_price = order.get("price", px) or px
-                ts = datetime.now(timezone.utc).isoformat()
+            cur.execute("""
+                SELECT trade_id FROM transactions
+                WHERE symbol=? AND side='buy' AND status='open'
+                ORDER BY ts ASC LIMIT 1
+            """, (symbol,))
+            row = cur.fetchone()
+            trade_id = row[0] if row else f"startup_{asset}"
 
-                cur.execute("""
-                    SELECT trade_id FROM transactions
-                    WHERE symbol=? AND side='buy' AND status='open'
-                    ORDER BY ts ASC LIMIT 1
-                """, (symbol,))
-                row = cur.fetchone()
-                trade_id = row[0] if row else f"startup_{asset}"
+            cur.execute("""
+                INSERT INTO transactions (symbol, side, price, amount, ts, trade_id, status)
+                VALUES (?, 'sell', ?, ?, ?, ?, 'closed')
+            """, (symbol, float(sell_price), float(sell_amt), ts, trade_id))
 
-                cur.execute("""
-                    INSERT INTO transactions (symbol, side, price, amount, ts, trade_id, status)
-                    VALUES (?, 'sell', ?, ?, ?, ?, 'closed')
-                """, (symbol, float(sell_price), float(adj_amt), ts, trade_id))
+            if row:
+                cur.execute("UPDATE transactions SET status='closed' WHERE trade_id=? AND side='buy'", (trade_id,))
+            conn.commit()
 
-                if row:
-                    cur.execute("UPDATE transactions SET status='closed' WHERE trade_id=? AND side='buy'", (trade_id,))
-                conn.commit()
+            send_telegram_message(f"🔒 *Startup Cleanup*: Vendido `{symbol}` cantidad `{sell_amt}` a `{sell_price}`")
 
-                send_telegram_message(f"🔒 *Startup Cleanup*: Vendido `{symbol}` cantidad `{adj_amt}` a `{sell_price}`")
+            exit_feats = build_rich_features(symbol)
+            save_trade_features(trade_id, symbol, 'exit', exit_feats)
 
-                exit_feats = build_rich_features(symbol)
-                save_trade_features(trade_id, symbol, 'exit', exit_feats)
+            analyze_and_learn(trade_id, sell_price, learn_enabled=False)
+            LAST_SELL_INFO[symbol] = {"ts": ts, "price": float(sell_price), "source": "startup"}
 
-                analyze_and_learn(trade_id, sell_price, learn_enabled=False)
-                LAST_SELL_INFO[symbol] = {"ts": ts, "price": float(sell_price), "source": "startup"}
-
-                logger.info(f"Startup sold {symbol}: amt={adj_amt}, px={sell_price}, trade_id={trade_id}")
-            except Exception as e:
-                logger.error(f"Error selling {symbol} in startup_cleanup: {e}", exc_info=True)
+            logger.info(f"Startup sold {symbol}: amt={sell_amt}, px={sell_price}, trade_id={trade_id}")
 
         conn.close()
         reconcile_orphan_open_buys()
