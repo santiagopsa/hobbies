@@ -2,20 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-Hybrid Crypto Spot Trader (Binance via ccxt) — r4 (No-Buy-Under-Sell + 9 hardening fixes)
+THIS CODE SHOULD BE THE BASELINE FOR FOLLOWING VERSIONS
 
-Fixed weaknesses:
-1) No-Buy-Under-Sell: never buy if current fast/slow momentum says “exit”.
-2) Re-entry block: after ANY sell (including startup_cleanup), block new buys for REENTRY_BLOCK_MIN.
-3) RVOL sanity: ignore bogus tiny RVOL baselines; require data-quality and floor.
-4) Score-gate floor: controller cannot drift gate below SCORE_GATE_HARD_MIN.
-5) Post-loss cooldown tougher: longer lock + stricter override (ADX15/RVOL15/MACDh/EMA20 all stronger).
-6) Severe 15m weakness & 4h overbought become HARD blocks (not only penalties).
-7) Same-candle lockout: do not buy on the same 1h/15m candle as a sell for that symbol.
-8) Don’t learn from startup_cleanup exits; they no longer move nudges.
-9) Entry confirmation: require price>EMA20 AND price>=VWAP AND price≥last_exit_price*(1+reentry_pad).
+Hybrid Crypto Spot Trader (Binance via ccxt) — r4.1 (Blocks vs Score, Schema-migration)
 
-Other: safer telemetry, slippage-aware sizing, orphan reconciliation, controller autotune.
+Ajustes clave r4.1:
+- Migración segura de SQLite: añade learn_enabled si falta (evita 'no column named learn_enabled').
+- Separación de 'raw_score' (señal) vs 'score' (pasa por gate y bloqueos).
+- Bloqueos etiquetados: HARD/ SOFT; el controller puede relajar SOLO SOFT en hambruna de compras.
+- Logs enriquecidos: raw=…, score=…, blocks=[…], level=…, exec=…
+- Mantiene tu flujo, sizing, trailing, reconcile, startup_cleanup, learning.
 """
 
 import os, time, json, threading, sqlite3, logging, logging.handlers, random
@@ -23,6 +19,7 @@ from datetime import datetime, timezone, date
 import ccxt, numpy as np, pandas as pd, pandas_ta as ta, requests
 from dotenv import load_dotenv
 from scipy.stats import linregress
+from typing import Tuple
 
 # =========================
 # Config & initialization
@@ -39,7 +36,7 @@ SELECTED_CRYPTOS = [f"{c}/USDT" for c in TOP_COINS]
 MIN_NOTIONAL = 8.0
 MAX_OPEN_TRADES = 10
 RESERVE_USDT = 100.0
-RISK_FRACTION = 0.12  # base fraction per trade (modulated)
+RISK_FRACTION = 0.18  # base fraction per trade (modulated)
 
 # Decision params (defaults)
 DECISION_TIMEFRAME = "1h"
@@ -51,7 +48,7 @@ RSI_MIN_DEFAULT, RSI_MAX_DEFAULT = 45, 72
 RVOL_BASE_DEFAULT = 1.5
 SCORE_GATE_START = 4.0
 SCORE_GATE_MIN, SCORE_GATE_MAX = 2.5, 6.0
-SCORE_GATE_HARD_MIN = 3.2  # (Fix #4) controller cannot go below this floor
+SCORE_GATE_HARD_MIN = 3  # floor del controller
 
 # Learning ranges & rates
 ADX_MIN_RANGE = (15, 35)
@@ -63,9 +60,9 @@ LEARN_DAILY_CLIP = 0.5
 MEAN_REV_WEIGHT = 0.02
 
 # Buy-flow controller
-TARGET_BUY_RATIO = 0.25
+TARGET_BUY_RATIO = 0.3
 BUY_RATIO_DELTA = 0.05
-GATE_STEP = 0.1
+GATE_STEP = 0.15
 EPSILON_EXPLORE = 0.03
 DECISION_WINDOW = 120
 
@@ -88,12 +85,12 @@ PENALTY_4H_RSI = 0.7
 PENALTY_15M_WEAK = 0.5
 
 # Cooldowns / re-entry
-COOLDOWN_MIN_AFTER_LOSS = 30  # (Fix #5) tougher cooldown
+COOLDOWN_MIN_AFTER_LOSS = 30
 POST_LOSS_SIZING_WINDOW_SEC = 2 * 3600
 POST_LOSS_CONF_CAP = 78
 POST_LOSS_SIZING_FACTOR = 0.70
-REENTRY_BLOCK_MIN = 10        # (Fix #2/#7) block after sell (and startup) before next buy
-REENTRY_ABOVE_LAST_EXIT_PAD = 0.0015  # 0.15% min above last exit (Fix #9)
+REENTRY_BLOCK_MIN = 10
+REENTRY_ABOVE_LAST_EXIT_PAD = 0.0015  # 0.15%
 
 # Volatility / crash protection
 INIT_STOP_ATR_MULT = 1.4
@@ -103,14 +100,14 @@ CRASH_HALT_WINDOW_MIN = 15
 
 # Crash-halt per-symbol override
 CRASH_HALT_ENABLE_OVERRIDE = True
-CRASH_HALT_OVERRIDE_MIN_ADX15 = 27.0  # slight raise
+CRASH_HALT_OVERRIDE_MIN_ADX15 = 27.0
 CRASH_HALT_OVERRIDE_REQUIRE_EMA20 = True
 
-# RVOL sanity (Fix #3)
-RVOL_MEAN_MIN = 1e-6      # avoid zero-division artifacts
-RVOL_VALUE_MIN = 0.25     # discard unrealistically tiny RVOL as "no data"
+# RVOL sanity
+RVOL_MEAN_MIN = 1e-6
+RVOL_VALUE_MIN = 0.25
 
-# No-buy-under-sell thresholds (Fix #1)
+# No-buy-under-sell thresholds
 NBUS_RSI15_OB = 70.0
 NBUS_MACDH15_NEG = 0.0
 NBUS_ADX1H_MIN = 20.0
@@ -143,7 +140,7 @@ TRADE_ANALYTICS_COUNT = {}    # base -> int
 LAST_PARAM_UPDATE = {}        # base -> yyyy-mm-dd
 
 # =========================
-# DB schema
+# DB schema (with migration)
 # =========================
 def initialize_db():
     conn = sqlite3.connect(DB_NAME)
@@ -153,14 +150,14 @@ def initialize_db():
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT NOT NULL,
-            side TEXT NOT NULL,                 -- 'buy' / 'sell'
+            side TEXT NOT NULL,
             price REAL NOT NULL,
             amount REAL NOT NULL,
             ts TEXT NOT NULL,
             trade_id TEXT NOT NULL,
             adx REAL, rsi REAL, rvol REAL, atr REAL,
             score REAL, confidence INTEGER,
-            status TEXT DEFAULT 'open'          -- 'open' | 'closed' | 'closed_orphan'
+            status TEXT DEFAULT 'open'
         )
     """)
 
@@ -170,11 +167,12 @@ def initialize_db():
             trade_id TEXT NOT NULL,
             ts TEXT NOT NULL,
             symbol TEXT NOT NULL,
-            side TEXT NOT NULL,                 -- 'entry' / 'exit'
+            side TEXT NOT NULL,
             features_json TEXT NOT NULL
         )
     """)
 
+    # trade_analysis pudo haberse creado sin learn_enabled en versiones previas
     cur.execute("""
         CREATE TABLE IF NOT EXISTS trade_analysis (
             trade_id TEXT PRIMARY KEY,
@@ -183,9 +181,18 @@ def initialize_db():
             pnl_usdt REAL, pnl_pct REAL, duration_sec INTEGER,
             entry_snapshot_json TEXT, exit_snapshot_json TEXT,
             adjustments_json TEXT,
-            learn_enabled INTEGER DEFAULT 1      -- (Fix #8) mark if analysis contributes to learning
+            learn_enabled INTEGER DEFAULT 1
         )
     """)
+    # ── MIGRACIÓN: añade learn_enabled si falta ──
+    try:
+        cur.execute("PRAGMA table_info(trade_analysis)")
+        cols = {r[1] for r in cur.fetchall()}
+        if "learn_enabled" not in cols:
+            logger.info("Migrating: ADD COLUMN trade_analysis.learn_enabled INTEGER DEFAULT 1")
+            cur.execute("ALTER TABLE trade_analysis ADD COLUMN learn_enabled INTEGER DEFAULT 1")
+    except Exception as e:
+        logger.warning(f"Migration check failed: {e}")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS learn_params (
@@ -327,6 +334,16 @@ def pct(x):
 def clamp(val, lo, hi):
     return max(lo, min(hi, val))
 
+def _fmt(v, decimals=2, pct=False, suffix=""):
+    try:
+        if v is None or (isinstance(v, float) and (np.isnan(v) or not np.isfinite(v))):
+            return "—"
+        if pct:
+            return f"{float(v):.{decimals}f}%"
+        return f"{float(v):.{decimals}f}{suffix}"
+    except Exception:
+        return "—"
+
 # =========================
 # Feature builders
 # =========================
@@ -386,7 +403,6 @@ def compute_timeframe_features(df: pd.DataFrame, label: str):
         try: atr_pct = float(atr.iloc[-1] / last['close'] * 100.0)
         except Exception: pass
 
-        # RVOL sanity (Fix #3)
         rvv = rvol10.iloc[-1]
         rv_ok = not pd.isna(rvv) and np.isfinite(rvv) and rv_mean.iloc[-1] and rv_mean.iloc[-1] > RVOL_MEAN_MIN
         rvv = float(rvv) if rv_ok else None
@@ -492,7 +508,6 @@ def build_rich_features(symbol: str):
     }
     return features
 
-# quick snapshot
 def quick_tf_snapshot(symbol: str, timeframe: str, limit: int = 120):
     ohlcv = fetch_ohlcv_with_retry(symbol, timeframe=timeframe, limit=limit)
     if not ohlcv: return {}
@@ -567,12 +582,10 @@ def get_score_gate():
     row = cur.fetchone(); conn.close()
     if not row or row[0] is None:
         return SCORE_GATE_START
-    # (Fix #4) enforce hard floor
     return max(float(row[0]), SCORE_GATE_HARD_MIN)
 
 def set_score_gate(new_gate: float):
     ng = clamp(float(new_gate), SCORE_GATE_MIN, SCORE_GATE_MAX)
-    # (Fix #4) hard floor
     ng = max(ng, SCORE_GATE_HARD_MIN)
     conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
     cur.execute("UPDATE controller SET score_gate=?, updated_at=? WHERE id=1",
@@ -611,6 +624,17 @@ def controller_autotune():
     except Exception as e:
         logger.debug(f"controller_autotune error: {e}")
 
+def _recent_buy_ratio():
+    try:
+        conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+        cur.execute("SELECT executed FROM decision_log ORDER BY id DESC LIMIT ?", (DECISION_WINDOW,))
+        rows = cur.fetchall(); conn.close()
+        if not rows:
+            return 0.0
+        return sum(1 for (e,) in rows if e == 1) / len(rows)
+    except Exception:
+        return 0.0
+
 # =========================
 # Data prep
 # =========================
@@ -636,7 +660,6 @@ def fetch_and_prepare_data_hybrid(symbol: str, limit: int = 200, timeframe: str 
         df.loc[df.index[-1], 'VOL_SLOPE10']   = linregress(x, df['volume'].iloc[-10:]).slope
     else:
         df['PRICE_SLOPE10'] = np.nan; df['VOL_SLOPE10'] = np.nan
-    # VWAP for confirmation (Fix #9)
     try:
         df['VWAP'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
     except Exception:
@@ -659,32 +682,67 @@ def estimate_slippage_pct(symbol: str, notional: float = MIN_NOTIONAL):
         return 0.05
 
 # =========================
-# No-Buy-Under-Sell gate (Fix #1)
+# No-Buy-Under-Sell gate
 # =========================
-def is_selling_condition_now(symbol: str) -> (bool, str):
-    """Return True if the *entry timeframe combo* indicates SELL/exhaustion right now."""
+def is_selling_condition_now(symbol: str) -> Tuple[bool, str]:
+    """
+    Devuelve (True, motivo) si la combinación 15m/1h sugiere vender/evitar compras ahora.
+    Maneja con seguridad la ausencia de datos/indicadores.
+    """
+    rsi15 = None
+    macdh15 = None
+    adx1h = None
+
     try:
         df15 = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=80)
         df1h = fetch_and_prepare_data_hybrid(symbol, timeframe="1h",  limit=80)
-        if df15 is None or df1h is None: return False, "no data"
 
-        rsi15 = float(df15['RSI'].iloc[-1]) if 'RSI' in df15 else None
-        v15 = ta.macd(df15['close'], fast=12, slow=26, signal=9)
-        macdh15 = float(v15['MACDh_12_26_9'].iloc[-1]) if v15 is not None else None
-        adx1h = float(df1h['ADX'].iloc[-1]) if 'ADX' in df1h else None
+        if df15 is None or df1h is None or len(df15) == 0 or len(df1h) == 0:
+            return False, "no data"
 
-        # SELL condition: overbought + histogram turning negative OR 1h ADX collapsed
-        if (rsi15 is not None and rsi15 >= NBUS_RSI15_OB and macdh15 is not None and macdh15 <= NBUS_MACDH15_NEG):
-            return True, f"15m overbought+MACDh≤0 (RSI15={rsi15:.1f}, MACDh15={macdh15:.3f})"
-        if (adx1h is not None and adx1h < NBUS_ADX1H_MIN):
-            return True, f"ADX1h<{NBUS_ADX1H_MIN:.0f} (ADX1h={adx1h:.1f})"
+        # RSI 15m
+        try:
+            if 'RSI' in df15 and not pd.isna(df15['RSI'].iloc[-1]):
+                rsi15 = float(df15['RSI'].iloc[-1])
+        except Exception:
+            rsi15 = None
+
+        # MACD hist 15m
+        try:
+            macd15 = ta.macd(df15['close'], fast=12, slow=26, signal=9)
+            if macd15 is not None and not macd15.empty and 'MACDh_12_26_9' in macd15:
+                mh = macd15['MACDh_12_26_9'].iloc[-1]
+                if not pd.isna(mh):
+                    macdh15 = float(mh)
+        except Exception:
+            macdh15 = None
+
+        # ADX 1h
+        try:
+            if 'ADX' in df1h and not pd.isna(df1h['ADX'].iloc[-1]):
+                adx1h = float(df1h['ADX'].iloc[-1])
+        except Exception:
+            adx1h = None
+
+        # Regla 1: 15m sobrecomprado + MACDh <= 0
+        if (rsi15 is not None and rsi15 >= NBUS_RSI15_OB) and (macdh15 is not None and macdh15 <= NBUS_MACDH15_NEG):
+            rsi_txt = f"{rsi15:.1f}" if rsi15 is not None else "—"
+            mh_txt  = f"{macdh15:.3f}" if macdh15 is not None else "—"
+            return True, f"15m overbought+MACDh≤0 (RSI15={rsi_txt}, MACDh15={mh_txt})"
+
+        # Regla 2: ADX 1h colapsado
+        if adx1h is not None and adx1h < NBUS_ADX1H_MIN:
+            adx_txt = f"{adx1h:.1f}"
+            return True, f"ADX1h<{NBUS_ADX1H_MIN:.0f} (ADX1h={adx_txt})"
+
         return False, "ok"
+
     except Exception as e:
         logger.debug(f"is_selling_condition_now error {symbol}: {e}")
+        # Aseguramos un retorno estable
         return False, "error"
-
 # =========================
-# Decision
+# Decision (reworked to keep raw_score)
 # =========================
 def hybrid_decision(symbol: str):
     base = symbol.split('/')[0]
@@ -692,27 +750,38 @@ def hybrid_decision(symbol: str):
     RSI_MIN = lp["rsi_min"]; RSI_MAX = lp["rsi_max"]
     ADX_MIN = lp["adx_min"]; RVOL_BASE = lp["rvol_base"]
 
-    # Liquidity
+    blocks = []
+    level = "NONE"  # NONE | SOFT | HARD
+
+    # Liquidez
     try:
         t = exchange.fetch_ticker(symbol)
         qvol = float(t.get('quoteVolume', 0.0) or 0.0)
         if qvol < MIN_QUOTE_VOL_24H_DEFAULT:
-            return "hold", 50, 0.0, f"low 24h quote vol: {qvol:.0f}"
+            blocks.append(f"low 24h quote vol: {qvol:.0f}")
+            level = "HARD"
     except Exception as e:
-        return "hold", 50, 0.0, f"ticker error: {e}"
+        blocks.append(f"ticker error: {e}")
+        level = "HARD"
 
     # Spread
     try:
         ob = exchange.fetch_order_book(symbol, limit=50)
         spr_p = percent_spread(ob)
         if spr_p > SPREAD_MAX_PCT_DEFAULT:
-            return "hold", 50, 0.0, "spread too wide"
+            blocks.append("spread too wide")
+            level = "HARD"
     except Exception as e:
-        return "hold", 50, 0.0, f"orderbook error: {e}"
+        blocks.append(f"orderbook error: {e}")
+        level = "HARD"
+        spr_p = 0.0
 
     df = fetch_and_prepare_data_hybrid(symbol)
     if df is None or len(df) < 60:
-        return "hold", 50, 0.0, "not enough candles"
+        blocks.append("not enough candles")
+        level = "HARD"
+        # Aún así devolvemos algo coherente:
+        return "hold", 50, 0.0, " | ".join(blocks)
 
     row = df.iloc[-1]
     score_gate = get_score_gate()
@@ -722,35 +791,38 @@ def hybrid_decision(symbol: str):
     rvol = float(row['RVOL10']) if pd.notna(row['RVOL10']) else None
     price_slope = float(row.get('PRICE_SLOPE10', 0.0) or 0.0)
 
-    # RVOL sanity (Fix #3)
+    # RVOL sanity → SOFT (no matamos el score)
     if rvol is None or not np.isfinite(rvol) or rvol < RVOL_VALUE_MIN:
-        return "hold", 50, 0.0, "RVOL invalid/too small"
+        blocks.append("RVOL invalid/too small")
+        if level != "HARD": level = "SOFT"
 
-    # Snapshots
+    # Snapshots para HARD softeners
     tf15 = quick_tf_snapshot(symbol, '15m', limit=120)
     tf4h = quick_tf_snapshot(symbol, '4h',  limit=120)
 
-    # HARD blocks (Fix #6): severe 15m weakness or 4h overbought extremes
+    # HARD blocks: 15m weakness o 4h overbought extremo
     try:
         rsi_15 = tf15.get('RSI'); macdh_15 = tf15.get('MACDh')
         if (macdh_15 is not None and macdh_15 < 0) and (rsi_15 is not None and rsi_15 < 48):
-            return "hold", 55, 0.0, "HARD block: 15m weakness"
+            blocks.append("HARD block: 15m weakness")
+            level = "HARD"
     except Exception:
         pass
     try:
         rsi_4h = tf4h.get('RSI')
         if rsi_4h is not None and rsi_4h >= (RSI_OVERBOUGHT_4H + 2.0):
-            return "hold", 55, 0.0, "HARD block: 4h too overbought"
+            blocks.append("HARD block: 4h too overbought")
+            level = "HARD"
     except Exception:
         pass
 
-    # No-buy-under-sell (Fix #1)
+    # NBUS — no-buy-under-sell → HARD
     sell_cond, reason = is_selling_condition_now(symbol)
     if sell_cond:
-        return "hold", 58, 0.0, f"NBUS: {reason}"
+        blocks.append(f"NBUS: {reason}")
+        level = "HARD"
 
-    # Post-loss cooldown (Fix #5) with stricter override
-    post_loss_override = False
+    # Post-loss cooldown → HARD (con override ya aplicado dentro)
     try:
         now = datetime.now(timezone.utc)
         info = LAST_LOSS_INFO.get(symbol)
@@ -758,7 +830,9 @@ def hybrid_decision(symbol: str):
             last_dt = datetime.fromisoformat(info["ts"].replace("Z",""))
             within_cooldown = last_dt and (now - last_dt).total_seconds() < COOLDOWN_MIN_AFTER_LOSS * 60
             if within_cooldown:
+                # chequeo de override estricto
                 df15 = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=120)
+                post_loss_override = False
                 if df15 is not None and len(df15) > 30:
                     adx15_df = ta.adx(df15['high'], df15['low'], df15['close'], length=14)
                     adx15 = float(adx15_df['ADX_14'].iloc[-1]) if adx15_df is not None else None
@@ -767,29 +841,30 @@ def hybrid_decision(symbol: str):
                     macdh15 = float(macd15['MACDh_12_26_9'].iloc[-1]) if macd15 is not None else None
                     ema20_15 = float(ta.ema(df15['close'], length=20).iloc[-1])
                     last15 = float(df15['close'].iloc[-1])
-                    # stricter
                     post_loss_override = (
                         (adx15 is not None and adx15 > 32) and
                         (rvol15 is not None and rvol15 > 2.2) and
                         (macdh15 is not None and macdh15 > 0) and
                         (last15 > ema20_15)
                     )
-            if within_cooldown and not post_loss_override:
-                return "hold", 58, 0.0, "post-loss cooldown"
+                if not post_loss_override:
+                    blocks.append("post-loss cooldown")
+                    level = "HARD"
     except Exception:
-        post_loss_override = False
+        pass
 
-    # Re-entry block after any sell / startup sell (Fix #2/#7/#9)
+    # Re-entry block tras sell/startup → HARD
     try:
         info = LAST_SELL_INFO.get(symbol)
         if info and info.get("ts"):
             last_dt = datetime.fromisoformat(info["ts"].replace("Z",""))
             if last_dt and (datetime.now(timezone.utc) - last_dt).total_seconds() < REENTRY_BLOCK_MIN * 60:
-                return "hold", 57, 0.0, f"re-entry block ({REENTRY_BLOCK_MIN}m)"
+                blocks.append(f"re-entry block ({REENTRY_BLOCK_MIN}m)")
+                level = "HARD"
     except Exception:
         pass
 
-    # Confirmation (Fix #9): price>EMA20 & price>=VWAP & price≥last_exit*(1+pad)
+    # Confirmación (EMA/VWAP/exitPad) → SOFT (se puede relajar)
     try:
         last = float(row['close'])
         ema20_1h = float(row['EMA20']) if pd.notna(row['EMA20']) else None
@@ -801,20 +876,22 @@ def hybrid_decision(symbol: str):
         if le and le.get("price") is not None:
             ok_c = last >= float(le["price"]) * (1.0 + REENTRY_ABOVE_LAST_EXIT_PAD)
         if not (ok_a and ok_b and ok_c):
-            return "hold", 56, 0.0, f"confirmation failed (EMA/VWAP/exitPad)"
+            blocks.append("confirmation failed (EMA/VWAP/exitPad)")
+            if level != "HARD": level = "SOFT"
     except Exception:
         pass
 
-    # Must be in lane OR use strong override
-    override = (not in_lane) and (adx >= ADX_MIN + 10) and (rvol >= RVOL_BASE * 1.5) and (price_slope > 0)
+    # ¿En lane o override fuerte?
+    override = (not in_lane) and (adx >= ADX_MIN + 10) and (rvol is not None and rvol >= RVOL_BASE * 1.5) and (price_slope > 0)
     if not (in_lane or override):
-        return "hold", 55, 0.0, "not in uptrend lane; no override"
+        blocks.append("not in uptrend lane; no override")
+        if level != "HARD": level = "SOFT"  # lo tratamos como SOFT para permitir override en hambruna
 
-    # Scoring
+    # ───────────────── raw_score (NO se anula por bloqueos)
     score = 0.0; notes = []
-    if rvol >= RVOL_BASE: score += 2.0; notes.append(f"RVOL≥{RVOL_BASE:.2f} ({rvol:.2f})")
-    if rvol >= RVOL_BASE + 0.5: score += 1.0
-    if rvol >= RVOL_BASE + 1.5: score += 1.0
+    if rvol is not None and rvol >= RVOL_BASE: score += 2.0; notes.append(f"RVOL≥{RVOL_BASE:.2f} ({rvol:.2f})")
+    if rvol is not None and rvol >= RVOL_BASE + 0.5: score += 1.0
+    if rvol is not None and rvol >= RVOL_BASE + 1.5: score += 1.0
     if price_slope > 0: score += 1.0; notes.append("price slope>0")
     rsi = float(row['RSI']) if pd.notna(row['RSI']) else 50.0
     if RSI_MIN <= rsi <= RSI_MAX: score += 1.0; notes.append(f"RSI in band ({rsi:.1f})")
@@ -823,7 +900,6 @@ def hybrid_decision(symbol: str):
     vol_slope = float(row.get('VOL_SLOPE10', 0.0) or 0.0)
     if vol_slope > 0: score += 0.5
 
-    # small spread-based penalty
     try:
         spr_pct = spr_p * 100.0
         if spr_pct > 0.10:
@@ -831,37 +907,57 @@ def hybrid_decision(symbol: str):
     except Exception:
         pass
 
-    # adaptive exploration jitter
+    # Jitter (igual que antes)
     try:
         conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
         cur.execute("SELECT executed FROM decision_log ORDER BY id DESC LIMIT ?", (DECISION_WINDOW,))
         rows = cur.fetchall(); conn.close()
         execs = sum(1 for (e,) in rows if e == 1)
-        ratio = execs / len(rows) if rows else 0.0
+        ratio_recent = execs / len(rows) if rows else 0.0
     except Exception:
-        ratio = TARGET_BUY_RATIO
+        ratio_recent = TARGET_BUY_RATIO
     explore_p = JITTER_BASE
-    if ratio < (TARGET_BUY_RATIO * 0.6):
+    if ratio_recent < (TARGET_BUY_RATIO * 0.6):
         explore_p = min(JITTER_MAX, JITTER_BASE + 0.03)
     if random.random() < explore_p:
         jitter = random.uniform(-0.3, 0.3)
         score += jitter
         notes.append(f"jitter {jitter:+.2f} (p={explore_p:.2f})")
 
-    msg = f"score={score:.1f} gate={score_gate:.1f} | " + ", ".join(notes) + f" | RSI={rsi:.1f} ADX={adx:.1f}"
+    raw_score = max(0.0, score)  # por sanidad
 
-    if score >= score_gate:
-        conf = int(min(92, 70 + max(0.0, score - score_gate)*6))
-        # cap confidence after recorded loss
-        if symbol in LAST_LOSS_INFO:
-            conf = min(conf, POST_LOSS_CONF_CAP)
-            msg += " | conf_cap_post_loss"
-        # additional sanity: require conf≥65 for execution
-        if conf < 65:
-            return "hold", conf, score, msg + " | conf too low"
-        return "buy", conf, score, msg
+    # ───────────────── Política de ejecución (HARD bloquea; SOFT puede relajarse en hambruna)
+    buy_ratio = _recent_buy_ratio()
+    starvation = buy_ratio < TARGET_BUY_RATIO
+    relax_soft = starvation  # puedes añadir más condiciones si quieres
 
-    return "hold", 60 if score >= (score_gate - 0.5) else 50, score, msg
+    if level == "HARD":
+        exec_allowed = False
+    elif level == "SOFT":
+        exec_allowed = relax_soft
+        if exec_allowed: notes.append("soft override (starvation)")
+    else:
+        exec_allowed = True
+
+    score_for_gate = raw_score if exec_allowed else 0.0
+
+    # Acción
+    gate = score_gate
+    if exec_allowed and raw_score >= gate:
+        action = "buy"
+    else:
+        action = "hold"
+
+    conf = int(clamp(50 + 10*(1 if row['EMA20'] > row['EMA50'] else 0) + 5*(1 if price_slope>0 else 0), 0, 100))
+    if symbol in LAST_LOSS_INFO:
+        conf = min(conf, POST_LOSS_CONF_CAP)
+
+    # Nota rica
+    note = f"raw={raw_score:.1f} gate={gate:.1f} score={score_for_gate:.1f} | " + ", ".join(notes)
+    if blocks:
+        note += f" | blocks=[{'; '.join(blocks)}] level={level} exec={exec_allowed}"
+
+    return action, conf, score_for_gate, note
 
 # =========================
 # Feature persistence & Telegram bundles
@@ -959,12 +1055,52 @@ def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"
 
         send_telegram_message(f"✅ SELL {symbol}\nPrice: {sell_price}\nAmount: {amount}")
 
-        # re-entry block info (Fix #2/#7/#9)
         LAST_SELL_INFO[symbol] = {"ts": sell_ts, "price": float(sell_price), "source": source}
 
         features_exit = build_rich_features(symbol)
         save_trade_features(trade_id, symbol, 'exit', features_exit)
-        analyze_and_learn(trade_id, sell_price, learn_enabled=(source != "startup"))  # (Fix #8)
+
+        # ── NUEVO: resumen de EXIT FEATURES para Telegram y logs ──
+        try:
+            gen = features_exit.get("general", {})
+            ob  = features_exit.get("orderbook", {})
+            tf1h = features_exit.get("timeframes", {}).get("1h", {})
+            tf15 = features_exit.get("timeframes", {}).get("15m", {})
+            tf4h = features_exit.get("timeframes", {}).get("4h", {})
+
+            exit_summary = (
+                f"📤 *EXIT FEATURES* {symbol}\n"
+                f"Trade: `{trade_id}`  |  Price: `{_fmt(sell_price)}`  Amount: `{_fmt(amount)}`\n"
+                f"—\n"
+                f"*Market*\n"
+                f"Last:`{_fmt(gen.get('last'))}`  24hQVol:`{abbr(gen.get('quote_volume_24h'))}`  "
+                f"Spread:`{_fmt((ob.get('spread_pct') or 0)*100, pct=True)}`  Imb:`{_fmt(ob.get('imbalance'))}`\n"
+                f"—\n"
+                f"*1h*   RSI:`{_fmt(tf1h.get('rsi'))}`  ADX:`{_fmt(tf1h.get('adx'))}`  RVOL10:`{_fmt(tf1h.get('rvol10'))}`  ATR%:`{_fmt(tf1h.get('atr_pct'))}`\n"
+                f"*15m*  RSI:`{_fmt(tf15.get('rsi'))}`  MACDh:`{_fmt(tf15.get('macd_hist'))}`\n"
+                f"*4h*   RSI:`{_fmt(tf4h.get('rsi'))}`  ADX:`{_fmt(tf4h.get('adx'))}`\n"
+            )
+            send_telegram_message(exit_summary)
+
+            # También adjuntamos el JSON como documento + un encabezado extra en el bundle
+            send_feature_bundle_telegram(
+                trade_id, symbol, 'exit', features_exit,
+                extra_lines="(exit snapshot adjunto como JSON)\n"
+            )
+
+            # Log “compacto” al file/console
+            logger.info(
+                f"[exit-features] {symbol} trade={trade_id} | "
+                f"1h RSI={_fmt(tf1h.get('rsi'))} ADX={_fmt(tf1h.get('adx'))} RVOL10={_fmt(tf1h.get('rvol10'))} "
+                f"| 15m RSI={_fmt(tf15.get('rsi'))} MACDh={_fmt(tf15.get('macd_hist'))} "
+                f"| spread={_fmt((ob.get('spread_pct') or 0)*100, pct=True)} imb={_fmt(ob.get('imbalance'))}"
+            )
+        except Exception as e:
+            logger.warning(f"exit features reporting error {symbol}: {e}")
+
+        # Aprendizaje post-trade (igual que antes)
+        analyze_and_learn(trade_id, sell_price, learn_enabled=(source != "startup"))
+
         logger.info(f"Sold {symbol} @ {sell_price} (trade {trade_id})")
     except Exception as e:
         logger.error(f"sell_symbol error {symbol}: {e}")
@@ -1078,7 +1214,6 @@ def analyze_and_learn(trade_id: str, sell_price: float = None, learn_enabled: bo
             "exit":  {"price": sell_price, "amount": sell_amt, "ts": sell_ts, "rsi": rsi_x, "adx": adx_x, "rvol": rvol_x}
         }
 
-        # soft learning with anti-overfit guards
         adjustments = {}
         win = pnl_usdt > 0.0
         base = symbol.split('/')[0]
@@ -1123,7 +1258,6 @@ def analyze_and_learn(trade_id: str, sell_price: float = None, learn_enabled: bo
                     adjustments["rvolbase"] = {"old": rvol_base, "new": new_rvol}
                     rvol_base = new_rvol
 
-            # daily clip
             def _clip_delta(cur, new, max_abs=LEARN_DAILY_CLIP):
                 return clamp(new, cur - max_abs, cur + max_abs)
 
@@ -1132,7 +1266,6 @@ def analyze_and_learn(trade_id: str, sell_price: float = None, learn_enabled: bo
             adx_min = _clip_delta(lp["adx_min"], adx_min)
             rvol_base = _clip_delta(lp["rvol_base"], rvol_base)
 
-            # mean reversion
             rsi_min = (1 - MEAN_REV_WEIGHT)*rsi_min + MEAN_REV_WEIGHT*RSI_MIN_DEFAULT
             rsi_max = (1 - MEAN_REV_WEIGHT)*rsi_max + MEAN_REV_WEIGHT*RSI_MAX_DEFAULT
             adx_min = (1 - MEAN_REV_WEIGHT)*adx_min + MEAN_REV_WEIGHT*ADX_MIN_DEFAULT
@@ -1160,9 +1293,10 @@ def analyze_and_learn(trade_id: str, sell_price: float = None, learn_enabled: bo
             f"📊 *Trade Analysis* {outcome}  {symbol}",
             f"Trade: `{trade_id}`",
             f"PnL: `{analysis['pnl_usdt']:.4f} USDT`  (`{analysis['pnl_pct']:.2f}%`)  Duration: `{analysis['duration_sec']}s`",
-            f"Entry: RSI `{analysis['entry']['rsi']}`, ADX `{analysis['entry']['adx']}`, RVOL `{analysis['entry']['rvol']}`",
-            f"Exit:  RSI `{analysis['exit']['rsi']}`, ADX `{analysis['exit']['adx']}`, RVOL `{analysis['exit']['rvol']}`",
+            f"*Entry* → RSI `{analysis['entry']['rsi']}`, ADX `{analysis['entry']['adx']}`, RVOL `{analysis['entry']['rvol']}`",
+            f"*Exit*  → RSI `{analysis['exit']['rsi']}`, ADX `{analysis['exit']['adx']}`, RVOL `{analysis['exit']['rvol']}`",
         ]
+
         if adjustments:
             adj_txt = ", ".join([f"{k}:{v['old']}→{v['new']}" for k,v in adjustments.items()])
             lines.append(f"Learned nudges → {adj_txt}")
@@ -1170,7 +1304,6 @@ def analyze_and_learn(trade_id: str, sell_price: float = None, learn_enabled: bo
             lines.append("_Note: startup/maintenance exit — learning disabled_")
         send_telegram_message("\n".join(lines))
 
-        # remember losses for cooldown
         try:
             if pnl_usdt <= 0:
                 LAST_LOSS_INFO[symbol] = {"ts": datetime.now(timezone.utc).isoformat(), "pnl_usdt": float(pnl_usdt)}
@@ -1302,7 +1435,6 @@ def trade_once_with_report(symbol: str):
             log_decision(symbol, score, "hold", False); return report
 
         with buy_lock:
-            # re-check limits
             open_trades = get_open_trades_count()
             if open_trades >= MAX_OPEN_TRADES:
                 report["note"] = "max open trades (post-lock)"; log_decision(symbol, score, "hold", False); return report
@@ -1409,14 +1541,6 @@ def reconcile_orphan_open_buys():
 # STARTUP CLEANUP
 # =========================
 def startup_cleanup():
-    """
-    On start:
-      - Sell non-USDT balances (if value >= MIN_NOTIONAL).
-      - Reuse trade_id of open BUY if exists, else startup_[asset].
-      - Insert SELL row; Telegram; capture exit features; analyze (learning disabled for startup).
-      - Reconcile 'open' BUYs with zero balance -> 'closed_orphan'.
-      - Set LAST_SELL_INFO to enforce re-entry block.  (Fix #2/#8)
-    """
     logger.info("Startup cleanup: closing non-USDT balances and syncing DB states...")
     try:
         try: exchange.load_markets()
@@ -1442,8 +1566,10 @@ def startup_cleanup():
             px = fetch_price(symbol)
             if not px or px <= 0: logger.info(f"Skip {symbol}: no price on cleanup"); continue
 
-            try: adj_amt = float(exchange.amount_to_precision(symbol, amt))
-            except Exception: adj_amt = float(amt)
+            try:
+                adj_amt = float(exchange.amount_to_precision(symbol, amt))
+            except Exception:
+                adj_amt = float(amt)
             if adj_amt <= 0: logger.info(f"Skip {symbol}: adjusted amount <= 0"); continue
 
             trade_value = adj_amt * px
@@ -1477,10 +1603,7 @@ def startup_cleanup():
                 exit_feats = build_rich_features(symbol)
                 save_trade_features(trade_id, symbol, 'exit', exit_feats)
 
-                # (Fix #8) learning disabled for startup
                 analyze_and_learn(trade_id, sell_price, learn_enabled=False)
-
-                # (Fix #2) record sell to block re-entry for a while
                 LAST_SELL_INFO[symbol] = {"ts": ts, "price": float(sell_price), "source": "startup"}
 
                 logger.info(f"Startup sold {symbol}: amt={adj_amt}, px={sell_price}, trade_id={trade_id}")
@@ -1494,10 +1617,10 @@ def startup_cleanup():
         logger.error(f"startup_cleanup fatal: {e}", exc_info=True)
 
 # =========================
-# Main loop (r4)
+# Main loop (r4.1)
 # =========================
 if __name__ == "__main__":
-    logger.info("Starting hybrid trader (r4)...")
+    logger.info("Starting hybrid trader (r4.1)…")
     try:
         try: exchange.load_markets()
         except Exception as e: logger.warning(f"load_markets warning: {e}")
@@ -1521,9 +1644,9 @@ if __name__ == "__main__":
 
                 rep = trade_once_with_report(sym)
                 cycle_decisions.append(rep)
-                time.sleep(1)   # pacing
+                time.sleep(1)
 
-            controller_autotune()         # adjust score gate (observing hard floor)
+            controller_autotune()
             print_cycle_summary(cycle_decisions)
             write_status_json(cycle_decisions)
             time.sleep(30)
