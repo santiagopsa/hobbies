@@ -60,7 +60,7 @@ LEARN_DAILY_CLIP = 0.5
 MEAN_REV_WEIGHT = 0.02
 
 # Buy-flow controller
-TARGET_BUY_RATIO = 0.3
+TARGET_BUY_RATIO = 0.2
 BUY_RATIO_DELTA = 0.05
 GATE_STEP = 0.15
 EPSILON_EXPLORE = 0.03
@@ -69,6 +69,13 @@ DECISION_WINDOW = 120
 # Adaptive jitter
 JITTER_BASE = EPSILON_EXPLORE
 JITTER_MAX = 0.08
+
+# --- Fees / edge guard ---
+# Taker fee in basis points (0.10% => 10 bps). Override with env if you have VIP/BNB discounts.
+FEE_BPS_PER_SIDE = float(os.getenv("FEE_BPS_PER_SIDE", "10"))
+# How much edge over round-trip cost we demand before allowing non-stop exits.
+# 1.3 means 30% safety margin over fees to cover spread + slippage.
+EDGE_SAFETY_MULT = float(os.getenv("EDGE_SAFETY_MULT", "1.3"))
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -138,6 +145,10 @@ LAST_LOSS_INFO = {}           # symbol -> {"ts": iso, "pnl_usdt": float}
 LAST_SELL_INFO = {}           # symbol -> {"ts": iso, "price": float, "source": "trail|manual|startup"}
 TRADE_ANALYTICS_COUNT = {}    # base -> int
 LAST_PARAM_UPDATE = {}        # base -> yyyy-mm-dd
+
+LAST_TRADE_CLOSE = {}  # symbol -> ts ISO
+POST_TRADE_COOLDOWN_SEC = int(os.getenv("POST_TRADE_COOLDOWN_SEC", "120"))
+
 
 # =========================
 # DB schema (with migration)
@@ -746,6 +757,12 @@ def estimate_slippage_pct(symbol: str, notional: float = MIN_NOTIONAL):
         return spr + bump
     except Exception:
         return 0.05
+    
+def required_edge_pct() -> float:
+    """Minimum pct gain vs entry to overcome round-trip fees (+ safety)."""
+    rt_fee = 2.0 * (FEE_BPS_PER_SIDE / 10000.0)  # e.g. 0.002 for 20 bps
+    return rt_fee * EDGE_SAFETY_MULT * 100.0     # return in %
+
 
 # =========================
 # No-Buy-Under-Sell gate
@@ -858,6 +875,14 @@ def hybrid_decision(symbol: str):
 
     row = df.iloc[-1]
     score_gate = get_score_gate() + SCORE_GATE_OFFSET
+    # Anti-scalp: skip if current ATR% can’t reasonably outrun fees
+    atr_abs_now = float(row['ATR']) if pd.notna(row['ATR']) else None
+    atr_pct_now = (atr_abs_now / row['close'] * 100.0) if (atr_abs_now and row['close']) else None
+    if atr_pct_now is not None:
+        if atr_pct_now < required_edge_pct() * 1.2:  # 1.2–1.5x is a good range
+            blocks.append(f"anti-scalp: ATR% {atr_pct_now:.2f} < needed {required_edge_pct()*1.2:.2f}")
+            if level != "HARD": level = "SOFT"
+
 
     in_lane = bool(row['EMA20'] > row['EMA50'] and row['close'] > row['EMA20'])
     adx = float(row['ADX']) if pd.notna(row['ADX']) else 0.0
@@ -939,6 +964,17 @@ def hybrid_decision(symbol: str):
             last_dt = datetime.fromisoformat(info["ts"].replace("Z",""))
             if last_dt and (datetime.now(timezone.utc) - last_dt).total_seconds() < REENTRY_BLOCK_MIN * 60:
                 blocks.append(f"re-entry block ({REENTRY_BLOCK_MIN}m)")
+                level = "HARD"
+    except Exception:
+        pass
+
+        # Post-trade cooldown regardless of PnL
+    try:
+        ltc = LAST_TRADE_CLOSE.get(symbol)
+        if ltc:
+            last_dt = datetime.fromisoformat(ltc.replace("Z",""))
+            if (datetime.now(timezone.utc) - last_dt).total_seconds() < POST_TRADE_COOLDOWN_SEC:
+                blocks.append(f"post-trade cooldown {POST_TRADE_COOLDOWN_SEC}s")
                 level = "HARD"
     except Exception:
         pass
@@ -1026,6 +1062,11 @@ def hybrid_decision(symbol: str):
         exec_allowed = True
 
     score_for_gate = raw_score if exec_allowed else 0.0
+
+    # Require stronger confluence on weak volume
+    if (rvol is not None) and (rvol < RVOL_BASE_K):
+        score_gate += 0.3
+
 
     # Acción
     gate = score_gate
@@ -1142,6 +1183,9 @@ def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"
         send_telegram_message(f"✅ SELL {symbol}\nPrice: {sell_price}\nAmount: {amount}")
 
         LAST_SELL_INFO[symbol] = {"ts": sell_ts, "price": float(sell_price), "source": source}
+        LAST_TRADE_CLOSE[symbol] = sell_ts
+
+        
 
         features_exit = build_rich_features(symbol)
         save_trade_features(trade_id, symbol, 'exit', features_exit)
@@ -1203,7 +1247,13 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
             else:
                 trail_pct = clamp(1.2 * atr_pct, 1.5, 6.0)
                 take_profit = purchase_price * 1.03
-                min_hold_seconds = 30
+                min_hold_seconds = 60
+            
+            # Ensure TP clears round-trip fees + a tiny cushion
+            min_tp = purchase_price * (1.0 + required_edge_pct()/100.0 + 0.0005)
+            if take_profit < min_tp:
+                take_profit = min_tp
+
 
             highest = purchase_price
             initial_stop = purchase_price * (1 - (INIT_STOP_ATR_MULT * (atr_abs / purchase_price)))
@@ -1248,8 +1298,16 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 price_exit = False
                 if EXIT_MODE in ("price", "hybrid"):
                     if held_long_enough:
-                        if price <= stop_price or price >= take_profit:
-                            price_exit = True
+                        # Require edge > fees before allowing profit-taking exits
+                        edge_needed_pct = required_edge_pct()
+                        gain_pct = (price / purchase_price - 1.0) * 100.0
+                        edge_ok = gain_pct >= edge_needed_pct
+                        # Trailing: only valid once we’re above fee-break-even
+                        trail_ok = edge_ok and (price <= stop_price)
+                        # TP should also be beyond fees
+                        tp_ok = edge_ok and (price >= take_profit)
+                        price_exit = trail_ok or tp_ok
+
 
                 if (EXIT_MODE == "indicators" and indicator_exit) or \
                    (EXIT_MODE == "price" and price_exit) or \
