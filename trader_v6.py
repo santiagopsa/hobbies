@@ -2,25 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-THIS CODE SHOULD BE THE BASELINE FOR FOLLOWING VERSIONS
+Hybrid Crypto Spot Trader (Binance via ccxt) — r4.2 (Volatility-aware)
 
-Hybrid Crypto Spot Trader (Binance via ccxt) — r4.1 (Blocks vs Score, Schema-migration)
-
-Ajustes clave r4.1:
-- Migración segura de SQLite: añade learn_enabled si falta (evita 'no column named learn_enabled').
-- Separación de 'raw_score' (señal) vs 'score' (pasa por gate y bloqueos).
-- Bloqueos etiquetados: HARD/ SOFT; el controller puede relajar SOLO SOFT en hambruna de compras.
-- Logs enriquecidos: raw=…, score=…, blocks=[…], level=…, exec=…
-- Mantiene tu flujo, sizing, trailing, reconcile, startup_cleanup, learning.
+Cambios r4.2 sobre r4.1:
+- Perfilado de volatilidad por símbolo (stable / medium / unstable) vía ATR% 30D.
+- Umbrales por régimen: RSI/ADX/RVOL/score_gate_offset y re-entry pad dinámico.
+- Confirmación reforzada en inestables (EMA50 + VWAP + pad sobre último exit).
+- HARD block extra: si 4h RSI alto y 15m no muestra empuje real (MACDh>0 y RVOL15≥1.3) → HOLD.
+- Sizing y trailing/TP adaptativos a la volatilidad.
+- Min-hold antes de permitir exit por precio/indicadores (evita salidas de 3s).
+- Mantiene tus flujos, aprendizaje, controller, startup_cleanup, reconcile, etc.
 """
 
-import os, time, json, threading, sqlite3, logging, logging.handlers, random
+import os, time, json, threading, sqlite3, logging, logging.handlers, random, math
 from datetime import datetime, timezone, date
 import ccxt, numpy as np, pandas as pd, pandas_ta as ta, requests
 from dotenv import load_dotenv
 from scipy.stats import linregress
 from typing import Tuple
-import math
 
 # =========================
 # Config & initialization
@@ -77,7 +76,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # Exit mode & cadence
 EXIT_MODE = os.getenv("EXIT_MODE", "hybrid")  # "price" | "indicators" | "hybrid"
-EXIT_CHECK_EVERY_SEC = int(os.getenv("EXIT_CHECK_EVERY_SEC", "60"))
+EXIT_CHECK_EVERY_SEC = int(os.getenv("EXIT_CHECK_EVERY_SEC", "30"))
 TRAIL_TP_MULT = float(os.getenv("TRAIL_TP_MULT", "1.05"))
 
 # Momentum penalties/blocks
@@ -91,7 +90,7 @@ POST_LOSS_SIZING_WINDOW_SEC = 2 * 3600
 POST_LOSS_CONF_CAP = 78
 POST_LOSS_SIZING_FACTOR = 0.70
 REENTRY_BLOCK_MIN = 10
-REENTRY_ABOVE_LAST_EXIT_PAD = 0.0015  # 0.15%
+REENTRY_ABOVE_LAST_EXIT_PAD = 0.0015  # 0.15% (por defecto; se ajusta por régimen)
 
 # Volatility / crash protection
 INIT_STOP_ATR_MULT = 1.4
@@ -173,7 +172,6 @@ def initialize_db():
         )
     """)
 
-    # trade_analysis pudo haberse creado sin learn_enabled en versiones previas
     cur.execute("""
         CREATE TABLE IF NOT EXISTS trade_analysis (
             trade_id TEXT PRIMARY KEY,
@@ -185,7 +183,8 @@ def initialize_db():
             learn_enabled INTEGER DEFAULT 1
         )
     """)
-    # ── MIGRACIÓN: añade learn_enabled si falta ──
+
+    # MIGRACIÓN: añade learn_enabled si falta
     try:
         cur.execute("PRAGMA table_info(trade_analysis)")
         cols = {r[1] for r in cur.fetchall()}
@@ -241,11 +240,9 @@ exchange = ccxt.binance({
     'options': {'defaultType': 'spot', 'adjustForTimeDifference': True}
 })
 
-
 # =========================
-# Cleanup helpers
+# Binance filter helpers
 # =========================
-
 def _bn_filters(symbol):
     m = exchange.markets.get(symbol, {})
     step = min_qty = min_notional = None
@@ -254,7 +251,6 @@ def _bn_filters(symbol):
             if f.get('filterType') == 'LOT_SIZE':
                 step = float(f['stepSize'])
                 min_qty = float(f['minQty'])
-            # Binance may use NOTIONAL now (or MIN_NOTIONAL on older symbols)
             if f.get('filterType') in ('NOTIONAL', 'MIN_NOTIONAL'):
                 min_notional = float(f.get('minNotional') or f.get('minNotional', 0))
     except Exception:
@@ -262,20 +258,20 @@ def _bn_filters(symbol):
     return step, min_qty, min_notional
 
 def _floor_to_step(x, step):
-    if not step or step <= 0: 
+    if not step or step <= 0:
         return x
     return math.floor(x / step) * step
 
 def _prepare_sell_amount(symbol, desired_amt, px):
     step, min_qty, min_notional = _bn_filters(symbol)
     amt = desired_amt * 0.999  # safety buffer
-    if step: amt = _floor_to_step(amt, step)
-    if min_qty and amt < min_qty: 
+    if step:
+        amt = _floor_to_step(amt, step)
+    if min_qty and amt < min_qty:
         return 0.0, "amount < minQty"
     if min_notional and px and (amt * px) < min_notional:
         return 0.0, "notional < minNotional"
     return amt, None
-
 
 # =========================
 # Telegram helpers
@@ -580,6 +576,39 @@ def quick_tf_snapshot(symbol: str, timeframe: str, limit: int = 120):
     return snap
 
 # =========================
+# Volatility profiling (NEW)
+# =========================
+VOL_CACHE = {}  # symbol -> {"class": "stable|medium|unstable", "atrp_30d": float, "ts": iso}
+
+def _atrp_median(df: pd.DataFrame) -> float:
+    atr = ta.atr(df['high'], df['low'], df['close'], length=14)
+    if atr is None or atr.empty: return None
+    atrp = (atr / df['close'] * 100.0).dropna()
+    return float(atrp.tail(200).median()) if len(atrp) else None
+
+def classify_symbol(symbol: str) -> dict:
+    now = datetime.now(timezone.utc)
+    c = VOL_CACHE.get(symbol)
+    if c and (now - datetime.fromisoformat(c["ts"])).total_seconds() < 3600:
+        return c
+    df = fetch_and_prepare_df(symbol, "4h", limit=400)
+    if df is None or len(df) < 120:
+        cls = {"class": "medium", "atrp_30d": None, "ts": now.isoformat()}
+        VOL_CACHE[symbol] = cls; return cls
+    atrp = _atrp_median(df)
+    if atrp is None:
+        klass = "medium"
+    elif atrp < 1.2:
+        klass = "stable"
+    elif atrp > 2.2:
+        klass = "unstable"
+    else:
+        klass = "medium"
+    cls = {"class": klass, "atrp_30d": atrp, "ts": now.isoformat()}
+    VOL_CACHE[symbol] = cls
+    return cls
+
+# =========================
 # Learning state
 # =========================
 def get_learn_params(symbol_base: str):
@@ -722,29 +751,19 @@ def estimate_slippage_pct(symbol: str, notional: float = MIN_NOTIONAL):
 # No-Buy-Under-Sell gate
 # =========================
 def is_selling_condition_now(symbol: str) -> Tuple[bool, str]:
-    """
-    Devuelve (True, motivo) si la combinación 15m/1h sugiere vender/evitar compras ahora.
-    Maneja con seguridad la ausencia de datos/indicadores.
-    """
     rsi15 = None
     macdh15 = None
     adx1h = None
-
     try:
         df15 = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=80)
         df1h = fetch_and_prepare_data_hybrid(symbol, timeframe="1h",  limit=80)
-
         if df15 is None or df1h is None or len(df15) == 0 or len(df1h) == 0:
             return False, "no data"
-
-        # RSI 15m
         try:
             if 'RSI' in df15 and not pd.isna(df15['RSI'].iloc[-1]):
                 rsi15 = float(df15['RSI'].iloc[-1])
         except Exception:
             rsi15 = None
-
-        # MACD hist 15m
         try:
             macd15 = ta.macd(df15['close'], fast=12, slow=26, signal=9)
             if macd15 is not None and not macd15.empty and 'MACDh_12_26_9' in macd15:
@@ -753,39 +772,57 @@ def is_selling_condition_now(symbol: str) -> Tuple[bool, str]:
                     macdh15 = float(mh)
         except Exception:
             macdh15 = None
-
-        # ADX 1h
         try:
             if 'ADX' in df1h and not pd.isna(df1h['ADX'].iloc[-1]):
                 adx1h = float(df1h['ADX'].iloc[-1])
         except Exception:
             adx1h = None
 
-        # Regla 1: 15m sobrecomprado + MACDh <= 0
         if (rsi15 is not None and rsi15 >= NBUS_RSI15_OB) and (macdh15 is not None and macdh15 <= NBUS_MACDH15_NEG):
             rsi_txt = f"{rsi15:.1f}" if rsi15 is not None else "—"
             mh_txt  = f"{macdh15:.3f}" if macdh15 is not None else "—"
             return True, f"15m overbought+MACDh≤0 (RSI15={rsi_txt}, MACDh15={mh_txt})"
-
-        # Regla 2: ADX 1h colapsado
         if adx1h is not None and adx1h < NBUS_ADX1H_MIN:
             adx_txt = f"{adx1h:.1f}"
             return True, f"ADX1h<{NBUS_ADX1H_MIN:.0f} (ADX1h={adx_txt})"
-
         return False, "ok"
-
     except Exception as e:
         logger.debug(f"is_selling_condition_now error {symbol}: {e}")
-        # Aseguramos un retorno estable
         return False, "error"
+
 # =========================
-# Decision (reworked to keep raw_score)
+# Decision (volatility aware)
 # =========================
 def hybrid_decision(symbol: str):
     base = symbol.split('/')[0]
     lp = get_learn_params(base)
+    # valores aprendidos base
     RSI_MIN = lp["rsi_min"]; RSI_MAX = lp["rsi_max"]
     ADX_MIN = lp["adx_min"]; RVOL_BASE = lp["rvol_base"]
+
+    # Perfil de volatilidad
+    prof = classify_symbol(symbol)
+    klass = prof["class"]
+
+    # Overlays por régimen
+    RSI_MIN_K, RSI_MAX_K = RSI_MIN, RSI_MAX
+    ADX_MIN_K = ADX_MIN
+    RVOL_BASE_K = RVOL_BASE
+    SCORE_GATE_OFFSET = 0.0
+    REENTRY_PAD = REENTRY_ABOVE_LAST_EXIT_PAD
+
+    if klass == "stable":
+        RSI_MIN_K, RSI_MAX_K = max(RSI_MIN, 52), min(RSI_MAX, 68)
+        ADX_MIN_K = max(18, ADX_MIN - 2)
+        RVOL_BASE_K = max(0.8, RVOL_BASE * 0.8)
+        SCORE_GATE_OFFSET = -0.2
+        REENTRY_PAD = 0.0015
+    elif klass == "unstable":
+        RSI_MIN_K, RSI_MAX_K = max(48, RSI_MIN - 2), min(65, RSI_MAX)
+        ADX_MIN_K = max(25, ADX_MIN)
+        RVOL_BASE_K = max(1.1, RVOL_BASE)
+        SCORE_GATE_OFFSET = +0.3
+        REENTRY_PAD = 0.0035
 
     blocks = []
     level = "NONE"  # NONE | SOFT | HARD
@@ -817,23 +854,22 @@ def hybrid_decision(symbol: str):
     if df is None or len(df) < 60:
         blocks.append("not enough candles")
         level = "HARD"
-        # Aún así devolvemos algo coherente:
         return "hold", 50, 0.0, " | ".join(blocks)
 
     row = df.iloc[-1]
-    score_gate = get_score_gate()
+    score_gate = get_score_gate() + SCORE_GATE_OFFSET
 
     in_lane = bool(row['EMA20'] > row['EMA50'] and row['close'] > row['EMA20'])
     adx = float(row['ADX']) if pd.notna(row['ADX']) else 0.0
     rvol = float(row['RVOL10']) if pd.notna(row['RVOL10']) else None
     price_slope = float(row.get('PRICE_SLOPE10', 0.0) or 0.0)
 
-    # RVOL sanity → SOFT (no matamos el score)
+    # RVOL sanity → SOFT
     if rvol is None or not np.isfinite(rvol) or rvol < RVOL_VALUE_MIN:
         blocks.append("RVOL invalid/too small")
         if level != "HARD": level = "SOFT"
 
-    # Snapshots para HARD softeners
+    # Snapshots
     tf15 = quick_tf_snapshot(symbol, '15m', limit=120)
     tf4h = quick_tf_snapshot(symbol, '4h',  limit=120)
 
@@ -850,6 +886,13 @@ def hybrid_decision(symbol: str):
         if rsi_4h is not None and rsi_4h >= (RSI_OVERBOUGHT_4H + 2.0):
             blocks.append("HARD block: 4h too overbought")
             level = "HARD"
+        # Extra para "unstable": requiere empuje real si 4h RSI alto
+        if klass == "unstable" and rsi_4h is not None and rsi_4h >= 68:
+            rv15 = tf15.get('RVOL10') or 0
+            mh15 = tf15.get('MACDh') or 0
+            if not (mh15 > 0 and rv15 >= 1.3):
+                blocks.append("HARD block: 4h high RSI but 15m lacks RVOL/MACDh")
+                level = "HARD"
     except Exception:
         pass
 
@@ -859,7 +902,7 @@ def hybrid_decision(symbol: str):
         blocks.append(f"NBUS: {reason}")
         level = "HARD"
 
-    # Post-loss cooldown → HARD (con override ya aplicado dentro)
+    # Post-loss cooldown → HARD (override estricto)
     try:
         now = datetime.now(timezone.utc)
         info = LAST_LOSS_INFO.get(symbol)
@@ -867,7 +910,6 @@ def hybrid_decision(symbol: str):
             last_dt = datetime.fromisoformat(info["ts"].replace("Z",""))
             within_cooldown = last_dt and (now - last_dt).total_seconds() < COOLDOWN_MIN_AFTER_LOSS * 60
             if within_cooldown:
-                # chequeo de override estricto
                 df15 = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=120)
                 post_loss_override = False
                 if df15 is not None and len(df15) > 30:
@@ -901,39 +943,46 @@ def hybrid_decision(symbol: str):
     except Exception:
         pass
 
-    # Confirmación (EMA/VWAP/exitPad) → SOFT (se puede relajar)
+    # Confirmación (EMA/VWAP/exitPad) por régimen → SOFT
     try:
         last = float(row['close'])
         ema20_1h = float(row['EMA20']) if pd.notna(row['EMA20']) else None
+        ema50_1h = float(row['EMA50']) if pd.notna(row['EMA50']) else None
         vwap_1h = float(row['VWAP']) if pd.notna(row['VWAP']) else None
-        ok_a = ema20_1h is None or last > ema20_1h
-        ok_b = vwap_1h is None or last >= vwap_1h
-        ok_c = True
+
+        ema_ok = (ema20_1h is None or last > ema20_1h)
+        if klass == "unstable":
+            ema_ok = ema_ok and (ema50_1h is None or last > ema50_1h)
+
+        vwap_ok = (vwap_1h is None) or (last >= vwap_1h)
+
         le = LAST_SELL_INFO.get(symbol)
+        exit_ok = True
         if le and le.get("price") is not None:
-            ok_c = last >= float(le["price"]) * (1.0 + REENTRY_ABOVE_LAST_EXIT_PAD)
-        if not (ok_a and ok_b and ok_c):
+            exit_ok = last >= float(le["price"]) * (1.0 + REENTRY_PAD)
+
+        if not (ema_ok and vwap_ok and exit_ok):
             blocks.append("confirmation failed (EMA/VWAP/exitPad)")
             if level != "HARD": level = "SOFT"
     except Exception:
         pass
 
     # ¿En lane o override fuerte?
-    override = (not in_lane) and (adx >= ADX_MIN + 10) and (rvol is not None and rvol >= RVOL_BASE * 1.5) and (price_slope > 0)
+    override = (not in_lane) and (adx >= ADX_MIN_K + 10) and (rvol is not None and rvol >= RVOL_BASE_K * 1.5) and (price_slope > 0)
     if not (in_lane or override):
         blocks.append("not in uptrend lane; no override")
-        if level != "HARD": level = "SOFT"  # lo tratamos como SOFT para permitir override en hambruna
+        if level != "HARD": level = "SOFT"
 
-    # ───────────────── raw_score (NO se anula por bloqueos)
+    # ─── raw_score (NO se anula por bloqueos)
     score = 0.0; notes = []
-    if rvol is not None and rvol >= RVOL_BASE: score += 2.0; notes.append(f"RVOL≥{RVOL_BASE:.2f} ({rvol:.2f})")
-    if rvol is not None and rvol >= RVOL_BASE + 0.5: score += 1.0
-    if rvol is not None and rvol >= RVOL_BASE + 1.5: score += 1.0
+    if rvol is not None and rvol >= RVOL_BASE_K: score += 2.0; notes.append(f"RVOL≥{RVOL_BASE_K:.2f} ({(rvol or 0):.2f})")
+    if rvol is not None and rvol >= RVOL_BASE_K + 0.5: score += 1.0
+    if rvol is not None and rvol >= RVOL_BASE_K + 1.5: score += 1.0
     if price_slope > 0: score += 1.0; notes.append("price slope>0")
     rsi = float(row['RSI']) if pd.notna(row['RSI']) else 50.0
-    if RSI_MIN <= rsi <= RSI_MAX: score += 1.0; notes.append(f"RSI in band ({rsi:.1f})")
-    if rsi >= (RSI_MIN + RSI_MAX)/2: score += 0.5
-    if adx >= ADX_MIN: score += 1.0; notes.append(f"ADX≥{ADX_MIN:.0f} ({adx:.1f})")
+    if RSI_MIN_K <= rsi <= RSI_MAX_K: score += 1.0; notes.append(f"RSI in band ({rsi:.1f})")
+    if rsi >= (RSI_MIN_K + RSI_MAX_K)/2: score += 0.5
+    if adx >= ADX_MIN_K: score += 1.0; notes.append(f"ADX≥{ADX_MIN_K:.0f} ({adx:.1f})")
     vol_slope = float(row.get('VOL_SLOPE10', 0.0) or 0.0)
     if vol_slope > 0: score += 0.5
 
@@ -944,7 +993,7 @@ def hybrid_decision(symbol: str):
     except Exception:
         pass
 
-    # Jitter (igual que antes)
+    # Jitter
     try:
         conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
         cur.execute("SELECT executed FROM decision_log ORDER BY id DESC LIMIT ?", (DECISION_WINDOW,))
@@ -961,12 +1010,12 @@ def hybrid_decision(symbol: str):
         score += jitter
         notes.append(f"jitter {jitter:+.2f} (p={explore_p:.2f})")
 
-    raw_score = max(0.0, score)  # por sanidad
+    raw_score = max(0.0, score)
 
-    # ───────────────── Política de ejecución (HARD bloquea; SOFT puede relajarse en hambruna)
+    # Ejecutabilidad (HARD bloquea; SOFT puede relajarse en hambruna)
     buy_ratio = _recent_buy_ratio()
     starvation = buy_ratio < TARGET_BUY_RATIO
-    relax_soft = starvation  # puedes añadir más condiciones si quieres
+    relax_soft = starvation
 
     if level == "HARD":
         exec_allowed = False
@@ -989,8 +1038,8 @@ def hybrid_decision(symbol: str):
     if symbol in LAST_LOSS_INFO:
         conf = min(conf, POST_LOSS_CONF_CAP)
 
-    # Nota rica
     note = f"raw={raw_score:.1f} gate={gate:.1f} score={score_for_gate:.1f} | " + ", ".join(notes)
+    note += f" | class={klass}"
     if blocks:
         note += f" | blocks=[{'; '.join(blocks)}] level={level} exec={exec_allowed}"
 
@@ -1097,7 +1146,7 @@ def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"
         features_exit = build_rich_features(symbol)
         save_trade_features(trade_id, symbol, 'exit', features_exit)
 
-        # ── NUEVO: resumen de EXIT FEATURES para Telegram y logs ──
+        # EXIT FEATURES
         try:
             gen = features_exit.get("general", {})
             ob  = features_exit.get("orderbook", {})
@@ -1119,13 +1168,11 @@ def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"
             )
             send_telegram_message(exit_summary)
 
-            # También adjuntamos el JSON como documento + un encabezado extra en el bundle
             send_feature_bundle_telegram(
                 trade_id, symbol, 'exit', features_exit,
                 extra_lines="(exit snapshot adjunto como JSON)\n"
             )
 
-            # Log “compacto” al file/console
             logger.info(
                 f"[exit-features] {symbol} trade={trade_id} | "
                 f"1h RSI={_fmt(tf1h.get('rsi'))} ADX={_fmt(tf1h.get('adx'))} RVOL10={_fmt(tf1h.get('rvol10'))} "
@@ -1135,7 +1182,6 @@ def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"
         except Exception as e:
             logger.warning(f"exit features reporting error {symbol}: {e}")
 
-        # Aprendizaje post-trade (igual que antes)
         analyze_and_learn(trade_id, sell_price, learn_enabled=(source != "startup"))
 
         logger.info(f"Sold {symbol} @ {sell_price} (trade {trade_id})")
@@ -1145,10 +1191,21 @@ def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"
 def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, trade_id: str, atr_abs: float):
     def loop():
         try:
-            highest = purchase_price
+            # Perfil de volatilidad → trail/TP + min-hold
+            prof_local = classify_symbol(symbol); klass_local = prof_local["class"]
+            opened_ts = datetime.now(timezone.utc)
             atr_pct = (atr_abs / purchase_price) * 100 if purchase_price > 0 and atr_abs else 2.0
-            trail_pct = min(max(1.5 * atr_pct, 2.0), 8.0)
-            take_profit = purchase_price * TRAIL_TP_MULT
+
+            if klass_local == "unstable":
+                trail_pct = clamp(1.8 * atr_pct, 2.0, 10.0)
+                take_profit = purchase_price * 1.08
+                min_hold_seconds = 45
+            else:
+                trail_pct = clamp(1.2 * atr_pct, 1.5, 6.0)
+                take_profit = purchase_price * 1.03
+                min_hold_seconds = 30
+
+            highest = purchase_price
             initial_stop = purchase_price * (1 - (INIT_STOP_ATR_MULT * (atr_abs / purchase_price)))
 
             while True:
@@ -1159,13 +1216,18 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 if price > highest: highest = price
                 stop_price = highest * (1 - trail_pct/100.0)
 
+                # Stop inicial (protección)
                 if price <= initial_stop:
                     logger.info(f"[init-stop] {symbol} hit initial stop at {initial_stop:.6f}")
                     sell_symbol(symbol, amount, trade_id, source="trail")
                     break
 
+                # No permitir exits antes de min_hold (salvo stop duro)
+                held = (datetime.now(timezone.utc) - opened_ts).total_seconds()
+                held_long_enough = held >= min_hold_seconds
+
                 indicator_exit = False
-                if EXIT_MODE in ("indicators", "hybrid"):
+                if EXIT_MODE in ("indicators", "hybrid") and held_long_enough:
                     df15 = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=60)
                     df1h = fetch_and_prepare_data_hybrid(symbol, timeframe="1h",  limit=60)
                     try:
@@ -1185,8 +1247,9 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
 
                 price_exit = False
                 if EXIT_MODE in ("price", "hybrid"):
-                    if price <= stop_price or price >= take_profit:
-                        price_exit = True
+                    if held_long_enough:
+                        if price <= stop_price or price >= take_profit:
+                            price_exit = True
 
                 if (EXIT_MODE == "indicators" and indicator_exit) or \
                    (EXIT_MODE == "price" and price_exit) or \
@@ -1303,6 +1366,7 @@ def analyze_and_learn(trade_id: str, sell_price: float = None, learn_enabled: bo
             adx_min = _clip_delta(lp["adx_min"], adx_min)
             rvol_base = _clip_delta(lp["rvol_base"], rvol_base)
 
+            # mean reversion a defaults
             rsi_min = (1 - MEAN_REV_WEIGHT)*rsi_min + MEAN_REV_WEIGHT*RSI_MIN_DEFAULT
             rsi_max = (1 - MEAN_REV_WEIGHT)*rsi_max + MEAN_REV_WEIGHT*RSI_MAX_DEFAULT
             adx_min = (1 - MEAN_REV_WEIGHT)*adx_min + MEAN_REV_WEIGHT*ADX_MIN_DEFAULT
@@ -1330,10 +1394,9 @@ def analyze_and_learn(trade_id: str, sell_price: float = None, learn_enabled: bo
             f"📊 *Trade Analysis* {outcome}  {symbol}",
             f"Trade: `{trade_id}`",
             f"PnL: `{analysis['pnl_usdt']:.4f} USDT`  (`{analysis['pnl_pct']:.2f}%`)  Duration: `{analysis['duration_sec']}s`",
-            f"*Entry* → RSI `{analysis['entry']['rsi']}`, ADX `{analysis['entry']['adx']}`, RVOL `{analysis['entry']['rvol']}`",
-            f"*Exit*  → RSI `{analysis['exit']['rsi']}`, ADX `{analysis['exit']['adx']}`, RVOL `{analysis['exit']['rvol']}`",
+            f"*Entry* → RSI `{analysis['entry']['rsi']}`  ADX `{analysis['entry']['adx']}`  RVOL `{analysis['entry']['rvol']}`",
+            f"*Exit*  → RSI `{analysis['exit']['rsi']}`  ADX `{analysis['exit']['adx']}`  RVOL `{analysis['exit']['rvol']}`",
         ]
-
         if adjustments:
             adj_txt = ", ".join([f"{k}:{v['old']}→{v['new']}" for k,v in adjustments.items()])
             lines.append(f"Learned nudges → {adj_txt}")
@@ -1351,14 +1414,18 @@ def analyze_and_learn(trade_id: str, sell_price: float = None, learn_enabled: bo
         logger.error(f"analyze_and_learn error {trade_id}: {e}", exc_info=True)
 
 # =========================
-# Sizing
+# Sizing (volatility-aware)
 # =========================
 def size_position(price: float, usdt_balance: float, confidence: int, symbol: str = None) -> float:
-    if not price or price <= 0: return 0.0
+    if not price or price <= 0: 
+        return 0.0
+
+    # base fraction por confianza
     conf_mult = (confidence - 50) / 50.0
     conf_mult = max(0.0, min(conf_mult, 0.84))
     base_frac = RISK_FRACTION * (0.6 + 0.4 * conf_mult)
 
+    # penalización temporal post-pérdida
     if symbol and symbol in LAST_LOSS_INFO:
         try:
             last_dt = datetime.fromisoformat(LAST_LOSS_INFO[symbol]["ts"].replace("Z",""))
@@ -1367,14 +1434,27 @@ def size_position(price: float, usdt_balance: float, confidence: int, symbol: st
         except Exception:
             pass
 
+    # slippage shave
     slip_pct = estimate_slippage_pct(symbol, notional=MIN_NOTIONAL) if symbol else 0.05
     shave = clamp(1.0 - (slip_pct/100.0)*0.5, 0.9, 1.0)
-    budget = usdt_balance * base_frac * shave
 
+    # ajuste por volatilidad (1/sqrt(ATR%)), cap en [0.6, 1.4]
+    vol_adj = 1.0
+    try:
+        prof = classify_symbol(symbol) if symbol else None
+        atrp = (prof or {}).get("atrp_30d")
+        if atrp:
+            vol_adj = clamp(1.0 / max(0.8, math.sqrt(atrp)), 0.6, 1.4)
+    except Exception:
+        pass
+
+    budget = usdt_balance * base_frac * shave * vol_adj
     amount = max(MIN_NOTIONAL / price, budget / price)
     return amount
 
+# =========================
 # Portfolio util & crash halt
+# =========================
 def portfolio_utilization():
     try:
         bal = exchange.fetch_balance() or {}
@@ -1574,43 +1654,8 @@ def reconcile_orphan_open_buys():
     except Exception as e:
         logger.error(f"reconcile_orphan_open_buys error: {e}", exc_info=True)
 
-import math  # add this at the top with other imports
-
 # =========================
-# Binance filter helpers
-# =========================
-def _bn_filters(symbol):
-    m = exchange.markets.get(symbol, {})
-    step = min_qty = min_notional = None
-    try:
-        for f in m.get('info', {}).get('filters', []):
-            if f.get('filterType') == 'LOT_SIZE':
-                step = float(f['stepSize'])
-                min_qty = float(f['minQty'])
-            if f.get('filterType') in ('NOTIONAL', 'MIN_NOTIONAL'):
-                min_notional = float(f.get('minNotional') or f.get('minNotional', 0))
-    except Exception:
-        pass
-    return step, min_qty, min_notional
-
-def _floor_to_step(x, step):
-    if not step or step <= 0: 
-        return x
-    return math.floor(x / step) * step
-
-def _prepare_sell_amount(symbol, desired_amt, px):
-    step, min_qty, min_notional = _bn_filters(symbol)
-    amt = desired_amt * 0.999  # safety buffer
-    if step:
-        amt = _floor_to_step(amt, step)
-    if min_qty and amt < min_qty:
-        return 0.0, "amount < minQty"
-    if min_notional and px and (amt * px) < min_notional:
-        return 0.0, "notional < minNotional"
-    return amt, None
-
-# =========================
-# STARTUP CLEANUP (patched)
+# STARTUP CLEANUP
 # =========================
 def startup_cleanup():
     logger.info("Startup cleanup: closing non-USDT balances and syncing DB states...")
@@ -1629,15 +1674,14 @@ def startup_cleanup():
         for asset, amt in non_usdt.items():
             symbol = f"{asset}/USDT"
             if symbol not in getattr(exchange, "markets", {}):
-                logger.info(f"Skip {asset}: market {symbol} not found"); 
+                logger.info(f"Skip {asset}: market {symbol} not found")
                 continue
 
             px = fetch_price(symbol)
             if not px or px <= 0:
-                logger.info(f"Skip {symbol}: no price on cleanup"); 
+                logger.info(f"Skip {symbol}: no price on cleanup")
                 continue
 
-            # Determine sellable amount respecting balance and filters
             free_bal = float(free.get(asset, 0) or 0)
             desired = min(free_bal, amt)
             sell_amt, reason = _prepare_sell_amount(symbol, desired, px)
@@ -1648,7 +1692,6 @@ def startup_cleanup():
             try:
                 order = exchange.create_market_sell_order(symbol, sell_amt)
             except ccxt.InsufficientFunds:
-                # retry with 0.5% less
                 sell_amt_retry, reason2 = _prepare_sell_amount(symbol, sell_amt * 0.995, px)
                 if sell_amt_retry > 0:
                     try:
@@ -1698,10 +1741,10 @@ def startup_cleanup():
         logger.error(f"startup_cleanup fatal: {e}", exc_info=True)
 
 # =========================
-# Main loop (r4.1)
+# Main loop (r4.2)
 # =========================
 if __name__ == "__main__":
-    logger.info("Starting hybrid trader (r4.1)…")
+    logger.info("Starting hybrid trader (r4.2)…")
     try:
         try: exchange.load_markets()
         except Exception as e: logger.warning(f"load_markets warning: {e}")
@@ -1738,3 +1781,5 @@ if __name__ == "__main__":
             try: h.close()
             except Exception: pass
             logger.removeHandler(h)
+
+           
