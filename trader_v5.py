@@ -16,6 +16,8 @@ Key ideas:
 - ==== NEW: Slippage-aware sizing & spread penalty
 - ==== NEW: Post-loss momentum override (ADX15/RVOL15/MACDh/EMA20)
 - ==== NEW r3: Crash-halt per-symbol momentum override (ADX15>25 & price>EMA20 on 15m)
+- ==== FIX: Pre-exit guard — never buy while immediate sell conditions are already true
+- ==== FIX: Anti-churn on exits — grace window + minimal favorable move before indicator/price exits can trigger
 """
 
 import os, time, json, threading, sqlite3, logging, logging.handlers, random
@@ -103,6 +105,10 @@ CRASH_HALT_WINDOW_MIN = 15    # minutes window on BTC
 CRASH_HALT_ENABLE_OVERRIDE = True
 CRASH_HALT_OVERRIDE_MIN_ADX15 = 25.0
 CRASH_HALT_OVERRIDE_REQUIRE_EMA20 = True  # require price > EMA20(15m)
+
+# --- Exit hygiene / anti-churn (FIX)
+INDICATOR_EXIT_GRACE_SEC = int(os.getenv("IND_EXIT_GRACE_SEC", "120"))   # no indicator/trailing exits in first N sec
+INDICATOR_EXIT_MIN_UPMOVE_PCT = float(os.getenv("IND_EXIT_MIN_UP_PCT", "0.15"))  # need +0.15% before allowing indicator/price exits
 
 # Logger
 logger = logging.getLogger("hybrid_trader")
@@ -679,8 +685,11 @@ def hybrid_decision(symbol: str):
     # Momentum override if not in lane
     adx = float(row['ADX']) if pd.notna(row['ADX']) else 0.0
     rvol = float(row['RVOL10']) if pd.notna(row['RVOL10']) else 0.0
+    # RVOL sanity (avoid absurdly small due to data gaps)
+    if rvol is None or not np.isfinite(rvol) or rvol <= 0:
+        rvol = 0.001
     price_slope = float(row.get('PRICE_SLOPE10', 0.0) or 0.0)
-    override = (not in_lane) and (adx >= ADX_MIN + 10) and (rvol >= RVOL_BASE * 1.5) and (price_slope > 0)
+    override = (not in_lane) and (adx >= ADX_MIN + 10) and (rvol >= max(0.2, RVOL_BASE * 1.5)) and (price_slope > 0)
 
     # quick multi-timeframe context
     tf15 = quick_tf_snapshot(symbol, '15m', limit=120)
@@ -722,6 +731,25 @@ def hybrid_decision(symbol: str):
                     return "hold", 58, 1.2, "post-loss: waiting 15m momentum reset"
     except Exception:
         post_loss_override = False
+
+    # === PRE-EXIT GUARD (FIX): never buy when exit-like conditions are already true
+    try:
+        rsi_15_now = tf15.get('RSI') if tf15 else None
+        macdh_15_now = tf15.get('MACDh') if tf15 else None
+        close_1h = float(row['close'])
+        ema20_1h = float(row['EMA20']) if pd.notna(row['EMA20']) else None
+        adx_1h = float(row['ADX']) if pd.notna(row['ADX']) else None
+
+        sellish_15m = (rsi_15_now is not None and rsi_15_now >= 70.0 and macdh_15_now is not None and macdh_15_now < 0)
+        sellish_1h  = (adx_1h is not None and adx_1h < 20.0 and ema20_1h is not None and close_1h < ema20_1h)
+
+        if sellish_15m or sellish_1h:
+            reason = []
+            if sellish_15m: reason.append("15m RSI≥70 & MACDh<0")
+            if sellish_1h:  reason.append("1h ADX<20 & price<EMA20")
+            return "hold", 58, 0.0, "pre-exit guard: " + " + ".join(reason)
+    except Exception:
+        pass
 
     if not (in_lane or override):
         return "hold", 55, 1.0, "not in uptrend lane; no override"
@@ -906,11 +934,10 @@ def sell_symbol(symbol: str, amount: float, trade_id: str):
 def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, trade_id: str, atr_abs: float):
     """
     Hybrid trailing with indicator exhaustion (config EXIT_MODE).
-    price-based: trail% (scaled by ATR) + optional TP
-    indicator-based: exit if momentum exhausts (15m RSI>70 & MACDh<0, ADX1h collapse, etc.)
     """
     def loop():
         try:
+            started = time.time()  # FIX: track entry time
             highest = purchase_price
             atr_pct = (atr_abs / purchase_price) * 100 if purchase_price > 0 and atr_abs else 2.0
             trail_pct = min(max(1.5 * atr_pct, 2.0), 8.0)
@@ -927,38 +954,52 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 if price > highest: highest = price
                 stop_price = highest * (1 - trail_pct/100.0)
 
-                # initial stop guard
+                # initial stop guard (always allowed)
                 if price <= initial_stop:
                     logger.info(f"[init-stop] {symbol} hit initial stop at {initial_stop:.6f}")
                     sell_symbol(symbol, amount, trade_id)
                     break
 
-                # indicator exhaustion checks
+                # TP (always allowed)
+                if price >= take_profit and (EXIT_MODE in ("price","hybrid")):
+                    sell_symbol(symbol, amount, trade_id)
+                    break
+
+                # FIX: anti-churn gating for indicator/price exits
+                elapsed = time.time() - started
+                upmove_pct = (highest / purchase_price - 1.0) * 100.0
+
+                allow_indicator_checks = (
+                    elapsed >= INDICATOR_EXIT_GRACE_SEC and
+                    upmove_pct >= INDICATOR_EXIT_MIN_UPMOVE_PCT
+                )
+
                 indicator_exit = False
-                if EXIT_MODE in ("indicators", "hybrid"):
-                    df15 = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=60)
-                    df1h = fetch_and_prepare_data_hybrid(symbol, timeframe="1h",  limit=60)
+                if EXIT_MODE in ("indicators", "hybrid") and allow_indicator_checks:
                     try:
+                        df15 = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=60)
+                        df1h = fetch_and_prepare_data_hybrid(symbol, timeframe="1h",  limit=60)
                         if df15 is not None and df1h is not None:
                             rsi15 = float(df15['RSI'].iloc[-1]) if 'RSI' in df15 else None
                             adx1h = float(df1h['ADX'].iloc[-1]) if 'ADX' in df1h else None
                             macd_df15 = ta.macd(df15['close'], fast=12, slow=26, signal=9)
                             macdh15 = float(macd_df15['MACDh_12_26_9'].iloc[-1]) if macd_df15 is not None else None
+                            ema20_1h = float(ta.ema(df1h['close'], length=20).iloc[-1])
+                            last_1h = float(df1h['close'].iloc[-1])
 
-                            if (rsi15 is not None and rsi15 > 70 and macdh15 is not None and macdh15 < 0):
-                                indicator_exit = True
-                            if (adx1h is not None and adx1h < 20):
-                                indicator_exit = True
+                            cond_15m = (rsi15 is not None and rsi15 > 70 and macdh15 is not None and macdh15 < 0)
+                            cond_1h  = (adx1h is not None and adx1h < 20 and last_1h < ema20_1h)
 
-                            if indicator_exit:
-                                logger.info(f"[trail-exit] {symbol} momentum exhausted (RSI15={rsi15}, MACDh15={macdh15}, ADX1h={adx1h})")
+                            if cond_15m or cond_1h:
+                                indicator_exit = True
+                                logger.info(f"[trail-exit] {symbol} indicator exit (15m:{cond_15m} 1h:{cond_1h}) "
+                                            f"elapsed={elapsed:.0f}s upmove={upmove_pct:.2f}%")
                     except Exception as e:
                         logger.debug(f"indicator check error {symbol}: {e}")
 
-                # price-based trailing conditions
                 price_exit = False
-                if EXIT_MODE in ("price", "hybrid"):
-                    if price <= stop_price or price >= take_profit:
+                if EXIT_MODE in ("price","hybrid") and (elapsed >= INDICATOR_EXIT_GRACE_SEC or upmove_pct >= INDICATOR_EXIT_MIN_UPMOVE_PCT):
+                    if price <= stop_price:
                         price_exit = True
 
                 if (EXIT_MODE == "indicators" and indicator_exit) or \
@@ -1093,6 +1134,14 @@ def analyze_and_learn(trade_id: str, sell_price: float = None):
                 LAST_PARAM_UPDATE[base] = date.today().isoformat()
 
         conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+        cur.execute("""
+            INSERT OR REPLACE INTO trade_analysis (trade_id, ts, symbol, pnl_usdt, pnl_pct, duration_sec,
+                                                   entry_snapshot_json, exit_snapshot_json, adjustments_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (trade_id, datetime.now(timezone.utc).isoformat(), symbol,
+              float(analysis["pnl_usdt"]), float(analysis["pnl_pct"]), int(analysis["duration_sec"])),
+        )
+        # sqlite requires full arg list; do again with all params (explicit to avoid confusion)
         cur.execute("""
             INSERT OR REPLACE INTO trade_analysis (trade_id, ts, symbol, pnl_usdt, pnl_pct, duration_sec,
                                                    entry_snapshot_json, exit_snapshot_json, adjustments_json)
@@ -1451,7 +1500,7 @@ def startup_cleanup():
 # Main loop (r3 crash-halt override)
 # =========================
 if __name__ == "__main__":
-    logger.info("Starting hybrid trader (r3)...")
+    logger.info("Starting hybrid trader (r3, with pre-exit guard & anti-churn exits)...")
     try:
         try: exchange.load_markets()
         except Exception as e: logger.warning(f"load_markets warning: {e}")
