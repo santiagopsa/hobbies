@@ -85,6 +85,58 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 EXIT_MODE = os.getenv("EXIT_MODE", "hybrid")  # "price" | "indicators" | "hybrid"
 EXIT_CHECK_EVERY_SEC = int(os.getenv("EXIT_CHECK_EVERY_SEC", "30"))
 TRAIL_TP_MULT = float(os.getenv("TRAIL_TP_MULT", "1.05"))
+# >>> PATCH START: REBOUND/TRAIL/TIME knobs
+# --- Exit anti-whipsaw / rebound guard ---
+REBOUND_GUARD_ENABLED = True
+REBOUND_WAIT_BARS_15M = 2          # espera confirmación 2 velas 15m antes de vender
+REBOUND_MIN_RSI_BOUNCE = 5.0       # cancel exit si RSI15 sube >= +5
+REBOUND_EMA_RECLAIM = True         # cancel exit si cierra sobre EMA20 15m
+REBOUND_USE_5M_DIVERGENCE = True   # opcional: divergencia alcista 5m cancela sell
+
+# --- Volatility grace / trailing hysteresis ---
+RVOL_SPIKE_GRACE = True
+RVOL_SPIKE_THRESHOLD = 2.0         # si RVOL10 en últimas 3 velas > 2 → ampliar trailing
+RVOL_SPIKE_TRAIL_BONUS = 0.5       # +0.5% al trail por 15 minutos
+
+# --- Time-in-trade stop con excepción de "tape mejorando" ---
+TIME_STOP_HOURS = 6
+TIME_STOP_EXTEND_HOURS = 3
+TAPE_IMPROVING_ADX_SLOPE_MIN = 0.0 # >0 = ADX1h subiendo
+TAPE_IMPROVING_VWAP_REQ = True     # close 1h > VWAP 1h para extender
+
+# --- Profit quality guard (evitar micro-takes post-fees) ---
+MIN_GAIN_OVER_FEES_MULT = 1.6      # exigir 1.6× fees totales antes de permitir exit por precio
+MIN_HOLD_SECONDS = 900             # 15 min mínimos globales para exits (excepto stop duro)
+# >>> PATCH END
+
+# >>> CHAN PATCH CONFIG START (ANCHOR A)
+# ——— Chandelier / estructura / BE / time-stop por velas ———
+CHAN_ATR_LEN = 22          # ATR para Chandelier (n)
+CHAN_LEN_HIGH = 22         # HH(n), típico 22
+CHAN_K_STABLE  = 3.0
+CHAN_K_MEDIUM  = 2.7
+CHAN_K_UNSTABLE= 2.3
+
+# Tighten/widen dinámicos del K
+SOFT_TIGHTEN_K = 0.5       # reducción temporal de k al detectar debilidad leve (RSI/MACDh)
+RVOL_SPIKE_K_BONUS = 0.4   # aumento temporal de k si hay spike de RVOL (gracia a la volatilidad)
+RVOL_K_BONUS_MINUTES = 15
+
+# Break-even cuando el trade alcanza X R
+BE_R_MULT = 1.5            # al ≥1.5R sube stop a BE + fees
+
+# Tiers para "dejar correr" apretando el k (sin TP duro)
+TIER2_R_MULT = 3.0         # a partir de 3R, aprieta más el k
+TIER2_K_TIGHTEN = 0.5      # reducción extra de k
+
+# Estructura: Donchian + EMA
+DONCHIAN_LEN_EXIT = 20     # N-bar low para salida de tendencia si se pierde estructura
+
+# Time-stop por barras del TF 1h
+TIME_STOP_BARS_1H = 12     # si en 12 velas 1h no progresa (o no cumple mejora), salir
+TIME_STOP_EXTEND_BARS = 6  # prórroga si "tape mejorando" (ADX↑ y close>VWAP)
+# >>> CHAN PATCH CONFIG END
+
 
 # Momentum penalties/blocks
 RSI_OVERBOUGHT_4H = 70.0
@@ -318,6 +370,74 @@ def send_telegram_document(file_path: str, caption: str = ""):
 # =========================
 # Utils
 # =========================
+# >>> PATCH START: REBOUND HELPERS
+def _ema(series, length=20):
+    try:
+        return ta.ema(series, length=length)
+    except Exception:
+        return None
+
+def bullish_divergence(df, rsi_len=14):
+    """
+    Divergencia alcista simple en 5m: precio hace low más bajo, RSI hace low más alto.
+    df: DataFrame con close; calcula RSI interno.
+    """
+    try:
+        rsi = ta.rsi(df['close'], length=rsi_len)
+        c = df['close'].iloc[-20:]
+        r = rsi.iloc[-20:]
+        # mínimos recientes (asegurando orden temporal)
+        p1 = c.idxmin()                        # low más reciente
+        p2 = c.iloc[:-1].idxmin()              # low anterior
+        if p2 >= p1 and len(c) >= 3:
+            p2 = c.iloc[:-2].idxmin()
+        if p2 is None or p1 is None:
+            return False
+        price_lower_low = c.loc[p1] < c.loc[p2]
+        rsi_higher_low = r.loc[p1] > r.loc[p2]
+        return bool(price_lower_low and rsi_higher_low)
+    except Exception:
+        return False
+# >>> PATCH END
+
+# >>> CHAN HELPERS START (ANCHOR B)
+def chandelier_stop_long(df: pd.DataFrame, atr_len=CHAN_ATR_LEN, hh_len=CHAN_LEN_HIGH, k=3.0):
+    """
+    Chandelier exit clásico para largos: stop = HH(hh_len) - k * ATR(atr_len).
+    Usa columnas 'high','low','close' en el TF actual (recomendado 1h).
+    """
+    if df is None or len(df) < max(atr_len, hh_len) + 2:
+        return None
+    try:
+        atr = ta.atr(df['high'], df['low'], df['close'], length=atr_len)
+        hh  = df['high'].rolling(hh_len).max()
+        c_stop = hh - k * atr
+        v = float(c_stop.iloc[-1])
+        return v if np.isfinite(v) else None
+    except Exception:
+        return None
+
+def donchian_lower(df: pd.DataFrame, length=DONCHIAN_LEN_EXIT):
+    """Lower band Donchian: mínimo de 'low' en las últimas N velas."""
+    if df is None or len(df) < length + 2:
+        return None
+    try:
+        low_n = df['low'].rolling(length).min().iloc[-1]
+        return float(low_n) if np.isfinite(low_n) else None
+    except Exception:
+        return None
+
+def count_closed_bars_since(df: pd.DataFrame, ts_open: datetime) -> int:
+    """# de velas cerradas con índice > ts_open (DataFrame index = timestamps)."""
+    if df is None or df.empty:
+        return 0
+    try:
+        return int((df.index > pd.Timestamp(ts_open)).sum())
+    except Exception:
+        return 0
+# >>> CHAN HELPERS END
+
+
 def fetch_price(symbol: str):
     try:
         t = exchange.fetch_ticker(symbol)
@@ -748,15 +868,16 @@ def estimate_slippage_pct(symbol: str, notional: float = MIN_NOTIONAL):
     try:
         best_ask = ob['asks'][0][0]; best_ask_vol = ob['asks'][0][1]
         best_bid = ob['bids'][0][0]; best_bid_vol = ob['bids'][0][1]
-        spr = percent_spread(ob) * 100.0
-        mid = (best_ask + best_bid)/2.0
+        spr_pct = percent_spread(ob) * 100.0  # p.p.
+
         order_qty = notional / max(best_ask, 1e-9)
-        bump = 0.0
-        if best_ask_vol and order_qty > 0.1 * best_ask_vol:
-            bump = min(0.15, (order_qty/(best_ask_vol+1e-9))*0.2) * 100.0
-        return spr + bump
+        # Bump en puntos porcentuales (cap 0.15%)
+        bump_pct = min(0.15, (order_qty / (best_ask_vol + 1e-9)) * 0.2)
+
+        return spr_pct + bump_pct
     except Exception:
         return 0.05
+
     
 def required_edge_pct() -> float:
     """Minimum pct gain vs entry to overcome round-trip fees (+ safety)."""
@@ -1234,93 +1355,238 @@ def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"
 
 def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, trade_id: str, atr_abs: float):
     def loop():
+        def trade_is_closed() -> bool:
+            try:
+                conn = sqlite3.connect(DB_NAME)
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM transactions WHERE trade_id=? AND side='sell' LIMIT 1", (trade_id,))
+                n = cur.fetchone()[0]
+                conn.close()
+                return n > 0
+            except Exception:
+                return False
+
         try:
-            # Perfil de volatilidad → trail/TP + min-hold
-            prof_local = classify_symbol(symbol); klass_local = prof_local["class"]
+            if not symbol or amount <= 0 or not purchase_price:
+                logger.info(f"[trailing] Invalid params, stopping. sym={symbol} amt={amount} px={purchase_price}")
+                return
+
+            # Perfil / parámetros base
+            prof_local = classify_symbol(symbol)
+            klass_local = prof_local["class"]
+            if   klass_local == "unstable": base_k = CHAN_K_UNSTABLE
+            elif klass_local == "stable":   base_k = CHAN_K_STABLE
+            else:                           base_k = CHAN_K_MEDIUM
+
             opened_ts = datetime.now(timezone.utc)
-            atr_pct = (atr_abs / purchase_price) * 100 if purchase_price > 0 and atr_abs else 2.0
+            # Stop inicial (protección dura, igual que antes pero explícito)
+            initial_stop = purchase_price - (INIT_STOP_ATR_MULT * atr_abs)
+            if initial_stop >= purchase_price:
+                # fallback por si ATR_abs inválido
+                initial_stop = purchase_price * 0.985
 
-            if klass_local == "unstable":
-                trail_pct = clamp(1.8 * atr_pct, 2.0, 10.0)
-                take_profit = purchase_price * 1.08
-                min_hold_seconds = 45
-            else:
-                trail_pct = clamp(1.2 * atr_pct, 1.5, 6.0)
-                take_profit = purchase_price * 1.03
-                min_hold_seconds = 60
-            
-            # Ensure TP clears round-trip fees + a tiny cushion
-            min_tp = purchase_price * (1.0 + required_edge_pct()/100.0 + 0.0005)
-            if take_profit < min_tp:
-                take_profit = min_tp
+            # "R" inicial con ese stop
+            initial_R = max(purchase_price - initial_stop, purchase_price * 0.003)  # evita R ~0
 
+            # Estados temporales
+            rv_grace_until = None
+            soft_tighten_until = None
 
-            highest = purchase_price
-            initial_stop = purchase_price * (1 - (INIT_STOP_ATR_MULT * (atr_abs / purchase_price)))
+            # Stop ratcheado (no retrocede)
+            stop_price = initial_stop
+
+            # Rebound guard (usa tu lógica ya existente)
+            rebound_pending_until = None
+            last_exit_trigger_reason = None
 
             while True:
+                if trade_is_closed():
+                    logger.info(f"[trailing] {symbol} trade {trade_id} already closed — stopping trailing thread.")
+                    return
+
                 price = fetch_price(symbol)
                 if not price:
-                    time.sleep(EXIT_CHECK_EVERY_SEC); continue
+                    time.sleep(EXIT_CHECK_EVERY_SEC)
+                    continue
 
-                if price > highest: highest = price
-                stop_price = highest * (1 - trail_pct/100.0)
-
-                # Stop inicial (protección)
-                if price <= initial_stop:
-                    logger.info(f"[init-stop] {symbol} hit initial stop at {initial_stop:.6f}")
-                    sell_symbol(symbol, amount, trade_id, source="trail")
-                    break
-
-                # No permitir exits antes de min_hold (salvo stop duro)
                 held = (datetime.now(timezone.utc) - opened_ts).total_seconds()
-                held_long_enough = held >= min_hold_seconds
+                held_long_enough = held >= max(60, MIN_HOLD_SECONDS)
 
-                indicator_exit = False
-                if EXIT_MODE in ("indicators", "hybrid") and held_long_enough:
-                    df15 = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=60)
-                    df1h = fetch_and_prepare_data_hybrid(symbol, timeframe="1h",  limit=60)
+                # ===== Cálculos en 1h (estructura, Chandelier, ADX/VWAP/tiempo) =====
+                df1h = fetch_and_prepare_data_hybrid(symbol, timeframe="1h", limit=max(120, CHAN_LEN_HIGH + CHAN_ATR_LEN + 10))
+                if df1h is None or len(df1h) < (CHAN_LEN_HIGH + CHAN_ATR_LEN + 5):
+                    time.sleep(EXIT_CHECK_EVERY_SEC)
+                    continue
+
+                # Candles y features 1h
+                close1h = float(df1h['close'].iloc[-1])
+                ema20_1h = float(df1h['EMA20'].iloc[-1]) if 'EMA20' in df1h and pd.notna(df1h['EMA20'].iloc[-1]) else None
+                vwap1h = float(df1h['VWAP'].iloc[-1]) if 'VWAP' in df1h and pd.notna(df1h['VWAP'].iloc[-1]) else None
+                adx1h = float(df1h['ADX'].iloc[-1]) if 'ADX' in df1h and pd.notna(df1h['ADX'].iloc[-1]) else None
+
+                # K efectivo
+                k_eff = base_k
+
+                # — RVOL grace: ampliar k temporalmente
+                if RVOL_SPIKE_GRACE:
                     try:
-                        if df15 is not None and df1h is not None:
-                            rsi15 = float(df15['RSI'].iloc[-1]) if 'RSI' in df15 else None
-                            adx1h = float(df1h['ADX'].iloc[-1]) if 'ADX' in df1h else None
-                            macd_df15 = ta.macd(df15['close'], fast=12, slow=26, signal=9)
-                            macdh15 = float(macd_df15['MACDh_12_26_9'].iloc[-1]) if macd_df15 is not None else None
-                            if (rsi15 is not None and rsi15 > NBUS_RSI15_OB and macdh15 is not None and macdh15 < 0):
-                                indicator_exit = True
-                            if (adx1h is not None and adx1h < NBUS_ADX1H_MIN):
-                                indicator_exit = True
-                            if indicator_exit:
-                                logger.info(f"[trail-exit] {symbol} momentum exhausted (RSI15={rsi15}, MACDh15={macdh15}, ADX1h={adx1h})")
-                    except Exception as e:
-                        logger.debug(f"indicator check error {symbol}: {e}")
+                        df15 = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=60)
+                        if df15 is not None and len(df15) > 20:
+                            rv_mean = df15['volume'].rolling(10).mean().iloc[-1]
+                            r3 = []
+                            for i in range(3):
+                                rv = df15['volume'].iloc[-1 - i] / rv_mean if rv_mean and rv_mean > RVOL_MEAN_MIN else None
+                                if rv is not None: r3.append(float(rv))
+                            if r3 and max(r3) >= RVOL_SPIKE_THRESHOLD:
+                                rv_grace_until = time.time() + RVOL_K_BONUS_MINUTES * 60
+                        if rv_grace_until and time.time() <= rv_grace_until:
+                            k_eff += RVOL_SPIKE_K_BONUS
+                    except Exception:
+                        pass
 
-                price_exit = False
-                if EXIT_MODE in ("price", "hybrid"):
-                    if held_long_enough:
-                        # Require edge > fees before allowing profit-taking exits
-                        edge_needed_pct = required_edge_pct()
+                # — Soft flags por 15m (no venden; aprietan k)
+                try:
+                    df15 = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=60)
+                    if df15 is not None and len(df15) > 30:
+                        rsi15 = float(df15['RSI'].iloc[-1]) if 'RSI' in df15 else None
+                        macd15 = ta.macd(df15['close'], fast=12, slow=26, signal=9)
+                        macdh15 = float(macd15['MACDh_12_26_9'].iloc[-1]) if macd15 is not None else None
+                        if rsi15 is not None and macdh15 is not None:
+                            if (rsi15 >= NBUS_RSI15_OB and macdh15 < 0):  # sobrecompra + debilidad
+                                soft_tighten_until = time.time() + 2 * 15 * 60
+                    if soft_tighten_until and time.time() <= soft_tighten_until:
+                        k_eff = max(1.2, k_eff - SOFT_TIGHTEN_K)
+                except Exception:
+                    pass
+
+                # — Tiers por múltiplos de R (dejar correr, sin TP duro, sólo apretar k)
+                gain = price - purchase_price
+                if gain >= BE_R_MULT * initial_R:
+                    # sube stop a break-even + fees
+                    be_stop = purchase_price * (1.0 + required_edge_pct()/100.0)
+                    stop_price = max(stop_price, be_stop)
+                if gain >= TIER2_R_MULT * initial_R:
+                    k_eff = max(1.2, k_eff - TIER2_K_TIGHTEN)
+
+                # ===== Chandelier y ratchet del stop =====
+                c_stop = chandelier_stop_long(df1h, atr_len=CHAN_ATR_LEN, hh_len=CHAN_LEN_HIGH, k=k_eff)
+                if c_stop is not None:
+                    # nunca bajar el stop (ratchet)
+                    stop_price = max(stop_price, c_stop, initial_stop)
+
+                # ===== Salida por estructura (Donchian + EMA20) =====
+                structural_exit = False
+                if held_long_enough:
+                    d_low = donchian_lower(df1h, length=DONCHIAN_LEN_EXIT)
+                    if d_low is not None and ema20_1h is not None:
+                        if (close1h < ema20_1h) and (close1h < d_low):
+                            structural_exit = True
+
+                # ===== Time-stop por # velas (con prórroga si tape mejora) =====
+                try:
+                    n_bars = count_closed_bars_since(df1h, opened_ts)
+                    if n_bars >= TIME_STOP_BARS_1H:
+                        extend = False
+                        # ADX slope reciente y close>VWAP
+                        if n_bars < (TIME_STOP_BARS_1H + TIME_STOP_EXTEND_BARS):
+                            try:
+                                adx_series = ta.adx(df1h['high'], df1h['low'], df1h['close'], length=14)['ADX_14']
+                                x = np.arange(6)
+                                adx_slope = linregress(x, adx_series.iloc[-6:]).slope
+                            except Exception:
+                                adx_slope = None
+                            improving = True
+                            if TAPE_IMPROVING_ADX_SLOPE_MIN is not None:
+                                improving = improving and (adx_slope is not None and adx_slope > TAPE_IMPROVING_ADX_SLOPE_MIN)
+                            if TAPE_IMPROVING_VWAP_REQ:
+                                improving = improving and (vwap1h is not None and close1h > vwap1h)
+                            extend = bool(improving)
+                        if not extend:
+                            logger.info(f"[time-stop] {symbol} exit after {n_bars} bars 1h (no improvement)")
+                            sell_symbol(symbol, amount, trade_id, source="trail")
+                            return
+                except Exception as e:
+                    logger.debug(f"time-stop bars check error {symbol}: {e}")
+
+                # ===== Disparador por precio (Chandelier/ratchet) =====
+                # Política de fees: si el stop cae en ganancia pequeña, exige cubrir fees; si es pérdida, siempre vende.
+                if price <= stop_price:
+                    if price >= purchase_price:
+                        edge_needed_pct = max(required_edge_pct()*MIN_GAIN_OVER_FEES_MULT/EDGE_SAFETY_MULT, required_edge_pct())
                         gain_pct = (price / purchase_price - 1.0) * 100.0
-                        edge_ok = gain_pct >= edge_needed_pct
-                        # Trailing: only valid once we’re above fee-break-even
-                        trail_ok = edge_ok and (price <= stop_price)
-                        # TP should also be beyond fees
-                        tp_ok = edge_ok and (price >= take_profit)
-                        price_exit = trail_ok or tp_ok
+                        if gain_pct < edge_needed_pct:
+                            # Demasiado micro-take; mantener si no hay estructura rota
+                            if structural_exit:
+                                sell_symbol(symbol, amount, trade_id, source="trail")
+                                return
+                            # de lo contrario, seguimos observando (el stop podrá subir en próximas velas)
+                        else:
+                            # OK fees cubiertos
+                            sell_symbol(symbol, amount, trade_id, source="trail")
+                            return
+                    else:
+                        # Stop de pérdida: salir siempre
+                        sell_symbol(symbol, amount, trade_id, source="trail")
+                        return
 
+                # ===== Rebound Guard (si hubiese un trigger "duro" por estructura) =====
+                if structural_exit and REBOUND_GUARD_ENABLED:
+                    try:
+                        if rebound_pending_until is None:
+                            rebound_pending_until = time.time() + REBOUND_WAIT_BARS_15M * 15 * 60
+                            last_exit_trigger_reason = 'structure'
+                            logger.info(f"[rebound-guard] {symbol} structural exit pending for {REBOUND_WAIT_BARS_15M}x15m")
 
-                if (EXIT_MODE == "indicators" and indicator_exit) or \
-                   (EXIT_MODE == "price" and price_exit) or \
-                   (EXIT_MODE == "hybrid" and (price_exit or indicator_exit)):
-                    sell_symbol(symbol, amount, trade_id, source="trail")
-                    break
+                        df15 = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=60)
+                        cancel_exit = False
+                        if df15 is not None and len(df15) > 21:
+                            rsi_series = ta.rsi(df15['close'], length=14)
+                            rsi_now = float(rsi_series.iloc[-1]) if rsi_series is not None else None
+                            rsi_prev = float(rsi_series.iloc[-3]) if rsi_series is not None else None
+                            ema20_15 = _ema(df15['close'], 20)
+                            ema_ok = False
+                            if REBOUND_EMA_RECLAIM and ema20_15 is not None:
+                                ema_ok = float(df15['close'].iloc[-1]) > float(ema20_15.iloc[-1])
+                            rsi_bounce = False
+                            if rsi_now is not None and rsi_prev is not None:
+                                rsi_bounce = (rsi_now - rsi_prev) >= REBOUND_MIN_RSI_BOUNCE
+
+                            div_ok = False
+                            if REBOUND_USE_5M_DIVERGENCE:
+                                df5 = fetch_and_prepare_df(symbol, "5m", limit=120)
+                                if df5 is not None and len(df5) > 30:
+                                    div_ok = bullish_divergence(df5)
+
+                            if rsi_bounce or ema_ok or div_ok:
+                                cancel_exit = True
+
+                        if cancel_exit:
+                            # Si hay rebote, no vendemos y solo apretamos un poco más el k
+                            base_k = max(1.2, base_k - 0.2)
+                            rebound_pending_until = None
+                            logger.info(f"[rebound-guard] {symbol} cancel structural exit — tighten k to {base_k:.2f}")
+                        elif time.time() >= rebound_pending_until:
+                            sell_symbol(symbol, amount, trade_id, source="trail")
+                            return
+                    except Exception as e:
+                        logger.debug(f"rebound-guard(structure) error {symbol}: {e}")
+                        sell_symbol(symbol, amount, trade_id, source="trail")
+                        return
 
                 time.sleep(EXIT_CHECK_EVERY_SEC)
+
         except Exception as e:
             logger.error(f"Trailing error {symbol}: {e}")
-            try: sell_symbol(symbol, amount, trade_id, source="trail")
-            except Exception: pass
+            try:
+                if not trade_is_closed():
+                    sell_symbol(symbol, amount, trade_id, source="trail")
+            except Exception:
+                pass
+            return
+
     threading.Thread(target=loop, daemon=True).start()
+
+
 
 # =========================
 # Post-trade analysis & learning
