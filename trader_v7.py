@@ -123,7 +123,11 @@ RVOL_SPIKE_K_BONUS = 0.4   # aumento temporal de k si hay spike de RVOL (gracia 
 RVOL_K_BONUS_MINUTES = 15
 
 # Break-even cuando el trade alcanza X R
-BE_R_MULT = 1.5            # al ≥1.5R sube stop a BE + fees
+BE_R_MULT = 1            # go BE at 1.0R to reduce scratches
+
+# Dead-tape hard block
+DEAD_TAPE_RVOL10_HARD = 0.20
+
 
 # Tiers para "dejar correr" apretando el k (sin TP duro)
 TIER2_R_MULT = 3.0         # a partir de 3R, aprieta más el k
@@ -995,6 +999,16 @@ def hybrid_decision(symbol: str):
         return "hold", 50, 0.0, " | ".join(blocks)
 
     row = df.iloc[-1]
+        # ADX slope (1h) — is energy building?
+    try:
+        adx_series_1h = ta.adx(df['high'], df['low'], df['close'], length=14)['ADX_14']
+        adx_slope_1h = None
+        if adx_series_1h is not None and len(adx_series_1h.dropna()) >= 6:
+            x = np.arange(6)
+            adx_slope_1h = linregress(x, adx_series_1h.iloc[-6:]).slope
+    except Exception:
+        adx_slope_1h = None
+
     score_gate = get_score_gate() + SCORE_GATE_OFFSET
     # Anti-scalp: skip if current ATR% can’t reasonably outrun fees
     atr_abs_now = float(row['ATR']) if pd.notna(row['ATR']) else None
@@ -1010,21 +1024,40 @@ def hybrid_decision(symbol: str):
     rvol = float(row['RVOL10']) if pd.notna(row['RVOL10']) else None
     price_slope = float(row.get('PRICE_SLOPE10', 0.0) or 0.0)
 
-    # RVOL sanity → SOFT
-    if rvol is None or not np.isfinite(rvol) or rvol < RVOL_VALUE_MIN:
-        blocks.append("RVOL invalid/too small")
+    # If ADX is flat/slipping and not already very strong, soft-block unless other confluence exists
+    if adx_slope_1h is not None and adx_slope_1h <= 0 and adx < (ADX_MIN_K + 3):
+        blocks.append(f"SOFT block: ADX slope≤0 (Δ≈{adx_slope_1h:.3f}) and ADX<{ADX_MIN_K+3:.0f}")
         if level != "HARD": level = "SOFT"
+
+        # RVOL checks: hard only on "dead tape", otherwise soft
+    if rvol is None or not np.isfinite(rvol):
+        blocks.append("RVOL invalid")
+        if level != "HARD": level = "SOFT"
+    else:
+        if rvol < DEAD_TAPE_RVOL10_HARD:
+            blocks.append(f"dead tape: RVOL10<{DEAD_TAPE_RVOL10_HARD:.2f} ({rvol:.2f})")
+            level = "HARD"
+        elif rvol < RVOL_VALUE_MIN:
+            blocks.append(f"RVOL small ({rvol:.2f})")
+            if level != "HARD": level = "SOFT"
+
 
     # Snapshots
     tf15 = quick_tf_snapshot(symbol, '15m', limit=120)
     tf4h = quick_tf_snapshot(symbol, '4h',  limit=120)
 
     # HARD blocks: 15m weakness o 4h overbought extremo
+        # 15m weakness: make it SOFT unless extremely weak
     try:
         rsi_15 = tf15.get('RSI'); macdh_15 = tf15.get('MACDh')
-        if (macdh_15 is not None and macdh_15 < 0) and (rsi_15 is not None and rsi_15 < 48):
-            blocks.append("HARD block: 15m weakness")
-            level = "HARD"
+        if (macdh_15 is not None and macdh_15 < 0) and (rsi_15 is not None):
+            if rsi_15 < 42:   # extreme → HARD
+                blocks.append("HARD block: 15m extreme weakness")
+                level = "HARD"
+            elif rsi_15 < 48: # typical weakness → SOFT
+                blocks.append("SOFT block: 15m weakness")
+                if level != "HARD": level = "SOFT"
+
     except Exception:
         pass
     try:
@@ -1136,9 +1169,20 @@ def hybrid_decision(symbol: str):
     if rvol is not None and rvol >= RVOL_BASE_K + 0.5: score += 1.0
     if rvol is not None and rvol >= RVOL_BASE_K + 1.5: score += 1.0
     if price_slope > 0: score += 1.0; notes.append("price slope>0")
+
     rsi = float(row['RSI']) if pd.notna(row['RSI']) else 50.0
-    if RSI_MIN_K <= rsi <= RSI_MAX_K: score += 1.0; notes.append(f"RSI in band ({rsi:.1f})")
-    if rsi >= (RSI_MIN_K + RSI_MAX_K)/2: score += 0.5
+        if RSI_MIN_K <= rsi <= RSI_MAX_K:
+        score += 1.0; notes.append(f"RSI in band ({rsi:.1f})")
+        # regime-aware nudge (helps high-vol pairs demand a bit more RSI)
+        if klass == "unstable" and rsi >= max(60, RSI_MIN_K + 2):
+            score += 0.2; notes.append("RSI nudge (unstable)")
+    else:
+        # still allow trades in mushy zones but with a tiny penalty
+        if klass == "unstable" and rsi < 55:
+            score -= 0.2; notes.append("RSI soft penalty (unstable<55)")
+    if rsi >= (RSI_MIN_K + RSI_MAX_K)/2:
+        score += 0.5
+
     if adx >= ADX_MIN_K: score += 1.0; notes.append(f"ADX≥{ADX_MIN_K:.0f} ({adx:.1f})")
     vol_slope = float(row.get('VOL_SLOPE10', 0.0) or 0.0)
     if vol_slope > 0: score += 0.5
@@ -1199,6 +1243,13 @@ def hybrid_decision(symbol: str):
     conf = int(clamp(50 + 10*(1 if row['EMA20'] > row['EMA50'] else 0) + 5*(1 if price_slope>0 else 0), 0, 100))
     if symbol in LAST_LOSS_INFO:
         conf = min(conf, POST_LOSS_CONF_CAP)
+
+        # small confidence nudge for strong RSI in unstable regime
+    try:
+        if klass == "unstable" and rsi is not None and rsi >= 62:
+            conf = min(100, conf + 3)
+    except Exception:
+        pass
 
     note = f"raw={raw_score:.1f} gate={gate:.1f} score={score_for_gate:.1f} | " + ", ".join(notes)
     note += f" | class={klass}"
@@ -1740,6 +1791,9 @@ def analyze_and_learn(trade_id: str, sell_price: float = None, learn_enabled: bo
 # =========================
 # Sizing (volatility-aware)
 # =========================
+# =========================
+# Sizing (volatility-aware)
+# =========================
 def size_position(price: float, usdt_balance: float, confidence: int, symbol: str = None) -> float:
     if not price or price <= 0: 
         return 0.0
@@ -1772,7 +1826,30 @@ def size_position(price: float, usdt_balance: float, confidence: int, symbol: st
     except Exception:
         pass
 
-    budget = usdt_balance * base_frac * shave * vol_adj
+    # === Soft sizing bias by regime + 1h RSI (no blocking) ===
+    try:
+        sym_cls = classify_symbol(symbol) if symbol else None
+        klass_sz = (sym_cls or {}).get("class", "medium")
+        rsi1h = None
+        snap1h = quick_tf_snapshot(symbol, '1h', limit=80) if symbol else {}
+        rsi1h = float(snap1h.get('RSI')) if snap1h and snap1h.get('RSI') is not None else None
+
+        size_bias = 1.0
+        if klass_sz == "unstable" and rsi1h is not None:
+            if rsi1h < 55:      # mushy → trim
+                size_bias *= 0.70
+            elif rsi1h < 60:    # borderline → mild trim
+                size_bias *= 0.85
+        elif klass_sz == "stable" and rsi1h is not None:
+            if rsi1h < 52:
+                size_bias *= 0.85
+
+        size_bias = clamp(size_bias, 0.6, 1.1)
+    except Exception:
+        size_bias = 1.0
+
+    # final budget
+    budget = usdt_balance * base_frac * shave * vol_adj * size_bias
     amount = max(MIN_NOTIONAL / price, budget / price)
     return amount
 
