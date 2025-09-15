@@ -1172,10 +1172,10 @@ def hybrid_decision(symbol: str):
 
     rsi = float(row['RSI']) if pd.notna(row['RSI']) else 50.0
     if RSI_MIN_K <= rsi <= RSI_MAX_K:
-    score += 1.0; notes.append(f"RSI in band ({rsi:.1f})")
-    # regime-aware nudge (helps high-vol pairs demand a bit more RSI)
-    if klass == "unstable" and rsi >= max(60, RSI_MIN_K + 2):
-        score += 0.2; notes.append("RSI nudge (unstable)")
+        score += 1.0; notes.append(f"RSI in band ({rsi:.1f})")
+        # regime-aware nudge (helps high-vol pairs demand a bit more RSI)
+        if klass == "unstable" and rsi >= max(60, RSI_MIN_K + 2):
+            score += 0.2; notes.append("RSI nudge (unstable)")
     else:
         # still allow trades in mushy zones but with a tiny penalty
         if klass == "unstable" and rsi < 55:
