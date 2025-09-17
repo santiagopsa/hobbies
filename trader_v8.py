@@ -1072,6 +1072,16 @@ def hybrid_decision(symbol: str):
     rvol_1h = float(row['RVOL10']) if pd.notna(row['RVOL10']) else None
     price_slope = float(row.get('PRICE_SLOPE10', 0.0) or 0.0)
 
+        # --- HARD floors to avoid no-trend / thin-tape scalps
+    if adx is not None and adx < 15:
+        blocks.append(f"HARD block: ADX too low ({adx:.1f} < 15)")
+        level = "HARD"
+
+    if (rvol_1h is not None) and (rvol_1h < 1.00):
+        blocks.append(f"HARD block: 1h RVOL {rvol_1h:.2f} < 1.00")
+        level = "HARD"
+
+
     # ===== fast snapshots (needed for anchors 2,8) =====
     tf15 = quick_tf_snapshot(symbol, '15m', limit=120)
     tf4h = quick_tf_snapshot(symbol, '4h',  limit=120)
@@ -1520,6 +1530,15 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
 
                 held = (datetime.now(timezone.utc) - opened_ts).total_seconds()
                 held_long_enough = held >= max(60, MIN_HOLD_SECONDS)
+
+                # --- Global min-hold guard: block all exits until MIN_HOLD_SECONDS,
+                #     except a hard protective stop (price <= initial_stop).
+                if not held_long_enough:
+                    if price <= initial_stop:
+                        sell_symbol(symbol, amount, trade_id, source="trail")
+                        return
+                    time.sleep(EXIT_CHECK_EVERY_SEC)
+                    continue
 
                 # ===== Cálculos en 1h (estructura, Chandelier, ADX/VWAP/tiempo) =====
                 df1h = fetch_and_prepare_data_hybrid(symbol, timeframe="1h", limit=max(120, CHAN_LEN_HIGH + CHAN_ATR_LEN + 10))
