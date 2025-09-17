@@ -47,8 +47,8 @@ ADX_MIN_DEFAULT = 20
 RSI_MIN_DEFAULT, RSI_MAX_DEFAULT = 45, 72
 RVOL_BASE_DEFAULT = 1.5
 SCORE_GATE_START = 4.0
-SCORE_GATE_MIN, SCORE_GATE_MAX = 2.5, 6.0
-SCORE_GATE_HARD_MIN = 3  # floor del controller
+SCORE_GATE_MAX = 6.0
+SCORE_GATE_HARD_MIN = 2.0  # floor del controller
 
 # Learning ranges & rates
 ADX_MIN_RANGE = (15, 35)
@@ -60,7 +60,7 @@ LEARN_DAILY_CLIP = 0.5
 MEAN_REV_WEIGHT = 0.02
 
 # Buy-flow controller
-TARGET_BUY_RATIO = 0.2
+TARGET_BUY_RATIO = 0.3
 BUY_RATIO_DELTA = 0.05
 GATE_STEP = 0.15
 EPSILON_EXPLORE = 0.03
@@ -143,16 +143,16 @@ TIME_STOP_EXTEND_BARS = 6  # prórroga si "tape mejorando" (ADX↑ y close>VWAP)
 
 
 # Momentum penalties/blocks
-RSI_OVERBOUGHT_4H = 70.0
+RSI_OVERBOUGHT_4H = 78.0
 PENALTY_4H_RSI = 0.7
 PENALTY_15M_WEAK = 0.5
 
 # Cooldowns / re-entry
-COOLDOWN_MIN_AFTER_LOSS = 30
+COOLDOWN_MIN_AFTER_LOSS = 10
 POST_LOSS_SIZING_WINDOW_SEC = 2 * 3600
 POST_LOSS_CONF_CAP = 78
 POST_LOSS_SIZING_FACTOR = 0.70
-REENTRY_BLOCK_MIN = 10
+REENTRY_BLOCK_MIN = 5
 REENTRY_ABOVE_LAST_EXIT_PAD = 0.0015  # 0.15% (por defecto; se ajusta por régimen)
 
 # Volatility / crash protection
@@ -171,10 +171,8 @@ RVOL_MEAN_MIN = 1e-6
 RVOL_VALUE_MIN = 0.25
 
 # No-buy-under-sell thresholds
-NBUS_RSI15_OB = 70.0
-NBUS_MACDH15_NEG = 0.0
-NBUS_ADX1H_MIN = 20.0
-
+NBUS_RSI15_OB = 75.0
+NBUS_MACDH15_NEG = -0.002
 # Logger
 logger = logging.getLogger("hybrid_trader")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -735,7 +733,7 @@ def classify_symbol(symbol: str) -> dict:
         klass = "medium"
     elif atrp < 1.2:
         klass = "stable"
-    elif atrp > 2.2:
+    elif atrp > 2.5:
         klass = "unstable"
     else:
         klass = "medium"
@@ -892,20 +890,29 @@ def required_edge_pct() -> float:
 # =========================
 # No-Buy-Under-Sell gate
 # =========================
+# === ANCHOR-NBUS: simplified NBUS gate (no ADX hard block) ===
 def is_selling_condition_now(symbol: str) -> Tuple[bool, str]:
-    rsi15 = None
-    macdh15 = None
-    adx1h = None
+    """
+    NBUS (No-Buy-Under-Sell) — only block obvious 'buy-the-top' traps.
+    - Block if 15m is *clearly* overheated AND rolling over: RSI15 >= 75 AND MACDh15 <= -0.002
+    - DO NOT block on 1h ADX < 20 (we already evaluate trend strength elsewhere)
+    """
     try:
         df15 = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=80)
-        df1h = fetch_and_prepare_data_hybrid(symbol, timeframe="1h",  limit=80)
-        if df15 is None or df1h is None or len(df15) == 0 or len(df1h) == 0:
-            return False, "no data"
+        if df15 is None or len(df15) == 0:
+            return False, "no 15m data"
+
+        rsi15 = None
+        macdh15 = None
+
+        # RSI15
         try:
             if 'RSI' in df15 and not pd.isna(df15['RSI'].iloc[-1]):
                 rsi15 = float(df15['RSI'].iloc[-1])
         except Exception:
             rsi15 = None
+
+        # MACDh15
         try:
             macd15 = ta.macd(df15['close'], fast=12, slow=26, signal=9)
             if macd15 is not None and not macd15.empty and 'MACDh_12_26_9' in macd15:
@@ -914,19 +921,11 @@ def is_selling_condition_now(symbol: str) -> Tuple[bool, str]:
                     macdh15 = float(mh)
         except Exception:
             macdh15 = None
-        try:
-            if 'ADX' in df1h and not pd.isna(df1h['ADX'].iloc[-1]):
-                adx1h = float(df1h['ADX'].iloc[-1])
-        except Exception:
-            adx1h = None
 
-        if (rsi15 is not None and rsi15 >= NBUS_RSI15_OB) and (macdh15 is not None and macdh15 <= NBUS_MACDH15_NEG):
-            rsi_txt = f"{rsi15:.1f}" if rsi15 is not None else "—"
-            mh_txt  = f"{macdh15:.3f}" if macdh15 is not None else "—"
-            return True, f"15m overbought+MACDh≤0 (RSI15={rsi_txt}, MACDh15={mh_txt})"
-        if adx1h is not None and adx1h < NBUS_ADX1H_MIN:
-            adx_txt = f"{adx1h:.1f}"
-            return True, f"ADX1h<{NBUS_ADX1H_MIN:.0f} (ADX1h={adx_txt})"
+        # Only one blocking rule remains (tougher than before)
+        if (rsi15 is not None and rsi15 >= 75.0) and (macdh15 is not None and macdh15 <= -0.002):
+            return True, f"15m overheated & rolling over (RSI15={rsi15:.1f}, MACDh15={macdh15:.3f})"
+
         return False, "ok"
     except Exception as e:
         logger.debug(f"is_selling_condition_now error {symbol}: {e}")
@@ -938,15 +937,15 @@ def is_selling_condition_now(symbol: str) -> Tuple[bool, str]:
 def hybrid_decision(symbol: str):
     base = symbol.split('/')[0]
     lp = get_learn_params(base)
-    # valores aprendidos base
+
+    # ===== learned/base thresholds =====
     RSI_MIN = lp["rsi_min"]; RSI_MAX = lp["rsi_max"]
     ADX_MIN = lp["adx_min"]; RVOL_BASE = lp["rvol_base"]
 
-    # Perfil de volatilidad
+    # ===== volatility profile (ANCHOR-6: soften "unstable") =====
     prof = classify_symbol(symbol)
     klass = prof["class"]
 
-    # Overlays por régimen
     RSI_MIN_K, RSI_MAX_K = RSI_MIN, RSI_MAX
     ADX_MIN_K = ADX_MIN
     RVOL_BASE_K = RVOL_BASE
@@ -960,16 +959,17 @@ def hybrid_decision(symbol: str):
         SCORE_GATE_OFFSET = -0.2
         REENTRY_PAD = 0.0015
     elif klass == "unstable":
-        RSI_MIN_K, RSI_MAX_K = max(48, RSI_MIN - 2), min(65, RSI_MAX)
-        ADX_MIN_K = max(25, ADX_MIN)
-        RVOL_BASE_K = max(1.1, RVOL_BASE)
-        SCORE_GATE_OFFSET = +0.3
-        REENTRY_PAD = 0.0035
+        # soften vs. your previous +0.3 gate bump and tighter RSI
+        RSI_MIN_K, RSI_MAX_K = max(48, RSI_MIN - 2), min(66, RSI_MAX)   # was 65
+        ADX_MIN_K = max(23, ADX_MIN)                                     # was 25
+        RVOL_BASE_K = max(1.05, RVOL_BASE)                               # was >=1.1
+        SCORE_GATE_OFFSET = +0.1                                         # was +0.3
+        REENTRY_PAD = 0.0030                                             # was 0.0035
 
     blocks = []
     level = "NONE"  # NONE | SOFT | HARD
 
-    # Liquidez
+    # ===== liquidity / spread guards (unchanged) =====
     try:
         t = exchange.fetch_ticker(symbol)
         qvol = float(t.get('quoteVolume', 0.0) or 0.0)
@@ -980,7 +980,6 @@ def hybrid_decision(symbol: str):
         blocks.append(f"ticker error: {e}")
         level = "HARD"
 
-    # Spread
     try:
         ob = exchange.fetch_order_book(symbol, limit=50)
         spr_p = percent_spread(ob)
@@ -992,6 +991,7 @@ def hybrid_decision(symbol: str):
         level = "HARD"
         spr_p = 0.0
 
+    # ===== core TF (1h) =====
     df = fetch_and_prepare_data_hybrid(symbol)
     if df is None or len(df) < 60:
         blocks.append("not enough candles")
@@ -999,65 +999,34 @@ def hybrid_decision(symbol: str):
         return "hold", 50, 0.0, " | ".join(blocks)
 
     row = df.iloc[-1]
-        # ADX slope (1h) — is energy building?
-    try:
-        adx_series_1h = ta.adx(df['high'], df['low'], df['close'], length=14)['ADX_14']
-        adx_slope_1h = None
-        if adx_series_1h is not None and len(adx_series_1h.dropna()) >= 6:
-            x = np.arange(6)
-            adx_slope_1h = linregress(x, adx_series_1h.iloc[-6:]).slope
-    except Exception:
-        adx_slope_1h = None
-
     score_gate = get_score_gate() + SCORE_GATE_OFFSET
-    # Anti-scalp: skip if current ATR% can’t reasonably outrun fees
+
+    # ===== anti-scalp vs fees (ANCHOR-7: keep but a touch looser) =====
     atr_abs_now = float(row['ATR']) if pd.notna(row['ATR']) else None
     atr_pct_now = (atr_abs_now / row['close'] * 100.0) if (atr_abs_now and row['close']) else None
     if atr_pct_now is not None:
-        if atr_pct_now < required_edge_pct() * 1.2:  # 1.2–1.5x is a good range
-            blocks.append(f"anti-scalp: ATR% {atr_pct_now:.2f} < needed {required_edge_pct()*1.2:.2f}")
+        needed = required_edge_pct() * 1.15  # was 1.2
+        if atr_pct_now < needed:
+            blocks.append(f"anti-scalp: ATR% {atr_pct_now:.2f} < needed {needed:.2f}")
             if level != "HARD": level = "SOFT"
 
-
+    # ===== local 1h features =====
     in_lane = bool(row['EMA20'] > row['EMA50'] and row['close'] > row['EMA20'])
     adx = float(row['ADX']) if pd.notna(row['ADX']) else 0.0
-    rvol = float(row['RVOL10']) if pd.notna(row['RVOL10']) else None
+    rvol_1h = float(row['RVOL10']) if pd.notna(row['RVOL10']) else None
     price_slope = float(row.get('PRICE_SLOPE10', 0.0) or 0.0)
 
-    # If ADX is flat/slipping and not already very strong, soft-block unless other confluence exists
-    if adx_slope_1h is not None and adx_slope_1h <= 0 and adx < (ADX_MIN_K + 3):
-        blocks.append(f"SOFT block: ADX slope≤0 (Δ≈{adx_slope_1h:.3f}) and ADX<{ADX_MIN_K+3:.0f}")
-        if level != "HARD": level = "SOFT"
-
-        # RVOL checks: hard only on "dead tape", otherwise soft
-    if rvol is None or not np.isfinite(rvol):
-        blocks.append("RVOL invalid")
-        if level != "HARD": level = "SOFT"
-    else:
-        if rvol < DEAD_TAPE_RVOL10_HARD:
-            blocks.append(f"dead tape: RVOL10<{DEAD_TAPE_RVOL10_HARD:.2f} ({rvol:.2f})")
-            level = "HARD"
-        elif rvol < RVOL_VALUE_MIN:
-            blocks.append(f"RVOL small ({rvol:.2f})")
-            if level != "HARD": level = "SOFT"
-
-
-    # Snapshots
+    # ===== fast snapshots (needed for anchors 2,8) =====
     tf15 = quick_tf_snapshot(symbol, '15m', limit=120)
     tf4h = quick_tf_snapshot(symbol, '4h',  limit=120)
+    rv15 = tf15.get('RVOL10')
 
-    # HARD blocks: 15m weakness o 4h overbought extremo
-        # 15m weakness: make it SOFT unless extremely weak
+    # ===== 15m weakness/4h OB hard-blocks (keep) =====
     try:
         rsi_15 = tf15.get('RSI'); macdh_15 = tf15.get('MACDh')
-        if (macdh_15 is not None and macdh_15 < 0) and (rsi_15 is not None):
-            if rsi_15 < 42:   # extreme → HARD
-                blocks.append("HARD block: 15m extreme weakness")
-                level = "HARD"
-            elif rsi_15 < 48: # typical weakness → SOFT
-                blocks.append("SOFT block: 15m weakness")
-                if level != "HARD": level = "SOFT"
-
+        if (macdh_15 is not None and macdh_15 < 0) and (rsi_15 is not None and rsi_15 < 48):
+            blocks.append("HARD block: 15m weakness")
+            level = "HARD"
     except Exception:
         pass
     try:
@@ -1065,45 +1034,53 @@ def hybrid_decision(symbol: str):
         if rsi_4h is not None and rsi_4h >= (RSI_OVERBOUGHT_4H + 2.0):
             blocks.append("HARD block: 4h too overbought")
             level = "HARD"
-        # Extra para "unstable": requiere empuje real si 4h RSI alto
         if klass == "unstable" and rsi_4h is not None and rsi_4h >= 68:
-            rv15 = tf15.get('RVOL10') or 0
-            mh15 = tf15.get('MACDh') or 0
-            if not (mh15 > 0 and rv15 >= 1.3):
+            rv_ok = (rv15 or 0) >= 1.3
+            mh_ok = (tf15.get('MACDh') or 0) > 0
+            if not (mh_ok and rv_ok):
                 blocks.append("HARD block: 4h high RSI but 15m lacks RVOL/MACDh")
                 level = "HARD"
     except Exception:
         pass
 
-    # NBUS — no-buy-under-sell → HARD
-    sell_cond, reason = is_selling_condition_now(symbol)
-    if sell_cond:
-        blocks.append(f"NBUS: {reason}")
-        level = "HARD"
-
-    # Post-loss cooldown → HARD (override estricto)
+    # ===== NBUS rework (ANCHOR-2): relax ADX and OB gate =====
+    # old call removed; inline light version:
+    # ===== NBUS gate (use helper) =====
     try:
-        now = datetime.now(timezone.utc)
+        sell_cond, reason = is_selling_condition_now(symbol)
+        if sell_cond:
+            blocks.append(f"NBUS: {reason}")
+            level = "HARD"
+    except Exception as e:
+        logger.debug(f"NBUS helper error {symbol}: {e}")
+
+
+    # ===== post-loss cooldown (ANCHOR-3: softer & more permissive) =====
+    try:
         info = LAST_LOSS_INFO.get(symbol)
         if info and info.get("ts"):
+            now = datetime.now(timezone.utc)
             last_dt = datetime.fromisoformat(info["ts"].replace("Z",""))
             within_cooldown = last_dt and (now - last_dt).total_seconds() < COOLDOWN_MIN_AFTER_LOSS * 60
             if within_cooldown:
-                df15 = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=120)
+                # easier override: RVOL15 > 1.5 or ADX15 > 30 and MACDh15 > 0
+                df15_full = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=120)
                 post_loss_override = False
-                if df15 is not None and len(df15) > 30:
-                    adx15_df = ta.adx(df15['high'], df15['low'], df15['close'], length=14)
+                if df15_full is not None and len(df15_full) > 30:
+                    adx15_df = ta.adx(df15_full['high'], df15_full['low'], df15_full['close'], length=14)
                     adx15 = float(adx15_df['ADX_14'].iloc[-1]) if adx15_df is not None else None
-                    rvol15 = float(df15['volume'].iloc[-1] / df15['volume'].rolling(10).mean().iloc[-1]) if df15['volume'].rolling(10).mean().iloc[-1] else None
-                    macd15 = ta.macd(df15['close'], fast=12, slow=26, signal=9)
+                    rvol15_full = None
+                    try:
+                        rv_mean = df15_full['volume'].rolling(10).mean().iloc[-1]
+                        if rv_mean and rv_mean > RVOL_MEAN_MIN:
+                            rvol15_full = float(df15_full['volume'].iloc[-1] / rv_mean)
+                    except Exception:
+                        pass
+                    macd15 = ta.macd(df15_full['close'], fast=12, slow=26, signal=9)
                     macdh15 = float(macd15['MACDh_12_26_9'].iloc[-1]) if macd15 is not None else None
-                    ema20_15 = float(ta.ema(df15['close'], length=20).iloc[-1])
-                    last15 = float(df15['close'].iloc[-1])
                     post_loss_override = (
-                        (adx15 is not None and adx15 > 32) and
-                        (rvol15 is not None and rvol15 > 2.2) and
-                        (macdh15 is not None and macdh15 > 0) and
-                        (last15 > ema20_15)
+                        (rvol15_full is not None and rvol15_full > 1.5) or
+                        ((adx15 or 0) > 30 and (macdh15 or 0) > 0)
                     )
                 if not post_loss_override:
                     blocks.append("post-loss cooldown")
@@ -1111,29 +1088,18 @@ def hybrid_decision(symbol: str):
     except Exception:
         pass
 
-    # Re-entry block tras sell/startup → HARD
+    # ===== re-entry block (ANCHOR-4: shorter) =====
     try:
         info = LAST_SELL_INFO.get(symbol)
         if info and info.get("ts"):
             last_dt = datetime.fromisoformat(info["ts"].replace("Z",""))
-            if last_dt and (datetime.now(timezone.utc) - last_dt).total_seconds() < REENTRY_BLOCK_MIN * 60:
+            if last_dt and (datetime.now(timezone.utc) - last_dt).total_seconds() < (REENTRY_BLOCK_MIN * 60):
                 blocks.append(f"re-entry block ({REENTRY_BLOCK_MIN}m)")
                 level = "HARD"
     except Exception:
         pass
 
-        # Post-trade cooldown regardless of PnL
-    try:
-        ltc = LAST_TRADE_CLOSE.get(symbol)
-        if ltc:
-            last_dt = datetime.fromisoformat(ltc.replace("Z",""))
-            if (datetime.now(timezone.utc) - last_dt).total_seconds() < POST_TRADE_COOLDOWN_SEC:
-                blocks.append(f"post-trade cooldown {POST_TRADE_COOLDOWN_SEC}s")
-                level = "HARD"
-    except Exception:
-        pass
-
-    # Confirmación (EMA/VWAP/exitPad) por régimen → SOFT
+    # ===== confirmation (EMA/VWAP/exitPad) — keep, but less strict on VWAP for stable =====
     try:
         last = float(row['close'])
         ema20_1h = float(row['EMA20']) if pd.notna(row['EMA20']) else None
@@ -1144,7 +1110,11 @@ def hybrid_decision(symbol: str):
         if klass == "unstable":
             ema_ok = ema_ok and (ema50_1h is None or last > ema50_1h)
 
-        vwap_ok = (vwap_1h is None) or (last >= vwap_1h)
+        # allow dip-buys on stable regime even if slightly below VWAP
+        if klass == "stable":
+            vwap_ok = True if vwap_1h is None else (last >= vwap_1h * 0.998)
+        else:
+            vwap_ok = (vwap_1h is None) or (last >= vwap_1h)
 
         le = LAST_SELL_INFO.get(symbol)
         exit_ok = True
@@ -1157,33 +1127,38 @@ def hybrid_decision(symbol: str):
     except Exception:
         pass
 
-    # ¿En lane o override fuerte?
-    override = (not in_lane) and (adx >= ADX_MIN_K + 10) and (rvol is not None and rvol >= RVOL_BASE_K * 1.5) and (price_slope > 0)
+    # ===== lane/override logic (ANCHOR-5: make override a bit easier) =====
+    override = (not in_lane) and (adx >= ADX_MIN_K + 8) and ((rvol_1h or 0) >= (RVOL_BASE_K * 1.4)) and (price_slope > 0)
     if not (in_lane or override):
         blocks.append("not in uptrend lane; no override")
         if level != "HARD": level = "SOFT"
 
-    # ─── raw_score (NO se anula por bloqueos)
+    # ===== scoring =====
     score = 0.0; notes = []
-    if rvol is not None and rvol >= RVOL_BASE_K: score += 2.0; notes.append(f"RVOL≥{RVOL_BASE_K:.2f} ({(rvol or 0):.2f})")
-    if rvol is not None and rvol >= RVOL_BASE_K + 0.5: score += 1.0
-    if rvol is not None and rvol >= RVOL_BASE_K + 1.5: score += 1.0
-    if price_slope > 0: score += 1.0; notes.append("price slope>0")
+
+    # RVOL contribution uses ANY of (1h,15m) so early wake-ups don’t get punished (ANCHOR-8)
+    rvol_any = None
+    for _rv in (rvol_1h, rv15):
+        if _rv is not None and np.isfinite(_rv):
+            rvol_any = _rv if (rvol_any is None) else max(rvol_any, _rv)
+
+    if rvol_any is not None and rvol_any >= RVOL_BASE_K:
+        score += 2.0; notes.append(f"RVOL≥{RVOL_BASE_K:.2f} ({rvol_any:.2f})")
+        if rvol_any >= RVOL_BASE_K + 0.5: score += 1.0
+        if rvol_any >= RVOL_BASE_K + 1.5: score += 1.0
+
+    if price_slope > 0:
+        score += 1.0; notes.append("price slope>0")
 
     rsi = float(row['RSI']) if pd.notna(row['RSI']) else 50.0
     if RSI_MIN_K <= rsi <= RSI_MAX_K:
         score += 1.0; notes.append(f"RSI in band ({rsi:.1f})")
-        # regime-aware nudge (helps high-vol pairs demand a bit more RSI)
-        if klass == "unstable" and rsi >= max(60, RSI_MIN_K + 2):
-            score += 0.2; notes.append("RSI nudge (unstable)")
-    else:
-        # still allow trades in mushy zones but with a tiny penalty
-        if klass == "unstable" and rsi < 55:
-            score -= 0.2; notes.append("RSI soft penalty (unstable<55)")
     if rsi >= (RSI_MIN_K + RSI_MAX_K)/2:
         score += 0.5
 
-    if adx >= ADX_MIN_K: score += 1.0; notes.append(f"ADX≥{ADX_MIN_K:.0f} ({adx:.1f})")
+    if adx >= ADX_MIN_K:
+        score += 1.0; notes.append(f"ADX≥{ADX_MIN_K:.0f} ({adx:.1f})")
+
     vol_slope = float(row.get('VOL_SLOPE10', 0.0) or 0.0)
     if vol_slope > 0: score += 0.5
 
@@ -1194,7 +1169,7 @@ def hybrid_decision(symbol: str):
     except Exception:
         pass
 
-    # Jitter
+    # jitter (unchanged)
     try:
         conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
         cur.execute("SELECT executed FROM decision_log ORDER BY id DESC LIMIT ?", (DECISION_WINDOW,))
@@ -1213,10 +1188,10 @@ def hybrid_decision(symbol: str):
 
     raw_score = max(0.0, score)
 
-    # Ejecutabilidad (HARD bloquea; SOFT puede relajarse en hambruna)
+    # executability and starvation logic
     buy_ratio = _recent_buy_ratio()
     starvation = buy_ratio < TARGET_BUY_RATIO
-    relax_soft = starvation
+    relax_soft = starvation  # can set True to force testing
 
     if level == "HARD":
         exec_allowed = False
@@ -1228,12 +1203,12 @@ def hybrid_decision(symbol: str):
 
     score_for_gate = raw_score if exec_allowed else 0.0
 
-    # Require stronger confluence on weak volume
-    if (rvol is not None) and (rvol < RVOL_BASE_K):
+    # ANCHOR-8b: skip gate bump if 15m is waking up
+    fifteen_waking = (rv15 is not None and rv15 >= 0.9 and (tf15.get('MACDh') or 0) > 0)
+    if ((rvol_1h is None) or (rvol_1h < RVOL_BASE_K)) and not fifteen_waking:
         score_gate += 0.3
 
-
-    # Acción
+    # final action
     gate = score_gate
     if exec_allowed and raw_score >= gate:
         action = "buy"
@@ -1243,13 +1218,6 @@ def hybrid_decision(symbol: str):
     conf = int(clamp(50 + 10*(1 if row['EMA20'] > row['EMA50'] else 0) + 5*(1 if price_slope>0 else 0), 0, 100))
     if symbol in LAST_LOSS_INFO:
         conf = min(conf, POST_LOSS_CONF_CAP)
-
-        # small confidence nudge for strong RSI in unstable regime
-    try:
-        if klass == "unstable" and rsi is not None and rsi >= 62:
-            conf = min(100, conf + 3)
-    except Exception:
-        pass
 
     note = f"raw={raw_score:.1f} gate={gate:.1f} score={score_for_gate:.1f} | " + ", ".join(notes)
     note += f" | class={klass}"
