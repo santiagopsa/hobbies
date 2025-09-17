@@ -147,6 +147,12 @@ RSI_OVERBOUGHT_4H = 78.0
 PENALTY_4H_RSI = 0.7
 PENALTY_15M_WEAK = 0.5
 
+# >>> SCRATCH FILTER CONFIG (ANCHOR SF1)
+ADX_SCRATCH_MIN = 18.0           # require ADX >= 18 OR positive slope if 15 <= ADX < 18
+ADX_SCRATCH_SLOPE_BARS = 6       # slope lookback (1h ADX)
+ADX_SCRATCH_SLOPE_MIN = 0.0      # must be > 0 when ADX < 18
+
+
 # Cooldowns / re-entry
 COOLDOWN_MIN_AFTER_LOSS = 10
 POST_LOSS_SIZING_WINDOW_SEC = 2 * 3600
@@ -736,6 +742,44 @@ def rsi_slope(df: pd.DataFrame, length: int = 14, bars: int = 6) -> float:
     except Exception:
         return 0.0
 
+# >>> SCRATCH FILTER HELPERS (ANCHOR SF2)
+def series_slope_last_n(series: pd.Series, bars: int = 6) -> float:
+    """Linear slope over the last `bars` points (positive => rising)."""
+    try:
+        s = pd.Series(series).dropna()
+        seg = s.iloc[-bars:]
+        if len(seg) < bars:
+            return 0.0
+        x = np.arange(len(seg))
+        return float(linregress(x, seg.values).slope)
+    except Exception:
+        return 0.0
+
+def preflight_buy_guard(symbol: str) -> Tuple[bool, str]:
+    """
+    Final check right BEFORE placing a buy:
+    - HARD block if 1h ADX < 15
+    - HARD block if 15 <= ADX < ADX_SCRATCH_MIN and ADX slope <= 0
+    - HARD block if 1h RVOL10 < 1.00
+    """
+    df1h = fetch_and_prepare_data_hybrid(symbol, timeframe="1h", limit=80)
+    if df1h is None or len(df1h) < 20:
+        return False, "no 1h data"
+
+    adx = float(df1h['ADX'].iloc[-1]) if pd.notna(df1h['ADX'].iloc[-1]) else None
+    rvol1h = float(df1h['RVOL10'].iloc[-1]) if pd.notna(df1h['RVOL10'].iloc[-1]) else None
+    adx_slope = series_slope_last_n(df1h['ADX'], ADX_SCRATCH_SLOPE_BARS)
+
+    if adx is None or adx < 15.0:
+        return False, f"1h ADX {None if adx is None else f'{adx:.1f}'} < 15"
+    if adx < ADX_SCRATCH_MIN and adx_slope <= ADX_SCRATCH_SLOPE_MIN:
+        return False, f"low-trend scratch: ADX {adx:.1f} < {ADX_SCRATCH_MIN:.0f} and slope {adx_slope:.4f} ≤ 0"
+    if rvol1h is None or rvol1h < 1.00:
+        return False, f"1h RVOL {None if rvol1h is None else f'{rvol1h:.2f}'} < 1.00"
+
+    return True, "ok"
+
+
 def rsi_trend_flags(df: pd.DataFrame, length: int = 14, fast: int = 2, slow: int = 3) -> tuple:
     """
     Returns (is_up, is_down) using a tiny MA crossover on 4h RSI.
@@ -1071,6 +1115,17 @@ def hybrid_decision(symbol: str):
     adx = float(row['ADX']) if pd.notna(row['ADX']) else 0.0
     rvol_1h = float(row['RVOL10']) if pd.notna(row['RVOL10']) else None
     price_slope = float(row.get('PRICE_SLOPE10', 0.0) or 0.0)
+
+    # Scratch filter: require ADX >= 18 or, if 15 <= ADX < 18, ADX slope > 0
+    try:
+        adx_slope_1h = series_slope_last_n(df['ADX'], ADX_SCRATCH_SLOPE_BARS)
+    except Exception:
+        adx_slope_1h = 0.0
+
+    if 15.0 <= adx < ADX_SCRATCH_MIN and adx_slope_1h <= ADX_SCRATCH_SLOPE_MIN:
+        blocks.append(f"HARD block: low-trend scratch (ADX {adx:.1f} < {ADX_SCRATCH_MIN:.0f} and slope {adx_slope_1h:.4f} ≤ 0)")
+        level = "HARD"
+
 
         # --- HARD floors to avoid no-trend / thin-tape scalps
     if adx is not None and adx < 15:
@@ -2080,6 +2135,15 @@ def trade_once_with_report(symbol: str):
             df = fetch_and_prepare_data_hybrid(symbol, limit=200, timeframe=DECISION_TIMEFRAME)
             row = df.iloc[-1]
             atr_abs = float(row['ATR']) if pd.notna(row['ATR']) else price * 0.02
+
+            # Final preflight guard to prevent scratchy/invalid entries (e.g., SOL case)
+            ok, reason = preflight_buy_guard(symbol)
+            if not ok:
+                report["note"] = f"preflight block: {reason}"
+                send_telegram_message(f"🛑 Skipping BUY {symbol} (preflight): {reason}")
+                log_decision(symbol, score, "hold", False)
+                return report
+
 
             amount = size_position(price, usdt, conf, symbol)
             trade_val = amount * price
