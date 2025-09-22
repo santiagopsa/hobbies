@@ -1,6 +1,7 @@
 
+
 # =========================
-# trader_v11.py
+# trader_v12.py
 # =========================
 
 from pathlib import Path
@@ -25,9 +26,11 @@ SELECTED_CRYPTOS = [f"{c}/USDT" for c in TOP_COINS]
 # >>> REGIME/BREADTH CONFIG (ANCHOR RBG)
 REGIME_LEADERS = ["BTC/USDT", "ETH/USDT"]
 BREADTH_COINS  = [f"{c}/USDT" for c in TOP_COINS]
-BREADTH_MIN_COUNT = 6
-BREADTH_RSI_MIN_1H = 60.0
-BREADTH_REQUIRE_EMA20 = True
+# >>> REGIME/BREADTH TUNING (ANCHOR RBG)
+BREADTH_MIN_COUNT = 4          # antes 6
+BREADTH_RSI_MIN_1H = 55.0      # antes 60.0
+BREADTH_REQUIRE_EMA20 = False  # antes True (lo hacemos "soft")
+
 REGIME_LEADER_RSI_MIN = 52.0
 REGIME_LEADER_ADX_MIN = 20.0
 BREADTH_CACHE_TTL_SEC = 120  # seconds
@@ -183,6 +186,11 @@ CRASH_HALT_OVERRIDE_REQUIRE_EMA20 = True
 # RVOL sanity
 RVOL_MEAN_MIN = 1e-6
 RVOL_VALUE_MIN = 0.25
+
+# >>> PREFLIGHT KNOBS (ANCHOR PF0)
+PREFLIGHT_ADX_HARD_MIN = 12.0   # antes 15
+PREFLIGHT_RVOL1H_MIN   = 0.95   # antes 1.00
+
 
 # No-buy-under-sell thresholds
 NBUS_RSI15_OB = 75.0
@@ -846,27 +854,49 @@ def series_slope_last_n(series: pd.Series, bars: int = 6) -> float:
 
 def preflight_buy_guard(symbol: str) -> Tuple[bool, str]:
     """
-    Final check right BEFORE placing a buy:
-    - HARD block if 1h ADX < 15
-    - HARD block if 15 <= ADX < ADX_SCRATCH_MIN and ADX slope <= 0
-    - HARD block if 1h RVOL10 < 1.00
+    Final check right BEFORE placing a buy (v11.1):
+    - HARD block if 1h ADX < PREFLIGHT_ADX_HARD_MIN (12).
+    - If PREFLIGHT_ADX_HARD_MIN ≤ ADX < ADX_SCRATCH_MIN (18), require:
+        * 15m MACDh > 0  (impulso corto)
+        * close_1h > EMA20_1h (estructura mínima)
+    - HARD block if 1h RVOL10 < PREFLIGHT_RVOL1H_MIN (0.95).
     """
     df1h = fetch_and_prepare_data_hybrid(symbol, timeframe="1h", limit=80)
     if df1h is None or len(df1h) < 20:
         return False, "no 1h data"
 
-    adx = float(df1h['ADX'].iloc[-1]) if pd.notna(df1h['ADX'].iloc[-1]) else None
-    rvol1h = float(df1h['RVOL10'].iloc[-1]) if pd.notna(df1h['RVOL10'].iloc[-1]) else None
-    adx_slope = series_slope_last_n(df1h['ADX'], ADX_SCRATCH_SLOPE_BARS)
+    try:
+        adx     = float(df1h['ADX'].iloc[-1]) if pd.notna(df1h['ADX'].iloc[-1]) else None
+        rvol1h  = float(df1h['RVOL10'].iloc[-1]) if pd.notna(df1h['RVOL10'].iloc[-1]) else None
+        ema20_1h= float(df1h['EMA20'].iloc[-1]) if pd.notna(df1h['EMA20'].iloc[-1]) else None
+        close_1h= float(df1h['close'].iloc[-1]) if pd.notna(df1h['close'].iloc[-1]) else None
+    except Exception:
+        return False, "bad 1h fields"
 
-    if adx is None or adx < 15.0:
-        return False, f"1h ADX {None if adx is None else f'{adx:.1f}'} < 15"
-    if adx < ADX_SCRATCH_MIN and adx_slope <= ADX_SCRATCH_SLOPE_MIN:
-        return False, f"low-trend scratch: ADX {adx:.1f} < {ADX_SCRATCH_MIN:.0f} and slope {adx_slope:.4f} ≤ 0"
-    if rvol1h is None or rvol1h < 1.00:
-        return False, f"1h RVOL {None if rvol1h is None else f'{rvol1h:.2f}'} < 1.00"
+    # 1) ADX piso duro
+    if adx is None or adx < PREFLIGHT_ADX_HARD_MIN:
+        return False, f"1h ADX {None if adx is None else f'{adx:.1f}'} < {PREFLIGHT_ADX_HARD_MIN:.0f}"
+
+    # 2) Zona 'scratch' (12–<18): pedir empuje 15m + estructura 1h
+    if adx < ADX_SCRATCH_MIN:
+        df15 = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=80)
+        if df15 is None or len(df15) < 35:
+            return False, "no 15m data for scratch check"
+        try:
+            macd15 = ta.macd(df15['close'])
+            macdh15 = float(macd15['MACDh_12_26_9'].iloc[-1]) if macd15 is not None and not macd15.empty else None
+        except Exception:
+            macdh15 = None
+
+        if (macdh15 is None or macdh15 <= 0.0) or (close_1h is None or ema20_1h is None or not (close_1h > ema20_1h)):
+            return False, f"scratch needs MACDh15>0 and close1h>EMA20 (ADX {adx:.1f} < {ADX_SCRATCH_MIN:.0f})"
+
+    # 3) RVOL piso
+    if rvol1h is None or rvol1h < PREFLIGHT_RVOL1H_MIN:
+        return False, f"1h RVOL {None if rvol1h is None else f'{rvol1h:.2f}'} < {PREFLIGHT_RVOL1H_MIN:.2f}"
 
     return True, "ok"
+
 
 
 def rsi_trend_flags(df: pd.DataFrame, length: int = 14, fast: int = 2, slow: int = 3) -> tuple:
