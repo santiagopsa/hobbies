@@ -218,6 +218,16 @@ RVOL_FLOOR_UNSTABLE_BONUS = +0.10  # unstable: require 0.10 higher
 RVOL_COLLAPSE_EXIT_ENABLED = True
 RVOL_COLLAPSE_EXIT = 0.50   # if 15m RVOL < 0.50 after min hold → exit
 
+# >>> FGI CONFIG (ANCHOR FGI0)
+FGI_API_URL = "https://api.alternative.me/fng/?limit=2&format=json"
+FGI_CACHE_TTL_SEC = 600   # 10 min
+FGI_EXTREME_FEAR = 20
+FGI_FEAR = 35
+FGI_GREED = 60
+FGI_EXTREME_GREED = 75
+
+_FGI_CACHE = {"ts": 0, "value": None, "prev": None}
+
 # Logger
 logger = logging.getLogger("hybrid_trader")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -352,6 +362,42 @@ exchange = ccxt.binance({
     'enableRateLimit': True,
     'options': {'defaultType': 'spot', 'adjustForTimeDifference': True}
 })
+
+
+def fetch_fear_greed_index() -> dict:
+    """
+    Retorna {"value": int|None, "prev": int|None, "ts": epoch}
+    Con caché para evitar rate-limit/timeouts.
+    """
+    now = time.time()
+    if now - _FGI_CACHE["ts"] < FGI_CACHE_TTL_SEC and _FGI_CACHE["value"] is not None:
+        return {"value": _FGI_CACHE["value"], "prev": _FGI_CACHE["prev"], "ts": _FGI_CACHE["ts"]}
+    try:
+        r = requests.get(FGI_API_URL, timeout=6)
+        j = r.json() if r is not None else {}
+        data = (j or {}).get("data", [])
+        cur = int(data[0]["value"]) if data and "value" in data[0] else None
+        prev = int(data[1]["value"]) if len(data) > 1 and "value" in data[1] else None
+        _FGI_CACHE.update({"ts": now, "value": cur, "prev": prev})
+        return {"value": cur, "prev": prev, "ts": now}
+    except Exception:
+        # Mantén último valor de caché si existe
+        return {"value": _FGI_CACHE.get("value"), "prev": _FGI_CACHE.get("prev"), "ts": _FGI_CACHE.get("ts", 0)}
+
+def is_market_bullish() -> tuple[bool, int|None, str]:
+    """
+    Usa F&G para determinar si el contexto global es propicio.
+    True si >= FGI_GREED o si (>=50 y mejorando vs prev).
+    """
+    f = fetch_fear_greed_index()
+    v, p = f.get("value"), f.get("prev")
+    if v is None:
+        return (True, None, "no-fgi")  # falla segura
+    if v >= FGI_GREED:
+        return (True, v, "greed")
+    if v >= 50 and (p is not None) and v > p:
+        return (True, v, "improving")
+    return (False, v, "fear")
 
 # =========================
 # Binance filter helpers
@@ -1154,6 +1200,44 @@ def fetch_and_prepare_data_hybrid(symbol: str, limit: int = 200, timeframe: str 
         df['VWAP'] = np.nan
     return df
 
+# >>> DOWNTREND (ANCHOR DT0)
+def is_downtrend(symbol: str) -> tuple[bool, float, str]:
+    """
+    Señal local por símbolo (4h/1h):
+    - down si RSI4h < 50 con slope<=0, o estructura EMA20<EMA50 y close<EMA20 en 1h.
+    - severidad en [0..1] (0.3 leve, 0.6 media, 0.9 fuerte).
+    """
+    try:
+        df4 = fetch_and_prepare_data_hybrid(symbol, timeframe="4h", limit=120)
+        df1 = fetch_and_prepare_data_hybrid(symbol, timeframe="1h", limit=120)
+        if df4 is None or len(df4) < 30 or df1 is None or len(df1) < 30:
+            return (False, 0.0, "no-data")
+
+        rsi4 = float(df4["RSI"].iloc[-1]) if not pd.isna(df4["RSI"].iloc[-1]) else None
+        slope4 = series_slope_last_n(df4["RSI"], bars=6) if "RSI" in df4 else 0.0
+
+        ema20_1h = float(df1["EMA20"].iloc[-1]) if not pd.isna(df1["EMA20"].iloc[-1]) else None
+        ema50_1h = float(df1["EMA50"].iloc[-1]) if not pd.isna(df1["EMA50"].iloc[-1]) else None
+        close_1h = float(df1["close"].iloc[-1])
+
+        ema_down = (ema20_1h is not None and ema50_1h is not None and ema20_1h < ema50_1h and close_1h < ema20_1h)
+        rsi_down = (rsi4 is not None and rsi4 < 50.0 and slope4 <= 0.0)
+
+        if not (ema_down or rsi_down):
+            return (False, 0.0, "neutral")
+
+        # severidad
+        sev = 0.0
+        if ema_down: sev += 0.5
+        if rsi4 is not None:
+            if rsi4 < 42: sev += 0.3
+            elif rsi4 < 47: sev += 0.15
+        if slope4 < -0.2: sev += 0.2
+
+        return (True, float(clamp(sev, 0.2, 0.95)), f"rsi4={rsi4:.1f if rsi4 is not None else '—'},slope={slope4:.2f},ema_down={ema_down}")
+    except Exception:
+        return (False, 0.0, "error")
+
 def estimate_slippage_pct(symbol: str, notional: float = MIN_NOTIONAL):
     ob = fetch_order_book_safe(symbol, limit=50)
     try:
@@ -1259,6 +1343,50 @@ def hybrid_decision(symbol: str):
 
     blocks = []
     level = "NONE"  # NONE | SOFT | HARD
+
+    # >>> F&G + Downtrend modulation (ANCHOR FGI1)
+    try:
+        mk_bull, fgi_v, fgi_tag = is_market_bullish()
+        down, down_sev, down_note = is_downtrend(symbol)
+
+        # Global (F&G): aflojar en greed, apretar en fear
+        if fgi_v is not None:
+            if fgi_v >= FGI_EXTREME_GREED:
+                ADX_MIN_K = max(ADX_MIN_K - 2, 15)
+                RVOL_BASE_K = max(0.9, RVOL_BASE_K * 0.9)
+                SCORE_GATE_OFFSET += -0.25
+            elif fgi_v >= FGI_GREED:
+                ADX_MIN_K = max(ADX_MIN_K - 1, 16)
+                RVOL_BASE_K = max(1.0, RVOL_BASE_K * 0.95)
+                SCORE_GATE_OFFSET += -0.15
+            elif fgi_v <= FGI_EXTREME_FEAR:
+                ADX_MIN_K = max(ADX_MIN_K + 3, ADX_MIN_K)  # endurece
+                RVOL_BASE_K = max(1.1, RVOL_BASE_K * 1.10)
+                SCORE_GATE_OFFSET += +0.35
+            elif fgi_v <= FGI_FEAR:
+                ADX_MIN_K = max(ADX_MIN_K + 1, ADX_MIN_K)
+                RVOL_BASE_K = max(1.05, RVOL_BASE_K * 1.05)
+                SCORE_GATE_OFFSET += +0.20
+
+        # Local (downtrend por símbolo): apretar gates y re-entry
+        if down:
+            bump = 1.0 + 0.35 * down_sev
+            ADX_MIN_K = max(ADX_MIN_K, 20 + 6*down_sev)
+            RVOL_BASE_K = max(RVOL_BASE_K, 1.1 * bump)
+            SCORE_GATE_OFFSET += +0.20 + 0.20*down_sev
+            reentry_pad_local = max(reentry_pad_local, 0.003 + 0.004*down_sev)
+            reentry_block_min_local = max(reentry_block_min_local, int(20 + 20*down_sev))
+        else:
+            # En subida local: permite un poco más de entradas
+            SCORE_GATE_OFFSET += -0.05
+
+        note_parts = []
+        if fgi_v is not None: note_parts.append(f"FGI={fgi_v}({fgi_tag})")
+        if down: note_parts.append(f"downtrend({down_sev:.2f})")
+        if note_parts:
+            blocks.append("mod:" + ",".join(note_parts))
+    except Exception as e:
+        blocks.append(f"fgi/down-mod error: {e}")
 
     # ===== liquidity / spread guards (unchanged) =====
     try:
@@ -2446,28 +2574,28 @@ def analyze_and_learn(trade_id: str, sell_price: float = None, learn_enabled: bo
 # Sizing (volatility-aware)
 # =========================
 def size_position(price: float, usdt_balance: float, confidence: int, symbol: str = None) -> float:
-    if not price or price <= 0: 
+    if not price or price <= 0:
         return 0.0
 
-    # base fraction por confianza
+    # 1) Base por confianza
     conf_mult = (confidence - 50) / 50.0
     conf_mult = max(0.0, min(conf_mult, 0.84))
     base_frac = RISK_FRACTION * (0.6 + 0.4 * conf_mult)
 
-    # penalización temporal post-pérdida
+    # 2) Penalización temporal post-pérdida
     if symbol and symbol in LAST_LOSS_INFO:
         try:
-            last_dt = datetime.fromisoformat(LAST_LOSS_INFO[symbol]["ts"].replace("Z",""))
+            last_dt = datetime.fromisoformat(LAST_LOSS_INFO[symbol]["ts"].replace("Z", ""))
             if (datetime.now(timezone.utc) - last_dt).total_seconds() < POST_LOSS_SIZING_WINDOW_SEC:
                 base_frac *= POST_LOSS_SIZING_FACTOR
         except Exception:
             pass
 
-    # slippage shave
+    # 3) Slippage shave
     slip_pct = estimate_slippage_pct(symbol, notional=MIN_NOTIONAL) if symbol else 0.05
-    shave = clamp(1.0 - (slip_pct/100.0)*0.5, 0.9, 1.0)
+    shave = clamp(1.0 - (slip_pct / 100.0) * 0.5, 0.9, 1.0)
 
-    # ajuste por volatilidad (1/sqrt(ATR%)), cap en [0.6, 1.4]
+    # 4) Ajuste por volatilidad (1/sqrt(ATR%)), cap en [0.6, 1.4]
     vol_adj = 1.0
     try:
         prof = classify_symbol(symbol) if symbol else None
@@ -2477,29 +2605,58 @@ def size_position(price: float, usdt_balance: float, confidence: int, symbol: st
     except Exception:
         pass
 
-    # === Soft sizing bias by regime + 1h RSI (no blocking) ===
+    # 5) Sesgo suave por clase del símbolo + RSI 1h (no bloqueante)
     try:
         sym_cls = classify_symbol(symbol) if symbol else None
         klass_sz = (sym_cls or {}).get("class", "medium")
-        rsi1h = None
         snap1h = quick_tf_snapshot(symbol, '1h', limit=80) if symbol else {}
         rsi1h = float(snap1h.get('RSI')) if snap1h and snap1h.get('RSI') is not None else None
 
         size_bias = 1.0
         if klass_sz == "unstable" and rsi1h is not None:
-            if rsi1h < 55:      # mushy → trim
+            if rsi1h < 55:
                 size_bias *= 0.70
-            elif rsi1h < 60:    # borderline → mild trim
+            elif rsi1h < 60:
                 size_bias *= 0.85
         elif klass_sz == "stable" and rsi1h is not None:
             if rsi1h < 52:
                 size_bias *= 0.85
-
         size_bias = clamp(size_bias, 0.6, 1.1)
     except Exception:
         size_bias = 1.0
 
-        # >>> PATCH A4: Sizing trim when tape is thin on both TFs
+    # 6) >>> NUEVO: Puerta de sentimiento global (FGI) — sesgo de sizing
+    try:
+        bull, fgi_val, fgi_tag = is_market_bullish()  # (bool, int|None, "greed|improving|fear|no-fgi")
+        if fgi_val is not None:
+            if fgi_val <= FGI_EXTREME_FEAR:
+                base_frac *= 0.60   # -40% en extremo miedo
+            elif fgi_val <= FGI_FEAR:
+                base_frac *= 0.80   # -20% en miedo
+            elif fgi_val >= FGI_EXTREME_GREED:
+                base_frac *= 1.15   # +15% en codicia extrema
+            elif fgi_val >= FGI_GREED:
+                base_frac *= 1.08   # +8% en codicia
+        # si no hay FGI disponible (no-fgi), fallback sin cambio
+    except Exception:
+        pass
+
+    # 7) >>> NUEVO: Sesgo local por tendencia (downtrend por símbolo)
+    try:
+        if symbol:
+            is_down, sev, _why = is_downtrend(symbol)  # sev en [0..1]
+            if is_down:
+                # recorte proporcional a severidad (ej: 0.6 → -30%)
+                base_frac *= clamp(1.0 - 0.5 * sev, 0.55, 1.0)
+            else:
+                # pequeño bono si no hay downtrend y el mercado global está favorable
+                bull, fgi_val, _ = is_market_bullish()
+                if bull:
+                    base_frac *= 1.05
+    except Exception:
+        pass
+
+    # 8) Recorte adicional si el tape está fino simultáneamente en 1h y 15m (ya lo tenías)
     try:
         klass_sz = (classify_symbol(symbol) or {}).get("class", "medium")
         floor1, floor15 = rvol_floors_by_regime(klass_sz)
@@ -2509,15 +2666,15 @@ def size_position(price: float, usdt_balance: float, confidence: int, symbol: st
         rvol15_now = float(snap15.get('RVOL10')) if snap15 and snap15.get('RVOL10') is not None else None
         thin = ((rvol1h_now is None or rvol1h_now < floor1) and (rvol15_now is None or rvol15_now < floor15))
         if thin:
-            base_frac *= 0.70  # cut 30% when both TFs are under floors
+            base_frac *= 0.70
     except Exception:
         pass
 
-
-    # final budget
+    # 9) Presupuesto final → convertir a cantidad
     budget = usdt_balance * base_frac * shave * vol_adj * size_bias
     amount = max(MIN_NOTIONAL / price, budget / price)
     return amount
+
 
 # =========================
 # Portfolio util & crash halt
@@ -2914,6 +3071,18 @@ if __name__ == "__main__":
 
             crash_active = crash_halt()
             cycle_decisions = []
+            
+                        # >>> FGI Cycle Gate (ANCHOR FGI3)
+            try:
+                mk_bull, fgi_v, tag = is_market_bullish()
+                # Si hay extreme fear y además el régimen está apagado, pausamos ciclo (low-frequency en bears)
+                if (fgi_v is not None and fgi_v <= FGI_EXTREME_FEAR) and (not market_regime_ok()):
+                    logger.warning(f"⏸️  Cycle skipped due to Extreme Fear (FGI={fgi_v}, {tag}) with regime off.")
+                    time.sleep(30)
+                    continue
+            except Exception as e:
+                logger.debug(f"FGI gate error: {e}")
+
 
             for sym in SELECTED_CRYPTOS:
                 if crash_active:
