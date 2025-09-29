@@ -19,10 +19,13 @@ from typing import Tuple
 load_dotenv()
 
 # >>> STRATEGY PROFILE (ANCHOR SP0)
-STRATEGY_PROFILE = os.getenv("STRATEGY_PROFILE", "USDT_MOMENTUM", "AUTO_HYBRID").upper()
+# Selector de estrategia
 STRATEGY_PROFILES = {"USDT_MOMENTUM", "BTC_PARK", "AUTO_HYBRID"}
+
+STRATEGY_PROFILE = (os.getenv("STRATEGY_PROFILE", "USDT_MOMENTUM") or "USDT_MOMENTUM").strip().upper()
 if STRATEGY_PROFILE not in STRATEGY_PROFILES:
-    STRATEGY_PROFILE = "USDT_MOMENTUM"
+    STRATEGY_PROFILE = "USDT_MOMENTUM"  # fallback seguro
+
 
 # Parking config (solo aplica a BTC_PARK)
 PARK_PCT = float(os.getenv("PARK_PCT", "0.90"))   # % del USDT libre (después de RESERVE_USDT) a parquear
