@@ -1,4 +1,9 @@
-# Write the provided trader code into /mnt/data/trader_v10.py
+
+
+# =========================
+# trader_v12_with_capital_manager.py
+# =========================
+
 from pathlib import Path
 import os, time, json, threading, sqlite3, logging, logging.handlers, random, math
 from datetime import datetime, timezone, date
@@ -12,6 +17,26 @@ from typing import Tuple
 # =========================
 load_dotenv()
 
+# === Strategy profile selector ===
+# Options: "USDT_MOMENTUM" (current behavior), "BTC_PARKING", "AUTO_HYBRID"
+STRATEGY_PROFILE = "USDT_MOMENTUM"
+
+# BTC Parking knobs (used by BTC_PARKING and AUTO_HYBRID)
+BTC_ATR_CALM_PCT = float(os.getenv("BTC_ATR_CALM_PCT", "2.0"))        # calm if 1h ATR% < 2.0
+BTC_FLOOR_TYPE = os.getenv("BTC_FLOOR_TYPE", "EMA200_4h")             # only EMA200_4h supported for now
+BTC_FLOOR_BUFFER = float(os.getenv("BTC_FLOOR_BUFFER", "0.015"))      # 1.5% hysteresis
+BTC_EXIT_MULTIPLIER = float(os.getenv("BTC_EXIT_MULTIPLIER", "1.2"))  # vol spike trigger = calm * 1.2
+CAPITAL_SWITCH_COOLDOWN_MIN = int(os.getenv("CAPITAL_SWITCH_COOLDOWN_MIN", "60"))
+BTC_PROTECT_ENTRY_FEE_BUFFER = os.getenv("BTC_PROTECT_ENTRY_FEE_BUFFER", "true").lower() == "true"
+BTC_PROFIT_LOCK_TRAIL_PCT = float(os.getenv("BTC_PROFIT_LOCK_TRAIL_PCT", "3.0"))  # 3% trail on peaks (optional)
+
+# State persistence for capital
+CAPITAL_STATE_PATH = os.getenv("CAPITAL_STATE_PATH", "capital_state.json")
+
+# If we’re in a profile that may hold BTC, don’t liquidate BTC on startup cleanup
+PRESERVE_BTC_BALANCE = (STRATEGY_PROFILE in ("BTC_PARKING", "AUTO_HYBRID"))
+
+
 DB_NAME = "trading_real.db"
 LOG_PATH = os.path.expanduser("~/hobbies/trading.log")
 
@@ -21,9 +46,11 @@ SELECTED_CRYPTOS = [f"{c}/USDT" for c in TOP_COINS]
 # >>> REGIME/BREADTH CONFIG (ANCHOR RBG)
 REGIME_LEADERS = ["BTC/USDT", "ETH/USDT"]
 BREADTH_COINS  = [f"{c}/USDT" for c in TOP_COINS]
-BREADTH_MIN_COUNT = 6
-BREADTH_RSI_MIN_1H = 60.0
-BREADTH_REQUIRE_EMA20 = True
+# >>> REGIME/BREADTH TUNING (ANCHOR RBG)
+BREADTH_MIN_COUNT = 4          # antes 6
+BREADTH_RSI_MIN_1H = 55.0      # antes 60.0
+BREADTH_REQUIRE_EMA20 = False  # antes True (lo hacemos "soft")
+
 REGIME_LEADER_RSI_MIN = 52.0
 REGIME_LEADER_ADX_MIN = 20.0
 BREADTH_CACHE_TTL_SEC = 120  # seconds
@@ -179,6 +206,11 @@ CRASH_HALT_OVERRIDE_REQUIRE_EMA20 = True
 # RVOL sanity
 RVOL_MEAN_MIN = 1e-6
 RVOL_VALUE_MIN = 0.25
+
+# >>> PREFLIGHT KNOBS (ANCHOR PF0)
+PREFLIGHT_ADX_HARD_MIN = 12.0   # antes 15
+PREFLIGHT_RVOL1H_MIN   = 0.95   # antes 1.00
+
 
 # No-buy-under-sell thresholds
 NBUS_RSI15_OB = 75.0
@@ -338,15 +370,18 @@ def _bn_filters(symbol):
     m = exchange.markets.get(symbol, {})
     step = min_qty = min_notional = None
     try:
-        for f in m.get('info', {}).get('filters', []):
+        for f in (m.get('info', {}) or {}).get('filters', []):
             if f.get('filterType') == 'LOT_SIZE':
                 step = float(f['stepSize'])
                 min_qty = float(f['minQty'])
             if f.get('filterType') in ('NOTIONAL', 'MIN_NOTIONAL'):
-                min_notional = float(f.get('minNotional') or f.get('minNotional', 0))
+                # try both keys; ccxt/spot can vary
+                mn = f.get('minNotional') or f.get('notional') or 0
+                min_notional = float(mn)
     except Exception:
         pass
     return step, min_qty, min_notional
+
 
 def _floor_to_step(x, step):
     if not step or step <= 0:
@@ -398,6 +433,197 @@ def send_telegram_document(file_path: str, caption: str = ""):
 # =========================
 # Utils
 # =========================
+
+def _load_capital_state():
+    try:
+        if os.path.exists(CAPITAL_STATE_PATH):
+            with open(CAPITAL_STATE_PATH, "r") as f:
+                st = json.load(f)
+                # sanity defaults
+                st.setdefault("state", "USDT")
+                st.setdefault("btc_entry_price", None)
+                st.setdefault("peak", None)
+                st.setdefault("last_switch_ts", 0)
+                return st
+    except Exception:
+        pass
+    return {"state": "USDT", "btc_entry_price": None, "peak": None, "last_switch_ts": 0}
+
+def _save_capital_state(st):
+    try:
+        with open(CAPITAL_STATE_PATH, "w") as f:
+            json.dump(st, f, indent=2)
+    except Exception as e:
+        logger.warning(f"save capital state error: {e}")
+
+class CapitalManager:
+    """
+    Minimal capital router:
+      - USDT_MOMENTUM: do nothing (your current algo runs as-is)
+      - BTC_PARKING: stay parked in BTC when regime is calm + above floor; flee to USDT on risk
+      - AUTO_HYBRID: USDT when regime is bad; BTC when calm+above floor, else USDT (momentum trades allowed)
+    """
+    def __init__(self, profile: str):
+        self.profile = profile
+        self.state = _load_capital_state()
+        self.cooldown = CAPITAL_SWITCH_COOLDOWN_MIN * 60
+
+    # ------- info helpers -------
+    def _btc_info(self):
+        # 1h ATR% + last (for calm/spike), 4h EMA200 floor, EMA20_1h bias
+        df1h = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="1h", limit=200)
+        df4h = fetch_and_prepare_df("BTC/USDT", "4h", limit=300)
+        if df1h is None or len(df1h) < 30 or df4h is None or len(df4h) < 210:
+            return None
+        last = float(df1h['close'].iloc[-1])
+        atr_abs = float(df1h['ATR'].iloc[-1]) if pd.notna(df1h['ATR'].iloc[-1]) else None
+        atr_pct = (atr_abs / last * 100.0) if atr_abs else None
+        ema20_1h = float(df1h['EMA20'].iloc[-1]) if pd.notna(df1h['EMA20'].iloc[-1]) else None
+        ema200_4h = float(ta.ema(df4h['close'], length=200).iloc[-1])
+        bias_ok = (ema20_1h is None) or (last > ema20_1h)
+        return {
+            "last": last, "atr_pct": atr_pct, "ema200_4h": ema200_4h, "bias_ok": bool(bias_ok)
+        }
+
+    def _hurdle_pct(self):
+        # conservative: require round-trip fees safety (already defined in your code)
+        return required_edge_pct()  # %
+
+    def _now_ok(self):
+        try:
+            return time.time() - float(self.state.get("last_switch_ts", 0)) >= self.cooldown
+        except Exception:
+            return True
+
+    # ------- order helpers -------
+    def _alloc_to_btc(self):
+        try:
+            bal = exchange.fetch_balance() or {}
+            free_usdt = float(bal.get('free', {}).get('USDT', 0.0))
+            avail = free_usdt - RESERVE_USDT
+            if avail < MIN_NOTIONAL:
+                logger.info("[capital] USDT→BTC skipped: insufficient free USDT.")
+                return False
+            px = fetch_price("BTC/USDT")
+            if not px or px <= 0: return False
+            step, min_qty, _ = _bn_filters("BTC/USDT")
+            amt = _floor_to_step(avail / px, step)
+            if min_qty and amt < min_qty:
+                logger.info(f"[capital] USDT→BTC skipped: amount<{min_qty}")
+                return False
+            order = exchange.create_market_buy_order("BTC/USDT", amt)
+            fill_px = order.get("price", px) or px
+            self.state.update({"state":"BTC","btc_entry_price": float(fill_px), "peak": float(fill_px), "last_switch_ts": time.time()})
+            _save_capital_state(self.state)
+            send_telegram_message(f"🟠 Capital switch: USDT → BTC  @ {_fmt(fill_px)}  (amt={_fmt(amt)})")
+            logger.info(f"[capital] USDT→BTC @ {fill_px} (amt={amt})")
+            return True
+        except Exception as e:
+            logger.error(f"alloc_to_btc error: {e}")
+            return False
+
+    def _alloc_to_usdt(self):
+        try:
+            bal = exchange.fetch_balance() or {}
+            free_btc = float(bal.get('free', {}).get('BTC', 0.0))
+            if free_btc <= 0:
+                logger.info("[capital] BTC→USDT skipped: no BTC free.")
+                return False
+            px = fetch_price("BTC/USDT")
+            sell_amt, reason = _prepare_sell_amount("BTC/USDT", free_btc, px)
+            if sell_amt <= 0:
+                logger.info(f"[capital] BTC→USDT skipped: {reason}")
+                return False
+            order = exchange.create_market_sell_order("BTC/USDT", sell_amt)
+            fill_px = order.get("price", px) or px
+            self.state.update({"state":"USDT","btc_entry_price": None, "peak": None, "last_switch_ts": time.time()})
+            _save_capital_state(self.state)
+            send_telegram_message(f"🟠 Capital switch: BTC → USDT  @ {_fmt(fill_px)}  (amt={_fmt(sell_amt)})")
+            logger.info(f"[capital] BTC→USDT @ {fill_px} (amt={sell_amt})")
+            return True
+        except Exception as e:
+            logger.error(f"alloc_to_usdt error: {e}")
+            return False
+
+    # ------- decision logic -------
+    def _should_enter_btc(self, info):
+        # calm + above floor + mild bullish bias
+        if not info or info["atr_pct"] is None or info["ema200_4h"] is None:
+            return False, "no info"
+        calm = info["atr_pct"] < BTC_ATR_CALM_PCT
+        above = info["last"] > info["ema200_4h"] * (1.0 + 0.5*BTC_FLOOR_BUFFER)
+        bias = info["bias_ok"]
+        ok = calm and above and bias
+        rsn = f"calm={calm} (ATR%={info['atr_pct']:.2f}<{BTC_ATR_CALM_PCT:.2f}) above_floor={above} bias={bias}"
+        return ok, rsn
+
+    def _should_exit_btc(self, info):
+        if not info or info["atr_pct"] is None or info["ema200_4h"] is None:
+            return True, "missing info"
+        spike = info["atr_pct"] > (BTC_ATR_CALM_PCT * BTC_EXIT_MULTIPLIER)
+        floor_break = info["last"] < info["ema200_4h"] * (1.0 - BTC_FLOOR_BUFFER)
+        trail_hit = False
+        if self.state.get("peak") is not None:
+            dd = (self.state["peak"] - info["last"]) / self.state["peak"] * 100.0
+            trail_hit = dd >= BTC_PROFIT_LOCK_TRAIL_PCT
+        # protect tiny loss near fees (don’t churn)
+        if BTC_PROTECT_ENTRY_FEE_BUFFER and (self.state.get("btc_entry_price") is not None):
+            loss = (info["last"]/self.state["btc_entry_price"] - 1.0) * 100.0
+            if loss > -self._hurdle_pct():
+                # do not force exit on small loss unless floor really breaks
+                if floor_break:
+                    return True, f"floor_break (loss {loss:.2f}% within fees)"
+                return False, f"hold (loss {loss:.2f}% within fees)"
+        ok = spike or floor_break or trail_hit
+        reason = f"spike={spike} floor_break={floor_break} trail={trail_hit}"
+        return ok, reason
+
+    def _update_peak(self, price):
+        try:
+            if self.state.get("peak") is None or price > self.state["peak"]:
+                self.state["peak"] = float(price)
+                _save_capital_state(self.state)
+        except Exception:
+            pass
+
+    def tick(self):
+        if self.profile == "USDT_MOMENTUM":
+            return  # nothing to do
+
+        info = self._btc_info()
+        if info and self.state.get("state") == "BTC":
+            self._update_peak(info["last"])
+
+        if not self._now_ok():
+            return
+
+        # ----- BTC_PARKING -----
+        if self.profile == "BTC_PARKING":
+            if self.state.get("state") == "USDT":
+                go, rsn = self._should_enter_btc(info)
+                if go:
+                    logger.info(f"[capital] Enter BTC_PARKING: {rsn}")
+                    self._alloc_to_btc()
+            else:  # state=BTC
+                out, rsn = self._should_exit_btc(info)
+                if out:
+                    logger.info(f"[capital] Exit BTC_PARKING: {rsn}")
+                    self._alloc_to_usdt()
+            return
+
+        # ----- AUTO_HYBRID -----
+        if self.profile == "AUTO_HYBRID":
+            # If calm+above floor -> park in BTC, else hold USDT (momentum rotation runs)
+            calm_up, rsn = self._should_enter_btc(info)
+            if calm_up and self.state.get("state") == "USDT":
+                logger.info(f"[capital] AUTO_HYBRID enter BTC: {rsn}")
+                self._alloc_to_btc()
+            elif (not calm_up) and self.state.get("state") == "BTC":
+                out, rsn2 = self._should_exit_btc(info)
+                if out:
+                    logger.info(f"[capital] AUTO_HYBRID exit BTC: {rsn2}")
+                    self._alloc_to_usdt()
+
 # >>> PATCH START: REBOUND HELPERS
 def _ema(series, length=20):
     try:
@@ -455,14 +681,31 @@ def donchian_lower(df: pd.DataFrame, length=DONCHIAN_LEN_EXIT):
     except Exception:
         return None
 
-def count_closed_bars_since(df: pd.DataFrame, ts_open: datetime) -> int:
-    """# de velas cerradas con índice > ts_open (DataFrame index = timestamps)."""
+def count_closed_bars_since(df, ts_open):
     if df is None or df.empty:
         return 0
     try:
-        return int((df.index > pd.Timestamp(ts_open)).sum())
+        idx = df.index
+        if idx.tz is None:
+            idx = idx.tz_localize('UTC')
+        ts_open = pd.Timestamp(ts_open).tz_convert('UTC') if pd.Timestamp(ts_open).tzinfo else pd.Timestamp(ts_open, tz='UTC')
+        return int((idx > ts_open).sum())
     except Exception:
         return 0
+
+def _prepare_buy_amount(symbol, desired_notional, px):
+    step, min_qty, min_notional = _bn_filters(symbol)
+    if not px or px <= 0: return 0.0, "no price"
+    amt = desired_notional / px
+    if step: amt = _floor_to_step(amt, step)
+    if min_qty and amt < min_qty: return 0.0, "amount < minQty"
+    if min_notional and (amt * px) < min_notional:  # IMPORTANT
+        # bump to min notional (floored to step)
+        target_amt = (min_notional / px) * 1.001
+        amt = _floor_to_step(target_amt, step)
+    return (amt if amt*px >= (min_notional or 0) else 0.0), None
+
+
 # >>> CHAN HELPERS END
 
 
@@ -502,13 +745,15 @@ def fetch_ohlcv_with_retry(symbol: str, timeframe: str, limit: int = 200, max_re
 
 def percent_spread(order_book: dict) -> float:
     try:
-        bid = order_book['bids'][0][0]
-        ask = order_book['asks'][0][0]
-        if ask:
-            return (ask - bid) / ask
+        bids = order_book.get('bids') or []
+        asks = order_book.get('asks') or []
+        if not bids or not asks:
+            return float('inf')
+        bid = bids[0][0]; ask = asks[0][0]
+        return (ask - bid) / ask if ask else float('inf')
     except Exception:
-        pass
-    return float('inf')
+        return float('inf')
+
 
 def abbr(num):
     try: num = float(num)
@@ -539,62 +784,67 @@ def _fmt(v, decimals=2, pct=False, suffix=""):
 # =========================
 # Feature builders
 # =========================
-def compute_timeframe_features(df: pd.DataFrame, label: str):
+def compute_timeframe_features(df: pd.DataFrame, label: str) -> dict:
+    """
+    Build a compact feature snapshot for a given timeframe DataFrame.
+    Expects df indexed by datetime with columns: open, high, low, close, volume.
+    """
     features = {}
     try:
-        ema20 = ta.ema(df['close'], length=20)
-        ema50 = ta.ema(df['close'], length=50)
+        # --- core indicators
+        ema20  = ta.ema(df['close'], length=20)
+        ema50  = ta.ema(df['close'], length=50)
         ema200 = ta.ema(df['close'], length=200) if len(df) >= 200 else pd.Series(index=df.index, dtype=float)
 
-        rsi = ta.rsi(df['close'], length=14)
+        rsi    = ta.rsi(df['close'], length=14)
         adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
-        adx = adx_df['ADX_14'] if adx_df is not None and not adx_df.empty else pd.Series(index=df.index, dtype=float)
-        atr = ta.atr(df['high'], df['low'], df['close'], length=14)
+        adx    = adx_df['ADX_14'] if adx_df is not None and not adx_df.empty else pd.Series(index=df.index, dtype=float)
+        atr    = ta.atr(df['high'], df['low'], df['close'], length=14)
 
         macd_df = ta.macd(df['close'], fast=12, slow=26, signal=9)
-        macd = macd_df['MACD_12_26_9'] if macd_df is not None and not macd_df.empty else pd.Series(index=df.index, dtype=float)
-        macds = macd_df['MACDs_12_26_9'] if macd_df is not None and not macd_df.empty else pd.Series(index=df.index, dtype=float)
-        macdh = macd_df['MACDh_12_26_9'] if macd_df is not None and not macd_df.empty else pd.Series(index=df.index, dtype=float)
+        macd    = macd_df['MACD_12_26_9'] if macd_df is not None and not macd_df.empty else pd.Series(index=df.index, dtype=float)
+        macds   = macd_df['MACDs_12_26_9'] if macd_df is not None and not macd_df.empty else pd.Series(index=df.index, dtype=float)
+        macdh   = macd_df['MACDh_12_26_9'] if macd_df is not None and not macd_df.empty else pd.Series(index=df.index, dtype=float)
 
-        stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3, smooth_k=3)
+        stoch   = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3, smooth_k=3)
         stoch_k = stoch['STOCHk_14_3_3'] if stoch is not None and not stoch.empty else pd.Series(index=df.index, dtype=float)
         stoch_d = stoch['STOCHd_14_3_3'] if stoch is not None and not stoch.empty else pd.Series(index=df.index, dtype=float)
 
-        bb = ta.bbands(df['close'], length=20, std=2)
-        bbl = bb['BBL_20_2.0'] if bb is not None and not bb.empty else pd.Series(index=df.index, dtype=float)
-        bbm = bb['BBM_20_2.0'] if bb is not None and not bb.empty else pd.Series(index=df.index, dtype=float)
-        bbu = bb['BBU_20_2.0'] if bb is not None and not bb.empty else pd.Series(index=df.index, dtype=float)
+        bb   = ta.bbands(df['close'], length=20, std=2)
+        bbl  = bb['BBL_20_2.0'] if bb is not None and not bb.empty else pd.Series(index=df.index, dtype=float)
+        bbm  = bb['BBM_20_2.0'] if bb is not None and not bb.empty else pd.Series(index=df.index, dtype=float)
+        bbu  = bb['BBU_20_2.0'] if bb is not None and not bb.empty else pd.Series(index=df.index, dtype=float)
 
-        obv = ta.obv(df['close'], df['volume'])
-        # StochRSI
-        try:
-            stochrsi = ta.stochrsi(df['close'], length=14)
-            if stochrsi is not None and not stochrsi.empty:
-                features["stochrsi_k"] = float(stochrsi.iloc[-1, 0]) # 'STOCHRSIk_14_14_3_3'
-                features["stochrsi_d"] = float(stochrsi.iloc[-1, 1]) # 'STOCHRSId_14_14_3_3'
-        except Exception:
-            pass
-        # Fisher Transform
-        try:
-            fdf = ta.fisher(df['high'], df['low'], length=9)
-            if fdf is not None and not fdf.empty:
-                # pandas_ta nombra columnas típicamente 'FISHERT_9' y 'FISHERTs_9'
-                features["fisher_t"] = float(fdf.iloc[-1, 0])
-                features["fisher_ts"] = float(fdf.iloc[-1, 1])
-        except Exception:
-            pass
-
+        obv  = ta.obv(df['close'], df['volume'])
         roc7 = ta.roc(df['close'], length=7)
         vwap = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
 
-        rv_mean = df['volume'].rolling(10).mean()
-        rvol10 = df['volume'] / rv_mean
+        # --- extras that were getting overwritten before
+        try:
+            stochrsi = ta.stochrsi(df['close'], length=14)
+            if stochrsi is not None and not stochrsi.empty:
+                features["stochrsi_k"] = float(stochrsi.iloc[-1, 0])  # STOCHRSIk_14_14_3_3
+                features["stochrsi_d"] = float(stochrsi.iloc[-1, 1])  # STOCHRSId_14_14_3_3
+        except Exception:
+            pass
 
+        try:
+            fdf = ta.fisher(df['high'], df['low'], length=9)
+            if fdf is not None and not fdf.empty:
+                features["fisher_t"]  = float(fdf.iloc[-1, 0])  # FISHERT_9
+                features["fisher_ts"] = float(fdf.iloc[-1, 1])  # FISHERTs_9
+        except Exception:
+            pass
+
+        # --- slopes & RVOL
         price_slope10 = vol_slope10 = np.nan
         if len(df) >= 10:
             x = np.arange(10)
             price_slope10 = linregress(x, df['close'].iloc[-10:]).slope
             vol_slope10   = linregress(x, df['volume'].iloc[-10:]).slope
+
+        rv_mean = df['volume'].rolling(10).mean()
+        rvol10  = df['volume'] / rv_mean
 
         last = df.iloc[-1]
 
@@ -606,35 +856,48 @@ def compute_timeframe_features(df: pd.DataFrame, label: str):
                 return None
 
         bb_pos = None
-        if (not pd.isna(bbu.iloc[-1]) and not pd.isna(bbl.iloc[-1]) and (bbu.iloc[-1]-bbl.iloc[-1]) != 0):
-            bb_pos = (last['close'] - bbl.iloc[-1]) / (bbu.iloc[-1] - bbl.iloc[-1])
+        try:
+            top = bbu.iloc[-1]; bot = bbl.iloc[-1]
+            if pd.notna(top) and pd.notna(bot) and (top - bot) != 0:
+                bb_pos = (last['close'] - bot) / (top - bot)
+        except Exception:
+            bb_pos = None
 
         atr_pct = None
-        try: atr_pct = float(atr.iloc[-1] / last['close'] * 100.0)
-        except Exception: pass
+        try:
+            atr_val = atr.iloc[-1]
+            atr_pct = float(atr_val / last['close'] * 100.0) if pd.notna(atr_val) else None
+        except Exception:
+            pass
 
-        rvv = rvol10.iloc[-1]
-        rv_ok = rv_mean.iloc[-1] and rv_mean.iloc[-1] > RVOL_MEAN_MIN
-        rvv = float(rvv) if rv_ok else None
+        rv_ok = pd.notna(rv_mean.iloc[-1]) and rv_mean.iloc[-1] > RVOL_MEAN_MIN
+        rvv   = float(rvol10.iloc[-1]) if rv_ok and pd.notna(rvol10.iloc[-1]) else None
 
-        features = {
+        # --- FINAL: update (not reassign) so earlier keys are preserved
+        features.update({
             "label": label,
             "last_close": sf(last['close']),
             "atr": sf(atr.iloc[-1]), "atr_pct": atr_pct,
             "rsi": sf(rsi.iloc[-1]), "adx": sf(adx.iloc[-1]),
-            "ema20": sf(ema20.iloc[-1]), "ema50": sf(ema50.iloc[-1]), "ema200": sf(ema200.iloc[-1]) if len(ema200) else None,
-            "macd": sf(macd.iloc[-1]), "macd_signal": sf(macds.iloc[-1]), "macd_hist": sf(macdh.iloc[-1]),
+            "ema20": sf(ema20.iloc[-1]), "ema50": sf(ema50.iloc[-1]),
+            "ema200": sf(ema200.iloc[-1]) if len(ema200) else None,
+            "macd": sf(macd.iloc[-1]), "macd_signal": sf(macds.iloc[-1]),
+            "macd_hist": sf(macdh.iloc[-1]),
             "stoch_k": sf(stoch_k.iloc[-1]), "stoch_d": sf(stoch_d.iloc[-1]),
-            "bb_lower": sf(bbl.iloc[-1]), "bb_mid": sf(bbm.iloc[-1]), "bb_upper": sf(bbu.iloc[-1]), "bb_pos": bb_pos,
+            "bb_lower": sf(bbl.iloc[-1]), "bb_mid": sf(bbm.iloc[-1]),
+            "bb_upper": sf(bbu.iloc[-1]), "bb_pos": bb_pos,
             "obv": sf(obv.iloc[-1]), "roc7": sf(roc7.iloc[-1]), "vwap": sf(vwap.iloc[-1]),
             "rvol10": rvv,
             "price_slope10": float(price_slope10) if not pd.isna(price_slope10) else None,
             "vol_slope10": float(vol_slope10) if not pd.isna(vol_slope10) else None,
-        }
+        })
+
     except Exception as e:
         logger.warning(f"compute_timeframe_features({label}) error: {e}")
-        features = {}
+        features = {"label": label}
+
     return features
+
 
 def detect_support_level_simple(df: pd.DataFrame, window: int = 20):
     try:
@@ -653,7 +916,10 @@ def fetch_and_prepare_df(symbol: str, timeframe: str, limit: int = 250):
     ohlcv = fetch_ohlcv_with_retry(symbol, timeframe=timeframe, limit=limit)
     if not ohlcv: return None
     df = pd.DataFrame(ohlcv, columns=['ts','open','high','low','close','volume'])
-    df['ts'] = pd.to_datetime(df['ts'], unit='ms'); df.set_index('ts', inplace=True)
+    # in fetch_and_prepare_df / fetch_and_prepare_data_hybrid
+    df['ts'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
+    df.set_index('ts', inplace=True)
+
     for c in ['open','high','low','close','volume']:
         df[c] = pd.to_numeric(df[c], errors='coerce').ffill().bfill()
     return df
@@ -722,7 +988,7 @@ def quick_tf_snapshot(symbol: str, timeframe: str, limit: int = 120):
     ohlcv = fetch_ohlcv_with_retry(symbol, timeframe=timeframe, limit=limit)
     if not ohlcv: return {}
     df = pd.DataFrame(ohlcv, columns=['ts','open','high','low','close','volume'])
-    df['ts'] = pd.to_datetime(df['ts'], unit='ms'); df.set_index('ts', inplace=True)
+    df['ts'] = pd.to_datetime(df['ts'], unit='ms', utc=True); df.set_index('ts', inplace=True)
     for c in ['open','high','low','close','volume']:
         df[c] = pd.to_numeric(df[c], errors='coerce').ffill().bfill()
     snap = {}
@@ -739,8 +1005,9 @@ def quick_tf_snapshot(symbol: str, timeframe: str, limit: int = 120):
         snap['ADX'] = float(adx_df['ADX_14'].iloc[-1])
     except Exception: pass
     try:
-        rv_mean = df['volume'].rolling(10).mean().iloc[-1]
-        snap['RVOL10'] = float(df['volume'].iloc[-1] / rv_mean) if rv_mean and rv_mean > RVOL_MEAN_MIN else None
+        rv_mean = df['volume'].shift(1).rolling(10).mean().iloc[-1]
+        rvol_val = (df['volume'].shift(1).iloc[-1] / rv_mean) if (rv_mean and rv_mean > RVOL_MEAN_MIN) else None
+        snap['RVOL10'] = float(rvol_val) if rvol_val is not None else None
     except Exception: pass
     try: snap['last'] = float(df['close'].iloc[-1])
     except Exception: pass
@@ -842,27 +1109,49 @@ def series_slope_last_n(series: pd.Series, bars: int = 6) -> float:
 
 def preflight_buy_guard(symbol: str) -> Tuple[bool, str]:
     """
-    Final check right BEFORE placing a buy:
-    - HARD block if 1h ADX < 15
-    - HARD block if 15 <= ADX < ADX_SCRATCH_MIN and ADX slope <= 0
-    - HARD block if 1h RVOL10 < 1.00
+    Final check right BEFORE placing a buy (v11.1):
+    - HARD block if 1h ADX < PREFLIGHT_ADX_HARD_MIN (12).
+    - If PREFLIGHT_ADX_HARD_MIN ≤ ADX < ADX_SCRATCH_MIN (18), require:
+        * 15m MACDh > 0  (impulso corto)
+        * close_1h > EMA20_1h (estructura mínima)
+    - HARD block if 1h RVOL10 < PREFLIGHT_RVOL1H_MIN (0.95).
     """
     df1h = fetch_and_prepare_data_hybrid(symbol, timeframe="1h", limit=80)
     if df1h is None or len(df1h) < 20:
         return False, "no 1h data"
 
-    adx = float(df1h['ADX'].iloc[-1]) if pd.notna(df1h['ADX'].iloc[-1]) else None
-    rvol1h = float(df1h['RVOL10'].iloc[-1]) if pd.notna(df1h['RVOL10'].iloc[-1]) else None
-    adx_slope = series_slope_last_n(df1h['ADX'], ADX_SCRATCH_SLOPE_BARS)
+    try:
+        adx     = float(df1h['ADX'].iloc[-1]) if pd.notna(df1h['ADX'].iloc[-1]) else None
+        rvol1h  = float(df1h['RVOL10'].iloc[-1]) if pd.notna(df1h['RVOL10'].iloc[-1]) else None
+        ema20_1h= float(df1h['EMA20'].iloc[-1]) if pd.notna(df1h['EMA20'].iloc[-1]) else None
+        close_1h= float(df1h['close'].iloc[-1]) if pd.notna(df1h['close'].iloc[-1]) else None
+    except Exception:
+        return False, "bad 1h fields"
 
-    if adx is None or adx < 15.0:
-        return False, f"1h ADX {None if adx is None else f'{adx:.1f}'} < 15"
-    if adx < ADX_SCRATCH_MIN and adx_slope <= ADX_SCRATCH_SLOPE_MIN:
-        return False, f"low-trend scratch: ADX {adx:.1f} < {ADX_SCRATCH_MIN:.0f} and slope {adx_slope:.4f} ≤ 0"
-    if rvol1h is None or rvol1h < 1.00:
-        return False, f"1h RVOL {None if rvol1h is None else f'{rvol1h:.2f}'} < 1.00"
+    # 1) ADX piso duro
+    if adx is None or adx < PREFLIGHT_ADX_HARD_MIN:
+        return False, f"1h ADX {None if adx is None else f'{adx:.1f}'} < {PREFLIGHT_ADX_HARD_MIN:.0f}"
+
+    # 2) Zona 'scratch' (12–<18): pedir empuje 15m + estructura 1h
+    if adx < ADX_SCRATCH_MIN:
+        df15 = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=80)
+        if df15 is None or len(df15) < 35:
+            return False, "no 15m data for scratch check"
+        try:
+            macd15 = ta.macd(df15['close'])
+            macdh15 = float(macd15['MACDh_12_26_9'].iloc[-1]) if macd15 is not None and not macd15.empty else None
+        except Exception:
+            macdh15 = None
+
+        if (macdh15 is None or macdh15 <= 0.0) or (close_1h is None or ema20_1h is None or not (close_1h > ema20_1h)):
+            return False, f"scratch needs MACDh15>0 and close1h>EMA20 (ADX {adx:.1f} < {ADX_SCRATCH_MIN:.0f})"
+
+    # 3) RVOL piso
+    if rvol1h is None or rvol1h < PREFLIGHT_RVOL1H_MIN:
+        return False, f"1h RVOL {None if rvol1h is None else f'{rvol1h:.2f}'} < {PREFLIGHT_RVOL1H_MIN:.2f}"
 
     return True, "ok"
+
 
 
 def rsi_trend_flags(df: pd.DataFrame, length: int = 14, fast: int = 2, slow: int = 3) -> tuple:
@@ -1026,29 +1315,39 @@ def fetch_and_prepare_data_hybrid(symbol: str, limit: int = 200, timeframe: str 
     ohlcv = fetch_ohlcv_with_retry(symbol, timeframe, limit=limit)
     if not ohlcv: return None
     df = pd.DataFrame(ohlcv, columns=['ts','open','high','low','close','volume'])
-    df['ts'] = pd.to_datetime(df['ts'], unit='ms'); df.set_index('ts', inplace=True)
+    df['ts'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
+    df.set_index('ts', inplace=True)
     for c in ['open','high','low','close','volume']:
         df[c] = pd.to_numeric(df[c], errors='coerce').ffill().bfill()
+
     df['EMA20'] = ta.ema(df['close'], length=20)
     df['EMA50'] = ta.ema(df['close'], length=50)
     df['RSI']   = ta.rsi(df['close'], length=14)
     adx = ta.adx(df['high'], df['low'], df['close'], length=14)
     df['ADX'] = adx['ADX_14'] if adx is not None and not adx.empty else np.nan
     df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+
+    # FIX: compute series, then mask small/invalid denominators
+    # in fetch_and_prepare_data_hybrid(...)
     rv_mean = df['volume'].rolling(10).mean()
-    rv_ok = rv_mean.iloc[-1] and rv_mean.iloc[-1] > RVOL_MEAN_MIN
-    df['RVOL10'] = (df['volume'] / rv_mean) if rv_ok else np.nan
+    # OLD: df['RVOL10'] = (df['volume'] / rv_mean).where(rv_mean > RVOL_MEAN_MIN)
+    df['RVOL10'] = (df['volume'].shift(1) / rv_mean.shift(1)).where(rv_mean.shift(1) > RVOL_MEAN_MIN)
+
+
     if len(df) >= 10:
         x = np.arange(10)
         df.loc[df.index[-1], 'PRICE_SLOPE10'] = linregress(x, df['close'].iloc[-10:]).slope
         df.loc[df.index[-1], 'VOL_SLOPE10']   = linregress(x, df['volume'].iloc[-10:]).slope
     else:
-        df['PRICE_SLOPE10'] = np.nan; df['VOL_SLOPE10'] = np.nan
+        df['PRICE_SLOPE10'] = np.nan
+        df['VOL_SLOPE10']   = np.nan
+
     try:
         df['VWAP'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
     except Exception:
         df['VWAP'] = np.nan
     return df
+
 
 def estimate_slippage_pct(symbol: str, notional: float = MIN_NOTIONAL):
     ob = fetch_order_book_safe(symbol, limit=50)
@@ -1672,35 +1971,52 @@ def send_feature_bundle_telegram(trade_id: str, symbol: str, side: str, features
 # =========================
 # Execution & trailing
 # =========================
-def execute_order_buy(symbol: str, amount: float, signals: dict):
+def execute_order_buy(symbol: str, token_amount: float, signals: dict, entry_price: float = None):
     try:
-        order = exchange.create_market_buy_order(symbol, amount)
-        price = order.get("price", fetch_price(symbol))
-        filled = order.get("filled", amount)
-        if not price: return None
+        px = entry_price or fetch_price(symbol)
+        if not px:
+            logger.info(f"BUY {symbol} skipped: no price at execution")
+            return None
+
+        # Enforce filters (convert desired notional → floored base amount)
+        desired_notional = token_amount * px
+        amt_ok, why = _prepare_buy_amount(symbol, desired_notional, px)
+        if amt_ok <= 0:
+            logger.info(f"BUY {symbol} skipped: amount invalid ({why})")
+            return None
+
+        order = exchange.create_market_buy_order(symbol, amt_ok)
+
+        fill_px = float(order.get("price") or fetch_price(symbol) or px)
+        filled  = float(order.get("filled") or amt_ok)
+
         trade_id = f"{symbol}-{datetime.now(timezone.utc).isoformat().replace(':','-')}"
 
         conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
         cur.execute("""
             INSERT INTO transactions (symbol, side, price, amount, ts, trade_id, adx, rsi, rvol, atr, score, confidence, status)
             VALUES (?, 'buy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
-        """, (symbol, float(price), float(filled),
+        """, (symbol, fill_px, filled,
               datetime.now(timezone.utc).isoformat(), trade_id,
               signals.get('adx'), signals.get('rsi'), signals.get('rvol'), signals.get('atr'),
               signals.get('score'), signals.get('confidence')))
         conn.commit(); conn.close()
 
-        send_telegram_message(f"✅ BUY {symbol}\nPrice: {price}\nAmount: {filled}\nConf: {signals.get('confidence', 0)}%\nScore: {signals.get('score', 0):.1f}")
+        send_telegram_message(
+            f"✅ BUY {symbol}\nPrice: {fill_px}\nAmount: {filled}\n"
+            f"Conf: {signals.get('confidence', 0)}%\nScore: {signals.get('score', 0):.1f}"
+        )
 
         features = build_rich_features(symbol)
         save_trade_features(trade_id, symbol, 'entry', features)
         send_feature_bundle_telegram(trade_id, symbol, 'entry', features)
 
-        return {"price": price, "filled": filled, "trade_id": trade_id}
+        return {"price": fill_px, "filled": filled, "trade_id": trade_id}
     except Exception as e:
         logger.error(f"execute_order_buy error {symbol}: {e}")
         send_telegram_message(f"❌ BUY failed {symbol}: {e}")
         return None
+
 
 def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"):
     try:
@@ -2235,50 +2551,65 @@ def analyze_and_learn(trade_id: str, sell_price: float = None, learn_enabled: bo
 # Sizing (volatility-aware)
 # =========================
 def size_position(price: float, usdt_balance: float, confidence: int, symbol: str = None) -> float:
-    if not price or price <= 0: 
+    """
+    Returns the desired TOKEN amount (base units) for a buy, given price, USDT balance, and confidence.
+    - Never spends the RESERVE_USDT.
+    - Scales by confidence and volatility.
+    - Trims sizing after recent loss on the same symbol.
+    - Adds light bias by volatility class + 1h RSI.
+    - Further trims when BOTH 1h and 15m RVOL are under regime floors.
+    """
+    if not price or price <= 0:
         return 0.0
 
-    # base fraction por confianza
-    conf_mult = (confidence - 50) / 50.0
+    # Keep the reserve intact
+    free_after_reserve = max(usdt_balance - RESERVE_USDT, 0.0)
+    if free_after_reserve < MIN_NOTIONAL:
+        return 0.0
+
+    # ---- Base fraction by confidence (50→~60% of RISK_FRACTION up to ~100→~100%) ----
+    conf_mult = (confidence - 50) / 50.0   # 50 → 0.0, 100 → 1.0
     conf_mult = max(0.0, min(conf_mult, 0.84))
     base_frac = RISK_FRACTION * (0.6 + 0.4 * conf_mult)
 
-    # penalización temporal post-pérdida
+    # ---- Post-loss penalty (short window after a loss on this symbol) ----
     if symbol and symbol in LAST_LOSS_INFO:
         try:
-            last_dt = datetime.fromisoformat(LAST_LOSS_INFO[symbol]["ts"].replace("Z",""))
+            last_dt = datetime.fromisoformat(LAST_LOSS_INFO[symbol]["ts"].replace("Z", ""))
             if (datetime.now(timezone.utc) - last_dt).total_seconds() < POST_LOSS_SIZING_WINDOW_SEC:
                 base_frac *= POST_LOSS_SIZING_FACTOR
         except Exception:
             pass
 
-    # slippage shave
-    slip_pct = estimate_slippage_pct(symbol, notional=MIN_NOTIONAL) if symbol else 0.05
-    shave = clamp(1.0 - (slip_pct/100.0)*0.5, 0.9, 1.0)
+    # ---- Slippage shave (small reduction based on expected slippage) ----
+    try:
+        slip_pct = estimate_slippage_pct(symbol, notional=MIN_NOTIONAL) if symbol else 0.05
+    except Exception:
+        slip_pct = 0.05
+    shave = clamp(1.0 - (slip_pct / 100.0) * 0.5, 0.9, 1.0)
 
-    # ajuste por volatilidad (1/sqrt(ATR%)), cap en [0.6, 1.4]
+    # ---- Volatility adjustment (1/sqrt(ATR% median)), capped ----
     vol_adj = 1.0
     try:
         prof = classify_symbol(symbol) if symbol else None
         atrp = (prof or {}).get("atrp_30d")
         if atrp:
+            # Guard tiny atrp; cap result to avoid extremes
             vol_adj = clamp(1.0 / max(0.8, math.sqrt(atrp)), 0.6, 1.4)
     except Exception:
         pass
 
-    # === Soft sizing bias by regime + 1h RSI (no blocking) ===
+    # ---- Soft bias by regime class + 1h RSI (no blocking, just nudge) ----
+    size_bias = 1.0
     try:
-        sym_cls = classify_symbol(symbol) if symbol else None
-        klass_sz = (sym_cls or {}).get("class", "medium")
-        rsi1h = None
+        klass_sz = (classify_symbol(symbol) or {}).get("class", "medium") if symbol else "medium"
         snap1h = quick_tf_snapshot(symbol, '1h', limit=80) if symbol else {}
         rsi1h = float(snap1h.get('RSI')) if snap1h and snap1h.get('RSI') is not None else None
 
-        size_bias = 1.0
         if klass_sz == "unstable" and rsi1h is not None:
-            if rsi1h < 55:      # mushy → trim
+            if rsi1h < 55:
                 size_bias *= 0.70
-            elif rsi1h < 60:    # borderline → mild trim
+            elif rsi1h < 60:
                 size_bias *= 0.85
         elif klass_sz == "stable" and rsi1h is not None:
             if rsi1h < 52:
@@ -2286,27 +2617,30 @@ def size_position(price: float, usdt_balance: float, confidence: int, symbol: st
 
         size_bias = clamp(size_bias, 0.6, 1.1)
     except Exception:
-        size_bias = 1.0
+        pass
 
-        # >>> PATCH A4: Sizing trim when tape is thin on both TFs
+    # ---- Extra trim when tape is thin on BOTH 1h and 15m ----
     try:
-        klass_sz = (classify_symbol(symbol) or {}).get("class", "medium")
+        klass_sz = (classify_symbol(symbol) or {}).get("class", "medium") if symbol else "medium"
         floor1, floor15 = rvol_floors_by_regime(klass_sz)
         snap1h = quick_tf_snapshot(symbol, '1h', limit=80) if symbol else {}
         snap15 = quick_tf_snapshot(symbol, '15m', limit=80) if symbol else {}
         rvol1h_now = float(snap1h.get('RVOL10')) if snap1h and snap1h.get('RVOL10') is not None else None
         rvol15_now = float(snap15.get('RVOL10')) if snap15 and snap15.get('RVOL10') is not None else None
-        thin = ((rvol1h_now is None or rvol1h_now < floor1) and (rvol15_now is None or rvol15_now < floor15))
-        if thin:
-            base_frac *= 0.70  # cut 30% when both TFs are under floors
+        thin_tape = ((rvol1h_now is None or rvol1h_now < floor1) and (rvol15_now is None or rvol15_now < floor15))
+        if thin_tape:
+            base_frac *= 0.70  # 30% cut when both TFs are under floors
     except Exception:
         pass
 
+    # ---- Final USDT budget (respect reserve), then to token amount ----
+    budget_usdt = free_after_reserve * base_frac * shave * vol_adj * size_bias
+    budget_usdt = min(budget_usdt, free_after_reserve)
 
-    # final budget
-    budget = usdt_balance * base_frac * shave * vol_adj * size_bias
-    amount = max(MIN_NOTIONAL / price, budget / price)
-    return amount
+    # Convert to token amount; ensure we at least meet MIN_NOTIONAL if we have enough free_after_reserve
+    token_amt = max(budget_usdt / price, MIN_NOTIONAL / price)
+    return token_amt
+
 
 # =========================
 # Portfolio util & crash halt
@@ -2333,35 +2667,50 @@ def crash_halt():
         return False
 
 def strong_symbol_momentum_15m(symbol: str) -> bool:
+    """
+    Momentum override for crash_halt():
+    Allow buys on `symbol` during a BTC crash halt if 15m trend is strong.
+
+    Criteria (using CLOSED 15m bars):
+      - ADX_14(15m) > CRASH_HALT_OVERRIDE_MIN_ADX15
+      - AND (optional) last close > EMA20_15m if CRASH_HALT_OVERRIDE_REQUIRE_EMA20 is True
+
+    Returns:
+      True  -> allow override (buy may proceed)
+      False -> keep crash halt block
+    """
     if not CRASH_HALT_ENABLE_OVERRIDE:
         return False
     try:
-        ohlcv = fetch_ohlcv_with_retry(symbol, timeframe="15m", limit=120)
-        if not ohlcv:
+        # Use the prepared helper for consistent UTC & cleaning
+        df = fetch_and_prepare_df(symbol, "15m", limit=120)
+        if df is None or len(df) < 40:
             return False
-        df = pd.DataFrame(ohlcv, columns=['ts','open','high','low','close','volume'])
-        df['ts'] = pd.to_datetime(df['ts'], unit='ms'); df.set_index('ts', inplace=True)
-        for c in ['open','high','low','close','volume']:
-            df[c] = pd.to_numeric(df[c], errors='coerce').ffill().bfill()
 
+        # ADX(14) on 15m closed bar
         adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
-        if adx_df is None or adx_df.empty:
+        if adx_df is None or adx_df.empty or pd.isna(adx_df['ADX_14'].iloc[-1]):
             return False
         adx15 = float(adx_df['ADX_14'].iloc[-1])
+
+        # EMA20 and last close on 15m closed bar
         ema20_15 = float(ta.ema(df['close'], length=20).iloc[-1])
-        last15 = float(df['close'].iloc[-1])
+        last15   = float(df['close'].iloc[-1])
 
         cond_adx = adx15 > CRASH_HALT_OVERRIDE_MIN_ADX15
         cond_ema = (last15 > ema20_15) if CRASH_HALT_OVERRIDE_REQUIRE_EMA20 else True
         ok = bool(cond_adx and cond_ema)
+
         if ok:
             logger.info(f"[crash-override] {symbol}: ADX15={adx15:.1f} EMA20OK={cond_ema} — allowing buy despite BTC dip.")
         else:
             logger.info(f"[crash-override] {symbol}: blocked (ADX15={adx15:.1f}, last>EMA20={last15>ema20_15})")
         return ok
+
     except Exception as e:
         logger.debug(f"strong_symbol_momentum_15m error {symbol}: {e}")
         return False
+
 
 # =========================
 # Trading step + report
@@ -2425,7 +2774,7 @@ def trade_once_with_report(symbol: str):
             if df is None or len(df) == 0:
                 report["note"] = "no candles at entry check"; log_decision(symbol, score, "hold", False); return report
 
-            row = df.iloc[-1]
+            row = df.iloc[-2]
             atr_abs = float(row['ATR']) if pd.notna(row['ATR']) else price * 0.02
 
             # Final preflight guard to prevent scratchy/invalid entries (e.g., SOL case)
@@ -2529,18 +2878,23 @@ def reconcile_orphan_open_buys():
 def startup_cleanup():
     logger.info("Startup cleanup: closing non-USDT balances and syncing DB states...")
     try:
-        try: 
+        try:
             exchange.load_markets()
-        except Exception as e: 
+        except Exception as e:
             logger.warning(f"load_markets warning: {e}")
 
-        balances = exchange.fetch_balance() or {} 
+        balances = exchange.fetch_balance() or {}
         free = balances.get("free", {}) or {}
         non_usdt = {a: amt for a, amt in free.items() if a != "USDT" and amt and amt > 0}
 
         conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
 
         for asset, amt in non_usdt.items():
+            # NEW: if the active strategy may hold BTC, preserve BTC balance on startup
+            if PRESERVE_BTC_BALANCE and asset == "BTC":
+                logger.info("Startup cleanup: preserving BTC balance due to strategy profile.")
+                continue
+
             symbol = f"{asset}/USDT"
             if symbol not in getattr(exchange, "markets", {}):
                 logger.info(f"Skip {asset}: market {symbol} not found")
@@ -2614,20 +2968,31 @@ def startup_cleanup():
 # Main loop (r4.2)
 # =========================
 if __name__ == "__main__":
-    logger.info("Starting hybrid trader (r4.2)…")
+    logger.info(f"Starting hybrid trader (r4.2) — profile={STRATEGY_PROFILE} …")
     try:
         try: exchange.load_markets()
         except Exception as e: logger.warning(f"load_markets warning: {e}")
 
-        startup_cleanup()
+        # NEW: capital router
+        capital = CapitalManager(STRATEGY_PROFILE)
+
+        startup_cleanup()  # now respects PRESERVE_BTC_BALANCE
 
         while True:
             check_log_rotation()
 
+            # NEW: let the capital manager decide BTC↔USDT
+            capital.tick()
+
             crash_active = crash_halt()
             cycle_decisions = []
 
-            for sym in SELECTED_CRYPTOS:
+            # When parked in BTC under BTC_PARKING, we don't trade alts.
+            # In AUTO_HYBRID: if state==BTC we also skip alt trading; once state flips to USDT, rotation resumes.
+            parked_btc = (STRATEGY_PROFILE in ("BTC_PARKING","AUTO_HYBRID") and _load_capital_state().get("state") == "BTC")
+            symbols = [] if parked_btc else SELECTED_CRYPTOS
+
+            for sym in symbols:
                 if crash_active:
                     if sym == "BTC/USDT":
                         logger.warning("⚠️ Crash halt active — skipping BTC/USDT.")
@@ -2651,3 +3016,4 @@ if __name__ == "__main__":
             try: h.close()
             except Exception: pass
             logger.removeHandler(h)
+
