@@ -1,7 +1,7 @@
 
 
 # =========================
-# trader_v13.py
+# trader_v14.py
 # =========================
 
 from pathlib import Path
@@ -16,14 +16,11 @@ from typing import Tuple
 # Config & initialization
 # =========================
 
-export STRATEGY_PROFILE=BTC_PARK
-export PARK_PCT=0.9
-
 load_dotenv()
 
 # >>> STRATEGY PROFILE (ANCHOR SP0)
-STRATEGY_PROFILE = os.getenv("STRATEGY_PROFILE", "USDT_MOMENTUM").upper()
-STRATEGY_PROFILES = {"USDT_MOMENTUM", "BTC_PARK"}  # puedes agregar más luego
+STRATEGY_PROFILE = os.getenv("STRATEGY_PROFILE", "USDT_MOMENTUM", "AUTO_HYBRID").upper()
+STRATEGY_PROFILES = {"USDT_MOMENTUM", "BTC_PARK", "AUTO_HYBRID"}
 if STRATEGY_PROFILE not in STRATEGY_PROFILES:
     STRATEGY_PROFILE = "USDT_MOMENTUM"
 
@@ -31,6 +28,13 @@ if STRATEGY_PROFILE not in STRATEGY_PROFILES:
 PARK_PCT = float(os.getenv("PARK_PCT", "0.90"))   # % del USDT libre (después de RESERVE_USDT) a parquear
 PARK_STATE = {"active": False}                    # estado en memoria (simple)
 
+# Target de parking cuando el entorno está “calm/safe”
+AUTO_PARK_PCT = float(os.getenv("AUTO_PARK_PCT", "0.60"))      # 60% del capital libre (tras reserva) hacia BTC
+AUTO_PARK_DEADBAND_BPS = int(os.getenv("AUTO_PARK_DEADBAND_BPS", "50"))  # banda muerta ±0.50% para evitar micro-churn
+
+# Condiciones “calm/safe”
+AUTO_SAFE_FGI = int(os.getenv("AUTO_SAFE_FGI", "60"))           # FGI ≥ 60
+AUTO_SAFE_ATRP_BTC = float(os.getenv("AUTO_SAFE_ATRP_BTC", "1.2"))  # ATR% 30d de BTC ≤ 1.2%
 
 DB_NAME = "trading_real.db"
 LOG_PATH = os.path.expanduser("~/hobbies/trading.log")
@@ -507,6 +511,45 @@ def send_telegram_document(file_path: str, caption: str = ""):
 # Utils
 # =========================
 
+# >>> CALM/SAFE DETECTOR (ANCHOR AH1)
+def is_calm_safe_env() -> tuple[bool, str]:
+    """
+    true si el entorno global es alcista y estable:
+      - market_regime_ok() == True
+      - is_market_bullish() con FGI >= AUTO_SAFE_FGI
+      - BTC estable: ATR% 30d ≤ AUTO_SAFE_ATRP_BTC
+      - Tendencia sana 1h: EMA20 > EMA50 y close > EMA20
+    """
+    try:
+        reg_ok = market_regime_ok()
+    except Exception:
+        reg_ok = True  # fail-open
+
+    mk_bull, fgi_v, tag = is_market_bullish()
+    if not (reg_ok and mk_bull and (fgi_v is not None and fgi_v >= AUTO_SAFE_FGI)):
+        return (False, f"reg={reg_ok},fgi={fgi_v},{tag}")
+
+    try:
+        prof_btc = classify_symbol("BTC/USDT") or {}
+        atrp = float(prof_btc.get("atrp_30d") or 0.0)
+        if atrp <= 0 or atrp > AUTO_SAFE_ATRP_BTC:
+            return (False, f"atrp_btc={atrp:.2f}>limit")
+    except Exception:
+        return (False, "atrp_err")
+
+    try:
+        d1 = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="1h", limit=120)
+        if d1 is None or len(d1) < 30:
+            return (False, "no-1h")
+        ema20 = float(d1["EMA20"].iloc[-1])
+        ema50 = float(d1["EMA50"].iloc[-1])
+        close = float(d1["close"].iloc[-1])
+        if not (ema20 > ema50 and close > ema20):
+            return (False, "ema-structure-weak")
+    except Exception:
+        return (False, "ema_err")
+
+    return (True, f"fgi≥{AUTO_SAFE_FGI},atrp≤{AUTO_SAFE_ATRP_BTC}")
 
 # >>> STRATEGY HELPERS (ANCHOR SP1)
 def strategy_profile() -> str:
@@ -522,51 +565,107 @@ def _free_balances() -> tuple[float, float]:
     except Exception:
         return 0.0, 0.0
 
+# >>> STRATEGY HELPERS (ANCHOR AH2) — reemplaza la función existente si ya la tenías
 def park_to_btc_if_needed() -> bool:
     """
-    Si STRATEGY_PROFILE == BTC_PARK:
-      - Régimen off  → compra BTC con USDT libre (menos RESERVE_USDT) y omite escaneo de alts (return True).
-      - Régimen on   → si estaba aparcado, vende BTC a USDT y continúa con el escaneo (return False).
-    Para USDT_MOMENTUM: no hace nada (return False).
+    BTC_PARK:
+      - régimen off → comprar BTC con USDT libre (tras RESERVE_USDT) y **omitir** escaneo de alts (return True).
+      - régimen on  → vender BTC aparcado y **reanudar** escaneo (return False).
+    AUTO_HYBRID:
+      - si entorno calm/safe → rebalancear a BTC hasta AUTO_PARK_PCT del capital libre (tras reserva).
+                             → **no omite** escaneo (return False).
+      - si deja de estar calm/safe → deshacer BTC aparcado (return False).
+    USDT_MOMENTUM: no hace nada (return False).
     """
-    if strategy_profile() != "BTC_PARK":
+    profile = strategy_profile()
+    if profile not in {"BTC_PARK", "AUTO_HYBRID"}:
         return False
 
-    try:
-        reg_ok = market_regime_ok()
-    except Exception:
-        reg_ok = True  # en caso de error, no aparcar
+    def _free_balances():
+        try:
+            b = exchange.fetch_balance() or {}
+            usdt = float(b.get('free', {}).get('USDT', 0.0) or 0.0)
+            btc  = float(b.get('free', {}).get('BTC', 0.0)  or 0.0)
+            return usdt, btc
+        except Exception:
+            return 0.0, 0.0
 
     usdt_free, btc_free = _free_balances()
     btc_px = fetch_price("BTC/USDT") or 0.0
+    btc_val = btc_free * (btc_px or 0.0)
 
-    # Cuando el régimen está apagado → aparcar
-    if not reg_ok:
-        if not PARK_STATE["active"]:
-            free_after_reserve = max(0.0, usdt_free - RESERVE_USDT)
-            if free_after_reserve >= MIN_NOTIONAL:
-                notional = free_after_reserve * max(0.0, min(PARK_PCT, 1.0))
-                amount = max(MIN_NOTIONAL / (btc_px or 1.0), notional / (btc_px or 1.0))
-                try:
-                    execute_order_buy("BTC/USDT", amount, signals={"confidence": 60, "score": 0.0})
-                    PARK_STATE["active"] = True
-                    logger.info(f"🏕️  PARK: comprados ~{amount:.6f} BTC (~{notional:.2f} USDT).")
-                except Exception as e:
-                    logger.warning(f"PARK buy error: {e}")
-        # Omitimos escaneo de alts mientras régimen off
-        return True
-
-    # Régimen on → des-aparcar si estábamos aparcados
-    if PARK_STATE["active"]:
-        if btc_free * btc_px >= MIN_NOTIONAL:
+    # ---------- BTC_PARK ----------
+    if profile == "BTC_PARK":
+        try:
+            reg_ok = market_regime_ok()
+        except Exception:
+            reg_ok = True
+        if not reg_ok:
+            if not PARK_STATE["active"]:
+                free_after_reserve = max(0.0, usdt_free - RESERVE_USDT)
+                if free_after_reserve >= MIN_NOTIONAL:
+                    notional = free_after_reserve * max(0.0, min(PARK_PCT, 1.0))
+                    amount = max(MIN_NOTIONAL / (btc_px or 1.0), notional / (btc_px or 1.0))
+                    try:
+                        execute_order_buy("BTC/USDT", amount, signals={"confidence": 60, "score": 0.0})
+                        PARK_STATE["active"] = True
+                        logger.info(f"🏕️  PARK: comprados ~{amount:.6f} BTC (~{notional:.2f} USDT).")
+                    except Exception as e:
+                        logger.warning(f"PARK buy error: {e}")
+            return True  # omite escaneo de alts
+        # régimen on → deshacer parking si había
+        if PARK_STATE["active"] and btc_val >= MIN_NOTIONAL:
             try:
                 sell_symbol("BTC/USDT", btc_free, trade_id=f"PARK-UNWIND-{datetime.now(timezone.utc).isoformat()}", source="unpark")
-                logger.info(f"🟢 UNPARK: vendidos {btc_free:.6f} BTC (~{btc_free*btc_px:.2f} USDT).")
+                logger.info(f"🟢 UNPARK: vendidos {btc_free:.6f} BTC (~{btc_val:.2f} USDT).")
             except Exception as e:
                 logger.warning(f"UNPARK sell error: {e}")
         PARK_STATE["active"] = False
+        return False  # continuar escaneo
 
-    return False  # no omitir escaneo
+    # ---------- AUTO_HYBRID ----------
+    calm, why = is_calm_safe_env()
+    # capital libre tras respetar reserva
+    free_cap = max(0.0, usdt_free + btc_val - RESERVE_USDT)
+    target_val = free_cap * max(0.0, min(AUTO_PARK_PCT, 1.0))
+    band = (AUTO_PARK_DEADBAND_BPS / 10000.0)  # ±bps
+
+    if calm and free_cap >= MIN_NOTIONAL:
+        lower = target_val * (1.0 - band)
+        upper = target_val * (1.0 + band)
+        if btc_val < lower:   # comprar BTC para alcanzar target
+            buy_notional = max(MIN_NOTIONAL, target_val - btc_val)
+            buy_notional = min(buy_notional, usdt_free - RESERVE_USDT)  # no tocar reserva
+            if buy_notional >= MIN_NOTIONAL:
+                amount = buy_notional / (btc_px or 1.0)
+                try:
+                    execute_order_buy("BTC/USDT", amount, signals={"confidence": 58, "score": 0.0})
+                    PARK_STATE["active"] = True
+                    logger.info(f"⚖️  AUTO_HYBRID REBAL BUY: +{amount:.6f} BTC (~{buy_notional:.2f} USDT). env={why}")
+                except Exception as e:
+                    logger.warning(f"AUTO_HYBRID buy error: {e}")
+        elif btc_val > upper: # vender excedente
+            sell_notional = max(MIN_NOTIONAL, btc_val - target_val)
+            sell_amount = sell_notional / (btc_px or 1.0)
+            if sell_amount * (btc_px or 0.0) >= MIN_NOTIONAL:
+                try:
+                    sell_symbol("BTC/USDT", min(btc_free, sell_amount), trade_id=f"AUTO_UNW-{datetime.now(timezone.utc).isoformat()}", source="auto_hybrid")
+                    logger.info(f"⚖️  AUTO_HYBRID REBAL SELL: -{sell_amount:.6f} BTC (~{sell_notional:.2f} USDT). env={why}")
+                except Exception as e:
+                    logger.warning(f"AUTO_HYBRID sell error: {e}")
+        # importante: NO omitimos escaneo; seguimos tradeando alts con el USDT remanente
+        return False
+
+    # si ya no está calm/safe → deshacer BTC aparcado
+    if btc_val >= MIN_NOTIONAL and PARK_STATE["active"]:
+        try:
+            sell_symbol("BTC/USDT", btc_free, trade_id=f"AUTO_UNPARK-{datetime.now(timezone.utc).isoformat()}", source="auto_hybrid_exit")
+            logger.info(f"🔄 AUTO_HYBRID EXIT: vendidos {btc_free:.6f} BTC (~{btc_val:.2f} USDT). env={why}")
+        except Exception as e:
+            logger.warning(f"AUTO_HYBRID exit error: {e}")
+    PARK_STATE["active"] = False
+    return False  # continuar escaneo
+
 
 # >>> PATCH START: REBOUND HELPERS
 def _ema(series, length=20):
