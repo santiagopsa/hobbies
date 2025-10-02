@@ -36,7 +36,7 @@ PARK_PROTECT_ENABLED = True
 PARK_TRAIL_PCT = float(os.getenv("PARK_TRAIL_PCT", "0.03"))     # 3% desde el high
 PARK_REENTRY_PAD_BPS = int(os.getenv("PARK_REENTRY_PAD_BPS", "30"))  # +0.30% para re-entrada
 PARK_MIN_HOLD_MIN = int(os.getenv("PARK_MIN_HOLD_MIN", "15"))   # evitar churn
-
+PARK_TRAIL_BPS = int(round(PARK_TRAIL_PCT * 10000))
 
 # Target de parking cuando el entorno está “calm/safe”
 AUTO_PARK_PCT = float(os.getenv("AUTO_PARK_PCT", "0.60"))      # 60% del capital libre (tras reserva) hacia BTC
@@ -80,9 +80,9 @@ STRONG_TREND_K_UNSTABLE = 2.5
 # Execution / risk
 MIN_NOTIONAL = 8.0
 MAX_OPEN_TRADES = 10
-RESERVE_USDT = 100.0
+RESERVE_USDT = 50.0
 RISK_FRACTION = 0.18  # base fraction per trade (modulated)
-
+MIN_RESERVE_USDT = RESERVE_USDT
 # Decision params (defaults)
 DECISION_TIMEFRAME = "1h"
 SPREAD_MAX_PCT_DEFAULT = 0.005   # 0.5%
