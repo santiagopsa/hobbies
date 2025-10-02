@@ -42,6 +42,11 @@ PARK_MIN_HOLD_MIN = int(os.getenv("PARK_MIN_HOLD_MIN", "15"))   # evitar churn
 AUTO_PARK_PCT = float(os.getenv("AUTO_PARK_PCT", "0.60"))      # 60% del capital libre (tras reserva) hacia BTC
 AUTO_PARK_DEADBAND_BPS = int(os.getenv("AUTO_PARK_DEADBAND_BPS", "50"))  # banda muerta ±0.50% para evitar micro-churn
 
+# Anti-chop extra (puedes sobreescribir en .env)
+HYBRID_GLOBAL_COOLDOWN_SEC = int(os.getenv("HYBRID_GLOBAL_COOLDOWN_SEC", "180"))  # espera mínima entre cambios
+HYBRID_MIN_REVERSAL_BPS    = int(os.getenv("HYBRID_MIN_REVERSAL_BPS", "20"))     # 0.20% de movimiento para revertir
+HYBRID_MAX_ACTIONS_5M      = int(os.getenv("HYBRID_MAX_ACTIONS_5M", "4"))        # tope de acciones en 5 minutos
+
 # Condiciones “calm/safe”
 AUTO_SAFE_FGI = int(os.getenv("AUTO_SAFE_FGI", "60"))           # FGI ≥ 60
 AUTO_SAFE_ATRP_BTC = float(os.getenv("AUTO_SAFE_ATRP_BTC", "1.2"))  # ATR% 30d de BTC ≤ 1.2%
@@ -579,147 +584,175 @@ def _free_balances() -> tuple[float, float]:
 # >>> STRATEGY HELPERS (ANCHOR AH2) — reemplaza la función existente si ya la tenías
 def park_to_btc_if_needed() -> bool:
     """
-    BTC_PARK:
-      - régimen off → comprar BTC con USDT libre (tras RESERVE_USDT) y **omitir** escaneo de alts (return True).
-      - régimen on  → vender BTC aparcado y **reanudar** escaneo (return False).
-    AUTO_HYBRID:
-      - si entorno calm/safe → rebalancear a BTC hasta AUTO_PARK_PCT del capital libre (tras reserva).
-                             → **no omite** escaneo (return False).
-      - si deja de estar calm/safe → deshacer BTC aparcado (return False).
-    USDT_MOMENTUM: no hace nada (return False).
+    Parquear a BTC (en realidad salir a USDT en BTC/USDT) cuando se rompe un piso dinámico,
+    y “des-parquear” (reentrar) sólo cuando:
+      1) ha pasado un tiempo mínimo en parking (PARK_MIN_HOLD_MIN), y
+      2) el precio recupera al menos hasta (high * (1 - PARK_REENTRY_PAD_BPS/10000)).
+
+    Requiere vars globales:
+      - PARK_PROTECT_ENABLED (bool)
+      - PARK_GUARD (dict con claves: anchor, high, floor, last_change, reason, parked)
+      - PARK_TRAIL_BPS (int, bps para trailing del piso)
+      - PARK_REENTRY_PAD_BPS (int, bps para “reclaim”)
+      - PARK_MIN_HOLD_MIN (int, minutos de bloqueo antes de re-entrar)
+      - MIN_NOTIONAL (float, notional mínimo del exchange)
+      - MIN_RESERVE_USDT (float, USDT a reservar sin usar)
     """
-    profile = strategy_profile()
-    if profile not in {"BTC_PARK", "AUTO_HYBRID"}:
-        return False
+    import time
+    from datetime import datetime, timezone
 
-    def _free_balances():
-        try:
-            b = exchange.fetch_balance() or {}
-            usdt = float(b.get('free', {}).get('USDT', 0.0) or 0.0)
-            btc  = float(b.get('free', {}).get('BTC', 0.0)  or 0.0)
-            return usdt, btc
-        except Exception:
-            return 0.0, 0.0
+    global PARK_GUARD
 
+    symbol = "BTC/USDT"
+
+    # --- helpers locales ---------------------------
+    def _init_guard():
+        """Asegura estructura y valores por defecto del guard."""
+        nonlocal PARK_GUARD
+        if not isinstance(PARK_GUARD, dict):
+            PARK_GUARD = {}
+        PARK_GUARD.setdefault("anchor", None)
+        PARK_GUARD.setdefault("high", None)
+        PARK_GUARD.setdefault("floor", None)
+        PARK_GUARD.setdefault("last_change", None)  # epoch seconds
+        PARK_GUARD.setdefault("reason", None)
+        PARK_GUARD.setdefault("parked", False)
+
+    def _floor_guard_active(btc_val_usdt: float) -> bool:
+        # Evita ruido si la posición es demasiado pequeña
+        return PARK_PROTECT_ENABLED and btc_val_usdt >= max(MIN_NOTIONAL, 25)
+
+    def _update_anchor_and_floor(last_px: float):
+        """Actualiza high/anchor y recalcula floor con trailing bps."""
+        g = PARK_GUARD
+        if g["high"] is None or last_px > g["high"]:
+            g["high"] = last_px
+            g["anchor"] = last_px
+            g["last_change"] = time.time()
+        # trailing floor desde el HIGH
+        g["floor"] = (g["high"] or last_px) * (1.0 - (PARK_TRAIL_BPS * 0.0001))
+
+    def _reentry_trigger_price(current_px: float) -> float:
+        """Precio de 'reclaim' para poder re-entrar (pad por debajo del high)."""
+        g = PARK_GUARD
+        base = g["high"] or current_px
+        return base * (1.0 - (PARK_REENTRY_PAD_BPS * 0.0001))
+
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    # --- inicio -----------------------------------
+    _init_guard()
+
+    # Balances y precio actual
     usdt_free, btc_free = _free_balances()
-    btc_px = fetch_price("BTC/USDT") or 0.0
-    btc_val = btc_free * (btc_px or 0.0)
-
-    # --- Piso dinámico para BTC aparcado (vende a USDT si rompe el trailing)
-    def _floor_guard_active() -> bool:
-        return PARK_PROTECT_ENABLED and btc_val >= MIN_NOTIONAL and btc_free > 0 and (time.time() - PARK_GUARD["last_change"] > PARK_MIN_HOLD_MIN * 60)
-
-    def _update_anchor(px: float):
-        if PARK_GUARD["anchor"] is None:
-            PARK_GUARD["anchor"] = px
-            PARK_GUARD["high"] = px
-        else:
-            PARK_GUARD["high"] = max(PARK_GUARD["high"] or px, px)
-
-    def _breakeven_price(entry_like: float) -> float:
-        # asegúrate de no vender por debajo de BE + fees/slippage
-        return entry_like * (1.0 + required_edge_pct()/100.0)
-
-    # si tenemos BTC (parqueado por perfil o por AUTO_HYBRID), mantenemos ancla y trailing
-    if _floor_guard_active():
-        _update_anchor(btc_px)
-        trail_stop = max(_breakeven_price(PARK_GUARD["anchor"]), (PARK_GUARD["high"] or btc_px) * (1.0 - PARK_TRAIL_PCT))
-
-        # SELL → pasar a USDT si rompe el stop de piso
-        if btc_px <= trail_stop:
-            try:
-                sell_symbol("BTC/USDT", btc_free, trade_id=f"PARK-FLOOR-{datetime.now(timezone.utc).isoformat()}", source="park_floor")
-                PARK_GUARD["last_change"] = time.time()
-                # mantenemos anchor como referencia de re-entrada
-            except Exception as e:
-                logger.warning(f"PARK floor sell error: {e}")
-
-        # BUY (re-entrada) → sólo si no tenemos BTC y recupera el anchor con pad
-    elif PARK_PROTECT_ENABLED and btc_free == 0 and (usdt_free - RESERVE_USDT) >= MIN_NOTIONAL and (PARK_GUARD["anchor"] is not None):
-        reentry_px = PARK_GUARD["anchor"] * (1.0 + PARK_REENTRY_PAD_BPS/10000.0)
-        if btc_px >= reentry_px:
-            try:
-                # usa parte del USDT libre (ajústalo si quieres)
-                notional = max(MIN_NOTIONAL, (usdt_free - RESERVE_USDT) * 0.60)
-                amt = notional / (btc_px or 1.0)
-                execute_order_buy("BTC/USDT", amt, signals={"confidence": 58, "score": 0.0})
-                PARK_GUARD["last_change"] = time.time()
-                # resetea high al precio de compra; anchor se mantiene como referencia de BE
-                PARK_GUARD["high"] = btc_px
-            except Exception as e:
-                logger.warning(f"PARK floor reentry error: {e}")
-
-    # ---------- BTC_PARK ----------
-    if profile == "BTC_PARK":
-        try:
-            reg_ok = market_regime_ok()
-        except Exception:
-            reg_ok = True
-        if not reg_ok:
-            if not PARK_STATE["active"]:
-                free_after_reserve = max(0.0, usdt_free - RESERVE_USDT)
-                if free_after_reserve >= MIN_NOTIONAL:
-                    notional = free_after_reserve * max(0.0, min(PARK_PCT, 1.0))
-                    amount = max(MIN_NOTIONAL / (btc_px or 1.0), notional / (btc_px or 1.0))
-                    try:
-                        execute_order_buy("BTC/USDT", amount, signals={"confidence": 60, "score": 0.0})
-                        PARK_STATE["active"] = True
-                        logger.info(f"🏕️  PARK: comprados ~{amount:.6f} BTC (~{notional:.2f} USDT).")
-                    except Exception as e:
-                        logger.warning(f"PARK buy error: {e}")
-            return True  # omite escaneo de alts
-        # régimen on → deshacer parking si había
-        if PARK_STATE["active"] and btc_val >= MIN_NOTIONAL:
-            try:
-                sell_symbol("BTC/USDT", btc_free, trade_id=f"PARK-UNWIND-{datetime.now(timezone.utc).isoformat()}", source="unpark")
-                logger.info(f"🟢 UNPARK: vendidos {btc_free:.6f} BTC (~{btc_val:.2f} USDT).")
-            except Exception as e:
-                logger.warning(f"UNPARK sell error: {e}")
-        PARK_STATE["active"] = False
-        return False  # continuar escaneo
-
-    # ---------- AUTO_HYBRID ----------
-    calm, why = is_calm_safe_env()
-    # capital libre tras respetar reserva
-    free_cap = max(0.0, usdt_free + btc_val - RESERVE_USDT)
-    target_val = free_cap * max(0.0, min(AUTO_PARK_PCT, 1.0))
-    band = (AUTO_PARK_DEADBAND_BPS / 10000.0)  # ±bps
-
-    if calm and free_cap >= MIN_NOTIONAL:
-        lower = target_val * (1.0 - band)
-        upper = target_val * (1.0 + band)
-        if btc_val < lower:   # comprar BTC para alcanzar target
-            buy_notional = max(MIN_NOTIONAL, target_val - btc_val)
-            buy_notional = min(buy_notional, usdt_free - RESERVE_USDT)  # no tocar reserva
-            if buy_notional >= MIN_NOTIONAL:
-                amount = buy_notional / (btc_px or 1.0)
-                try:
-                    execute_order_buy("BTC/USDT", amount, signals={"confidence": 58, "score": 0.0})
-                    PARK_STATE["active"] = True
-                    logger.info(f"⚖️  AUTO_HYBRID REBAL BUY: +{amount:.6f} BTC (~{buy_notional:.2f} USDT). env={why}")
-                except Exception as e:
-                    logger.warning(f"AUTO_HYBRID buy error: {e}")
-        elif btc_val > upper: # vender excedente
-            sell_notional = max(MIN_NOTIONAL, btc_val - target_val)
-            sell_amount = sell_notional / (btc_px or 1.0)
-            if sell_amount * (btc_px or 0.0) >= MIN_NOTIONAL:
-                try:
-                    sell_symbol("BTC/USDT", min(btc_free, sell_amount), trade_id=f"AUTO_UNW-{datetime.now(timezone.utc).isoformat()}", source="auto_hybrid")
-                    logger.info(f"⚖️  AUTO_HYBRID REBAL SELL: -{sell_amount:.6f} BTC (~{sell_notional:.2f} USDT). env={why}")
-                except Exception as e:
-                    logger.warning(f"AUTO_HYBRID sell error: {e}")
-        # importante: NO omitimos escaneo; seguimos tradeando alts con el USDT remanente
+    btc_px = float(fetch_price(symbol) or 0.0)
+    if btc_px <= 0:
         return False
 
-    # si ya no está calm/safe → deshacer BTC aparcado
-    if btc_val >= MIN_NOTIONAL and PARK_STATE["active"]:
-        try:
-            sell_symbol("BTC/USDT", btc_free, trade_id=f"AUTO_UNPARK-{datetime.now(timezone.utc).isoformat()}", source="auto_hybrid_exit")
-            logger.info(f"🔄 AUTO_HYBRID EXIT: vendidos {btc_free:.6f} BTC (~{btc_val:.2f} USDT). env={why}")
-        except Exception as e:
-            logger.warning(f"AUTO_HYBRID exit error: {e}")
-    PARK_STATE["active"] = False
-    return False  # continuar escaneo
+    btc_val = btc_free * btc_px  # valor de la posición BTC en USDT
+    now_epoch = time.time()
+
+    # 1) Si tengo BTC (posición) y el guard está activo, mantener trailing y vender si rompe el piso
+    if _floor_guard_active(btc_val):
+        _update_anchor_and_floor(btc_px)
+
+        # Rompe el piso => vender a USDT (parquear)
+        floor = PARK_GUARD.get("floor") or 0.0
+        if btc_px <= floor and btc_free > 0.0:
+            # Respetar reserva de USDT: no vender el BTC equivalente a MIN_RESERVE_USDT
+            reserve_btc = max(0.0, MIN_RESERVE_USDT / btc_px)
+            qty_to_sell = max(0.0, btc_free - reserve_btc)
+
+            if qty_to_sell * btc_px >= MIN_NOTIONAL:
+                trade_id = f"PARK-FLOOR-{_now_iso()}"
+
+                # Enviar snapshot de features de salida
+                try:
+                    features = build_rich_features(symbol)
+                    extra = f"Price: {btc_px:,.2f}  Amount: {qty_to_sell:.8f}"
+                    send_feature_bundle_telegram(
+                        side="exit",
+                        symbol=symbol,
+                        trade_id=trade_id,
+                        features=features,
+                        extra_lines=extra,
+                    )
+                except Exception as e:
+                    logger.warning(f"[park] no se pudo enviar features de salida: {e}")
+
+                # Vender
+                try:
+                    sell_symbol(symbol, qty_to_sell, trade_id=trade_id, source="park-floor")
+                    PARK_GUARD["last_change"] = now_epoch
+                    PARK_GUARD["reason"] = "floor_break"
+                    PARK_GUARD["parked"] = True
+                    return True
+                except Exception as e:
+                    logger.error(f"[park] error al vender BTC por floor-break: {e}")
+                    # aunque falle, no devolvemos True
+            # si la qty no alcanza el mínimo, no hacemos nada
+        # si no rompe el piso, no hacemos nada
+
+    # 2) Si estoy aparcado (sin BTC) y tengo USDT suficientes, evaluar des-parking (re-entrada)
+    #    Condiciones: cooldown y reclaim del precio
+    if PARK_PROTECT_ENABLED and btc_free <= 0.0 and usdt_free >= (MIN_NOTIONAL + 1.0):
+        last_change = PARK_GUARD.get("last_change")
+        hold_secs = (now_epoch - last_change) if last_change else None
+        min_hold_secs = float(PARK_MIN_HOLD_MIN) * 60.0
+
+        # (a) cooldown: esperar al menos PARK_MIN_HOLD_MIN min tras el parking
+        if hold_secs is not None and hold_secs < min_hold_secs:
+            # Demasiado pronto para re-entrar
+            return False
+
+        # (b) reclaim: precio actual debe estar por encima del trigger de re-entrada
+        reclaim_px = _reentry_trigger_price(btc_px)
+        if btc_px >= reclaim_px:
+            # Notional a usar: todo lo que supere la reserva
+            buy_usdt = max(0.0, usdt_free - MIN_RESERVE_USDT)
+            if buy_usdt >= MIN_NOTIONAL:
+                qty_to_buy = round(buy_usdt / btc_px, 8)  # granularidad suficiente p/ BTC
+
+                trade_id = f"PARK-UNWIND-{_now_iso()}"
+
+                # Ejecutar la compra primero (para que el order fill dispare el mensaje "BUY")
+                try:
+                    execute_order_buy(
+                        symbol,
+                        qty_to_buy,
+                        signals={"confidence": 60, "score": 0.0},
+                    )
+                except Exception as e:
+                    logger.error(f"[unwind] error al recomprar BTC: {e}")
+                    return False
+
+                # Enviar snapshot de features de entrada
+                try:
+                    features = build_rich_features(symbol)
+                    extra = f"Price: {btc_px:,.2f}  Amount: {qty_to_buy:.8f}"
+                    send_feature_bundle_telegram(
+                        side="entry",
+                        symbol=symbol,
+                        trade_id=trade_id,
+                        features=features,
+                        extra_lines=extra,
+                    )
+                except Exception as e:
+                    logger.warning(f"[unwind] no se pudo enviar features de entrada: {e}")
+
+                # Reset del guard
+                PARK_GUARD["parked"] = False
+                PARK_GUARD["anchor"] = btc_px
+                PARK_GUARD["high"] = btc_px
+                PARK_GUARD["floor"] = btc_px * (1.0 - (PARK_TRAIL_BPS * 0.0001))
+                PARK_GUARD["last_change"] = now_epoch
+                PARK_GUARD["reason"] = "reclaim"
+
+                return True
+
+    return False
+
 
 
 # >>> PATCH START: REBOUND HELPERS
