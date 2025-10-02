@@ -608,7 +608,7 @@ def park_to_btc_if_needed() -> bool:
     # --- helpers locales ---------------------------
     def _init_guard():
         """Asegura estructura y valores por defecto del guard."""
-        nonlocal PARK_GUARD
+        global PARK_GUARD
         if not isinstance(PARK_GUARD, dict):
             PARK_GUARD = {}
         PARK_GUARD.setdefault("anchor", None)
