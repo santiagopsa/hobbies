@@ -43,8 +43,8 @@ AUTO_PARK_PCT = float(os.getenv("AUTO_PARK_PCT", "0.60"))      # 60% del capital
 AUTO_PARK_DEADBAND_BPS = int(os.getenv("AUTO_PARK_DEADBAND_BPS", "50"))  # banda muerta ±0.50% para evitar micro-churn
 
 # Anti-chop extra (puedes sobreescribir en .env)
-HYBRID_GLOBAL_COOLDOWN_SEC = int(os.getenv("HYBRID_GLOBAL_COOLDOWN_SEC", "180"))  # espera mínima entre cambios
-HYBRID_MIN_REVERSAL_BPS    = int(os.getenv("HYBRID_MIN_REVERSAL_BPS", "20"))     # 0.20% de movimiento para revertir
+HYBRID_GLOBAL_COOLDOWN_SEC = int(os.getenv("HYBRID_GLOBAL_COOLDOWN_SEC", "120"))
+HYBRID_MIN_REVERSAL_BPS    = int(os.getenv("HYBRID_MIN_REVERSAL_BPS", "10"))
 HYBRID_MAX_ACTIONS_5M      = int(os.getenv("HYBRID_MAX_ACTIONS_5M", "4"))        # tope de acciones en 5 minutos
 
 # Condiciones “calm/safe”
@@ -94,7 +94,7 @@ RVOL_BASE_DEFAULT = 1.5
 # >>> PATCH START: gate & cooldowns
 SCORE_GATE_START = 5.0
 SCORE_GATE_MAX = 6.0
-SCORE_GATE_HARD_MIN = 4.5  # tougher floor to avoid low-quality buys
+SCORE_GATE_HARD_MIN = 4.2  # tougher floor to avoid low-quality buys
 
 # re-entry/cooldowns
 COOLDOWN_AFTER_COLLAPSE_MIN = 60   # minutes — after a volume-collapse exit
@@ -113,7 +113,7 @@ MEAN_REV_WEIGHT = 0.02
 # Buy-flow controller
 TARGET_BUY_RATIO = 0.3
 BUY_RATIO_DELTA = 0.05
-GATE_STEP = 0.15
+GATE_STEP = 0.12
 EPSILON_EXPLORE = 0.03
 DECISION_WINDOW = 120
 
@@ -1334,21 +1334,16 @@ def preflight_buy_guard(symbol: str) -> Tuple[bool, str]:
 
     # (B) Pullback timing on 15m
     pullback_ok = (rsi15 is not None and 55.0 <= rsi15 <= 65.0) and macdh15_accel
-    if not pullback_ok:
-        return False, "pullback_15m_not_clear (want RSI15 in 55–65 and MACDh15 accelerating>0)"
+    pullback_note = "pullback_15m_clear (+boost)" if pullback_ok else "pullback_15m_weak (no boost)"
+    return True, f"ok | {pullback_note}"
 
     # (C) Pair filter for SOL/DOGE (need added alignment)
-    base = symbol.split('/')[0]
-    if base in {'SOL', 'DOGE'}:
-        try:
-            rsi4h = float(ta.rsi(df4h['close'], length=14).iloc[-1])
-        except Exception:
-            rsi4h = None
-        ok_align = (rsi1h is not None and rsi1h >= 63.0) and (rsi4h is not None and rsi4h >= 55.0) and adx4h_rising and pullback_ok
-        if not ok_align:
-            return False, "pair_filter: SOL/DOGE requires 1h/4h alignment + clear 15m pullback"
+    base = symbol.split("USDT")[0]
+    slope_1h = df1.get('PRICE_SLOPE10', 0.0)
+    if base in ("SOL","DOGE") and (slope_1h is not None and slope_1h < 0.0005):
+        return False, "weak_1h_trend_for_pair (skip SOL/DOGE)"
 
-    return True, "ok"
+    return True, f"ok | {pullback_note}"
 
 
 
@@ -1579,15 +1574,21 @@ def is_downtrend(symbol: str) -> tuple[bool, float, str]:
     except Exception:
         return (False, 0.0, "error")
 
-def estimate_slippage_pct(symbol: str, notional: float = MIN_NOTIONAL):
-    ob = fetch_order_book_safe(symbol, limit=50)
+def estimate_slippage_pct(symbol: str, notional: float) -> float:
+    """
+    Return expected % slippage = quoted spread % + impact from taking top of book.
+    """
     try:
-        best_ask = ob['asks'][0][0]; best_ask_vol = ob['asks'][0][1]
-        best_bid = ob['bids'][0][0]; best_bid_vol = ob['bids'][0][1]
-        bump_pct = min(0.15, (order_qty / (best_ask_vol + 1e-9)) * 0.2) * 100.0  # <-- convert to %
+        ob = fetch_order_book_safe(symbol, limit=50)
+        best_ask = float(ob['asks'][0][0]); ask_vol = float(ob['asks'][0][1])
+        best_bid = float(ob['bids'][0][0])
+        spr_pct = max(0.0, (best_ask - best_bid) / best_bid * 100.0)
+        order_qty = notional / best_ask
+        bump_pct = min(0.15, (order_qty / max(ask_vol, 1e-9)) * 0.2) * 100.0
         return spr_pct + bump_pct
     except Exception:
         return 0.05
+
 
     
 def required_edge_pct() -> float:
@@ -1790,18 +1791,32 @@ def hybrid_decision(symbol: str):
     tf4h_for_adx = quick_tf_snapshot(symbol, '4h', limit=120)
     adx4h_for_gate = tf4h_for_adx.get('ADX')
 
-    if adx is not None and adx < 17.5:
-        blocks.append(f"HARD block: 1h ADX {adx:.1f} < 17.5")
-        level = "HARD"
-    elif adx is not None and 17.5 <= adx < 22.0:
-        if adx_slope_1h <= 0.0 or (adx4h_for_gate is None or adx4h_for_gate < 25.0):
-            blocks.append(f"HARD block: ADX {adx:.1f} in gray zone needs slope>0 and 4h ADX≥25 (slope={adx_slope_1h:.4f}, 4h={adx4h_for_gate})")
+    # ADX gray zone
+    if adx is not None:
+        if adx < 17.5:
+            blocks.append("HARD block: ADX<17.5")
             level = "HARD"
+        elif adx < 22.0:
+            # Was hard unless slope>0 & 4h ADX>=25; now soften:
+            allow = (adx_slope_1h > 0 and ((rv15 or 0) >= 1.10 or retest_ok))
+            if not allow:
+                # make it SOFT unless slope≤0 and no retest
+                if adx_slope_1h <= 0 and not retest_ok:
+                    blocks.append("HARD block: ADX<22 + slope≤0 + no retest")
+                    level = "HARD"
+                else:
+                    blocks.append("SOFT block: ADX<22 needs retest or (slope>0 + RVOL15≥1.1)")
+                    if level != "HARD": level = "SOFT"
+
 
     # Keep minimal volume sanity
-    if (rvol_1h is not None) and (rvol_1h < 1.00):
-        blocks.append(f"HARD block: 1h RVOL {rvol_1h:.2f} < 1.00")
+    if rvol_1h is not None and rvol_1h < 0.90:
+        blocks.append("HARD block: 1h RVOL << 1.0 (thin tape)")
         level = "HARD"
+    elif rvol_1h is not None and rvol_1h < 1.00:
+        if not ((macdh15 or 0) >= 0 and (rv15 or 0) >= 1.00):
+            blocks.append("SOFT block: 1h RVOL ~1.0 need MACDh≥0 and RVOL15≥1.0")
+            if level != "HARD": level = "SOFT"
 
     # ===== fast snapshots (needed for anchors 2,8) =====
     tf15 = quick_tf_snapshot(symbol, '15m', limit=120) or {}
@@ -1865,6 +1880,7 @@ def hybrid_decision(symbol: str):
     fifteen_waking = (rv15 is not None and rv15 >= max(0.9, rvol15_floor)) and ((macdh15 or 0) > 0)
     if level == "SOFT" and fifteen_waking:
         blocks.append("soft override: 15m waking (MACDh>0 & RVOL ok)")
+        level = "NONE"
 
     # ===== 15m weakness/4h OB hard-blocks (keep) =====
     try:
@@ -3252,10 +3268,13 @@ def trade_once_with_report(symbol: str):
             # 7) Preflight guard (evita entradas "scratch"/mushy)
             ok, reason = preflight_buy_guard(symbol)
             if not ok:
-                report["note"] = f"preflight block: {reason}"
-                send_telegram_message(f"🛑 Skipping BUY {symbol} (preflight): {reason}")
-                log_decision(symbol, score, "hold", False)
-                return report
+                blocks.append(f"preflight: {reason}")
+                level = "HARD"
+            else:
+                if "pullback_15m_clear" in reason:
+                    score += 0.7
+                    notes.append("15m pullback boost +0.7")
+
 
             # 8) Sizing en función de confianza, slippage y volatilidad
             #    - se capa al presupuesto disponible (free_after_reserve)
