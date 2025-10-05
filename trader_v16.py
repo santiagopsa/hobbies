@@ -1335,12 +1335,11 @@ def preflight_buy_guard(symbol: str) -> Tuple[bool, str]:
     # (B) Pullback timing on 15m
     pullback_ok = (rsi15 is not None and 55.0 <= rsi15 <= 65.0) and macdh15_accel
     pullback_note = "pullback_15m_clear (+boost)" if pullback_ok else "pullback_15m_weak (no boost)"
-    return True, f"ok | {pullback_note}"
 
     # (C) Pair filter for SOL/DOGE (need added alignment)
-    base = symbol.split("USDT")[0]
-    slope_1h = df1.get('PRICE_SLOPE10', 0.0)
-    if base in ("SOL","DOGE") and (slope_1h is not None and slope_1h < 0.0005):
+    base = symbol.split("/")[0]
+    slope_1h = float(df1h['PRICE_SLOPE10'].iloc[-1]) if 'PRICE_SLOPE10' in df1h.columns and pd.notna(df1h['PRICE_SLOPE10'].iloc[-1]) else 0.0
+    if base in ("SOL","DOGE") and slope_1h < 0.0005:
         return False, "weak_1h_trend_for_pair (skip SOL/DOGE)"
 
     return True, f"ok | {pullback_note}"
@@ -1764,6 +1763,31 @@ def hybrid_decision(symbol: str):
         return "hold", 50, 0.0, " | ".join(blocks)
 
     row = df.iloc[-1]
+    # ===== fast snapshots (needed for anchors 2,8) =====
+    tf15 = quick_tf_snapshot(symbol, '15m', limit=120) or {}
+    tf4h = quick_tf_snapshot(symbol, '4h',  limit=120) or {}
+    rv15 = tf15.get('RVOL10')
+    macdh15 = tf15.get('MACDh')
+
+    # ---- compute breakout+retest early (used by ADX gray-zone) ----
+    df15_full = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=120)
+    breakout = False
+    retest_ok = False
+    try:
+        if df15_full is not None and len(df15_full) > 21:
+            don_hi = df15_full['high'].rolling(20).max().shift(1)
+            bo_lvl = float(don_hi.iloc[-2]) if pd.notna(don_hi.iloc[-2]) else None
+            bo_prev_close = float(df15_full['close'].iloc[-2])
+            bo_now_low = float(df15_full['low'].iloc[-1]); bo_now_close = float(df15_full['close'].iloc[-1])
+            breakout = (bo_lvl and bo_prev_close > bo_lvl and (rv15 or 0) >= 1.0)   # keep your floor
+            retest_ok = (bo_lvl and bo_now_low <= bo_lvl * 1.002 and bo_now_close >= bo_lvl)
+    except Exception:
+        breakout = False; retest_ok = False
+
+    # also cache 4h ADX for gate checks
+    tf4h_for_adx = quick_tf_snapshot(symbol, '4h', limit=120)
+    adx4h_for_gate = tf4h_for_adx.get('ADX')
+
     score_gate = get_score_gate() + SCORE_GATE_OFFSET
 
     # ===== anti-scalp vs fees (ANCHOR-7: keep but a touch looser) =====
@@ -1798,7 +1822,7 @@ def hybrid_decision(symbol: str):
             level = "HARD"
         elif adx < 22.0:
             # Was hard unless slope>0 & 4h ADX>=25; now soften:
-            allow = (adx_slope_1h > 0 and ((rv15 or 0) >= 1.10 or retest_ok))
+            allow = (adx_slope_1h > 0) and ( ((rv15 or 0) >= 1.10) or (adx4h_for_gate or 0) >= 25 or retest_ok )
             if not allow:
                 # make it SOFT unless slope≤0 and no retest
                 if adx_slope_1h <= 0 and not retest_ok:
@@ -2862,6 +2886,14 @@ def fetch_trade_legs(trade_id: str):
     return buy, sell, feats_entry, feats_exit
 
 def analyze_and_learn(trade_id: str, sell_price: float = None, learn_enabled: bool = True):
+    """
+    Post-mortem for a closed trade:
+      - Computes PnL and duration
+      - Persists a trade_analysis row (entry/exit snapshots + adjustments)
+      - Optionally learns: nudges RSI/ADX/RVOL thresholds with daily clip + mean reversion
+      - Updates LAST_LOSS_INFO for cooldown logic on losses
+      - Sends a compact Telegram summary (and attaches JSON)
+    """
     try:
         buy, sell, feats_entry, feats_exit = fetch_trade_legs(trade_id)
         if not buy or not sell:
@@ -2870,136 +2902,221 @@ def analyze_and_learn(trade_id: str, sell_price: float = None, learn_enabled: bo
 
         symbol, buy_price, amount, buy_ts, adx_e, rsi_e, rvol_e, atr_e, score_e, conf_e = buy
         sell_p, sell_amt, sell_ts = sell
-        sell_price = sell_price or sell_p
+        sell_price = float(sell_price or sell_p or 0.0)
 
-        pnl_usdt = (sell_price - buy_price) * amount
-        pnl_pct = (sell_price / buy_price - 1.0) * 100.0 if buy_price else 0.0
-        # >>> PATCH START: scratch logging
+        # Basic metrics
+        pnl_usdt = (sell_price - float(buy_price)) * float(amount)
+        pnl_pct = (sell_price / float(buy_price) - 1.0) * 100.0 if buy_price else 0.0
+
+        # Scratch logging (±0.20%)
         try:
-            if abs(pnl_pct) <= 0.20:  # scratch threshold (±0.20%)
+            if abs(pnl_pct) <= 0.20:
                 now_ts = time.time()
                 arr = SCRATCH_LOG.setdefault(symbol, [])
                 arr.append(now_ts)
-                # keep only last 2h
-                SCRATCH_LOG[symbol] = [t for t in arr if now_ts - t <= 7200]
+                SCRATCH_LOG[symbol] = [t for t in arr if now_ts - t <= 7200]  # keep last 2h
         except Exception:
             pass
-        # >>> PATCH END
 
-        dur_sec = int((datetime.fromisoformat(sell_ts.replace("Z","")).timestamp()
-                      - datetime.fromisoformat(buy_ts.replace("Z","")).timestamp()))
+        # Duration
+        try:
+            dur_sec = int(
+                datetime.fromisoformat(str(sell_ts).replace("Z","")).timestamp() -
+                datetime.fromisoformat(str(buy_ts).replace("Z","")).timestamp()
+            )
+        except Exception:
+            dur_sec = None
 
-        tf1h_x = feats_exit.get("timeframes", {}).get("1h", {})
-        rsi_x = tf1h_x.get("rsi"); adx_x = tf1h_x.get("adx"); rvol_x = tf1h_x.get("rvol10")
+        # Exit-side quick fields from saved features (if any)
+        tf1h_x = (feats_exit or {}).get("timeframes", {}).get("1h", {}) or {}
+        rsi_x = tf1h_x.get("rsi")
+        adx_x = tf1h_x.get("adx")
+        rvol_x = tf1h_x.get("rvol10")
 
+        # Assemble analysis payload
         analysis = {
-            "trade_id": trade_id, "symbol": symbol,
-            "pnl_usdt": round(pnl_usdt, 6), "pnl_pct": round(pnl_pct, 4), "duration_sec": dur_sec,
-            "entry": {"price": buy_price, "amount": amount, "ts": buy_ts, "rsi": rsi_e, "adx": adx_e, "rvol": rvol_e, "atr": atr_e, "score": score_e, "confidence": conf_e},
-            "exit":  {"price": sell_price, "amount": sell_amt, "ts": sell_ts, "rsi": rsi_x, "adx": adx_x, "rvol": rvol_x}
+            "trade_id": trade_id,
+            "symbol": symbol,
+            "pnl_usdt": round(float(pnl_usdt), 6),
+            "pnl_pct": round(float(pnl_pct), 4),
+            "duration_sec": dur_sec,
+            "entry": {
+                "price": float(buy_price),
+                "amount": float(amount),
+                "ts": buy_ts,
+                "rsi": float(rsi_e) if rsi_e is not None else None,
+                "adx": float(adx_e) if adx_e is not None else None,
+                "rvol": float(rvol_e) if rvol_e is not None else None,
+                "atr": float(atr_e) if atr_e is not None else None,
+                "score": float(score_e) if score_e is not None else None,
+                "confidence": int(conf_e) if conf_e is not None else None
+            },
+            "exit": {
+                "price": float(sell_price),
+                "amount": float(sell_amt),
+                "ts": sell_ts,
+                "rsi": float(rsi_x) if rsi_x is not None else None,
+                "adx": float(adx_x) if adx_x is not None else None,
+                "rvol": float(rvol_x) if rvol_x is not None else None
+            }
         }
 
+        # Persist base analysis row (learn_enabled toggled after adjustments)
         adjustments = {}
-        win = pnl_usdt > 0.0
         base = symbol.split('/')[0]
         lp = get_learn_params(base)
-        rsi_min = lp["rsi_min"]; rsi_max = lp["rsi_max"]
-        adx_min = lp["adx_min"]; rvol_base = lp["rvol_base"]
+        rsi_min = float(lp["rsi_min"]); rsi_max = float(lp["rsi_max"])
+        adx_min = float(lp["adx_min"]); rvol_base = float(lp["rvol_base"])
 
+        # Learn?
         TRADE_ANALYTICS_COUNT[base] = TRADE_ANALYTICS_COUNT.get(base, 0) + 1
-        do_learn = learn_enabled and (TRADE_ANALYTICS_COUNT[base] >= LEARN_MIN_SAMPLES)
+        do_learn = bool(learn_enabled and (TRADE_ANALYTICS_COUNT[base] >= LEARN_MIN_SAMPLES))
+
+        # Update LAST_LOSS_INFO for cooldown logic
+        try:
+            if pnl_usdt < 0.0:
+                LAST_LOSS_INFO[symbol] = {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "pnl_usdt": float(pnl_usdt)
+                }
+            else:
+                # Clear on win (optional)
+                if symbol in LAST_LOSS_INFO:
+                    del LAST_LOSS_INFO[symbol]
+            # Track last close timestamp too (already set in sell_symbol, but keep safe)
+            LAST_TRADE_CLOSE[symbol] = datetime.now(timezone.utc).isoformat()
+        except Exception:
+            pass
 
         if do_learn:
-            # ---- RSI nudges (keep your gentle behavior) ----
-            if not win and rsi_e is not None and rsi_e >= (rsi_max - 1):
-                new_rsi_max = smooth_nudge(rsi_max, rsi_max - 1, *RSI_MAX_RANGE)
+            win = pnl_usdt > 0.0
+
+            # ----- RSI nudges -----
+            # If loss at high RSI: lower RSI max ceiling a bit
+            if (not win) and (rsi_e is not None) and (float(rsi_e) >= (rsi_max - 1)):
+                new_rsi_max = smooth_nudge(rsi_max, rsi_max - 1.0, *RSI_MAX_RANGE)
                 if new_rsi_max != rsi_max:
                     adjustments["rsimax"] = {"old": rsi_max, "new": new_rsi_max}
                     rsi_max = new_rsi_max
-            elif win and rsi_e is not None and rsi_e <= (rsi_min + 2):
-                new_rsi_min = clamp(rsi_min - 1, 35, RSI_MAX_RANGE[0]-5)
+
+            # If win at low RSI: make it easier to buy dips by lowering rsi_min slightly
+            if win and (rsi_e is not None) and (float(rsi_e) <= (rsi_min + 2.0)):
+                # keep a gap vs RSI_MAX lower bound
+                new_rsi_min = clamp(rsi_min - 1.0, 35.0, float(RSI_MAX_RANGE[0]) - 5.0)
                 if new_rsi_min != rsi_min:
                     adjustments["rsimin"] = {"old": rsi_min, "new": new_rsi_min}
                     rsi_min = new_rsi_min
 
-            # ---- ADX nudges (do NOT lower after wins) ----
-            if not win and (adx_e is not None) and adx_e < adx_min:
-                # Loss in low-trend context → raise floor
+            # Maintain sensible band spacing
+            if rsi_max - rsi_min < 8.0:
+                # widen symmetrically around current midpoint
+                mid = 0.5 * (rsi_max + rsi_min)
+                rsi_min = max(35.0, mid - 5.0)
+                rsi_max = min(float(RSI_MAX_RANGE[1]), mid + 5.0)
+                adjustments.setdefault("rsiband_widen", True)
+
+            # ----- ADX nudges (never *lower* after wins) -----
+            if (not win) and (adx_e is not None) and (float(adx_e) < adx_min):
                 new_adx_min = smooth_nudge(adx_min, adx_min + 1.0, *ADX_MIN_RANGE)
                 if new_adx_min != adx_min:
                     adjustments["adxmin"] = {"old": adx_min, "new": new_adx_min}
                     adx_min = new_adx_min
-            elif win and (adx_e is not None) and adx_e >= 30.0 and (adx_x or 0) >= 30.0:
-                # Optional tiny tilt toward stronger trends on wins in strong trend
+            elif win and (adx_e is not None) and (float(adx_e) >= 30.0) and ((adx_x or 0) >= 30.0):
                 new_adx_min = smooth_nudge(adx_min, adx_min + 0.5, *ADX_MIN_RANGE)
                 if new_adx_min != adx_min:
                     adjustments["adxmin"] = {"old": adx_min, "new": new_adx_min}
                     adx_min = new_adx_min
 
-            # ---- RVOL nudges (do NOT lower after wins) ----
-            if not win and (rvol_e is not None) and rvol_e < max(1.0, rvol_base):
-                # Loss with thin tape → raise base
+            # ----- RVOL nudges (never lower after wins) -----
+            if (not win) and (rvol_e is not None) and (float(rvol_e) < max(1.0, rvol_base)):
                 new_rvol = smooth_nudge(rvol_base, rvol_base + 0.10, *RVOL_BASE_RANGE)
                 if new_rvol != rvol_base:
                     adjustments["rvolbase"] = {"old": rvol_base, "new": new_rvol}
                     rvol_base = new_rvol
-            # (No "lower after win" step anymore)
 
-            # ---- daily clip + mean reversion (unchanged) ----
-            def _clip_delta(cur, new, max_abs=LEARN_DAILY_CLIP):
-                return clamp(new, cur - max_abs, cur + max_abs)
+            # ----- Daily clip & mean reversion toward defaults -----
+            def _clip_delta(cur, proposed, max_abs=LEARN_DAILY_CLIP):
+                # Clip proposed movement relative to *current* value
+                return clamp(proposed, cur - max_abs, cur + max_abs)
 
+            # Propose deltas already in rsi_min/rsi_max/ etc. Apply daily clip:
             rsi_min = _clip_delta(lp["rsi_min"], rsi_min)
             rsi_max = _clip_delta(lp["rsi_max"], rsi_max)
             adx_min = _clip_delta(lp["adx_min"], adx_min)
             rvol_base = _clip_delta(lp["rvol_base"], rvol_base)
 
-            # mean reversion to defaults
-            rsi_min = (1 - MEAN_REV_WEIGHT)*rsi_min + MEAN_REV_WEIGHT*RSI_MIN_DEFAULT
-            rsi_max = (1 - MEAN_REV_WEIGHT)*rsi_max + MEAN_REV_WEIGHT*RSI_MAX_DEFAULT
-            adx_min = (1 - MEAN_REV_WEIGHT)*adx_min + MEAN_REV_WEIGHT*ADX_MIN_DEFAULT
-            rvol_base = (1 - MEAN_REV_WEIGHT)*rvol_base + MEAN_REV_WEIGHT*RVOL_BASE_DEFAULT
+            # Mean reversion (gentle pull toward defaults)
+            rsi_min = (1.0 - MEAN_REV_WEIGHT) * rsi_min + MEAN_REV_WEIGHT * float(RSI_MIN_DEFAULT)
+            rsi_max = (1.0 - MEAN_REV_WEIGHT) * rsi_max + MEAN_REV_WEIGHT * float(RSI_MAX_DEFAULT)
+            adx_min = (1.0 - MEAN_REV_WEIGHT) * adx_min + MEAN_REV_WEIGHT * float(ADX_MIN_DEFAULT)
+            rvol_base = (1.0 - MEAN_REV_WEIGHT) * rvol_base + MEAN_REV_WEIGHT * float(RVOL_BASE_DEFAULT)
 
-            if adjustments:
-                set_learn_params(base, rsi_min, rsi_max, adx_min, rvol_base)
-                LAST_PARAM_UPDATE[base] = date.today().isoformat()
+            # Final clamps
+            rsi_min = clamp(rsi_min, 35.0, float(RSI_MAX_RANGE[0]) - 5.0)
+            rsi_max = clamp(rsi_max, float(RSI_MAX_RANGE[0]), float(RSI_MAX_RANGE[1]))
+            if rsi_max - rsi_min < 8.0:
+                rsi_min = max(35.0, rsi_max - 8.0)
 
-        conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
-        cur.execute("""
-            INSERT OR REPLACE INTO trade_analysis (trade_id, ts, symbol, pnl_usdt, pnl_pct, duration_sec,
-                                                   entry_snapshot_json, exit_snapshot_json, adjustments_json, learn_enabled)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (trade_id, datetime.now(timezone.utc).isoformat(), symbol,
-              float(analysis["pnl_usdt"]), float(analysis["pnl_pct"]), int(analysis["duration_sec"]),
-              json.dumps(analysis["entry"], ensure_ascii=False),
-              json.dumps(analysis["exit"], ensure_ascii=False),
-              json.dumps(adjustments, ensure_ascii=False),
-              1 if learn_enabled else 0))
-        conn.commit(); conn.close()
+            adx_min = clamp(adx_min, float(ADX_MIN_RANGE[0]), float(ADX_MIN_RANGE[1]))
+            rvol_base = clamp(rvol_base, float(RVOL_BASE_RANGE[0]), float(RVOL_BASE_RANGE[1]))
 
-        outcome = "WIN ✅" if win else "LOSS ❌"
-        lines = [
-            f"📊 *Trade Analysis* {outcome}  {symbol}",
-            f"Trade: `{trade_id}`",
-            f"PnL: `{analysis['pnl_usdt']:.4f} USDT`  (`{analysis['pnl_pct']:.2f}%`)  Duration: `{analysis['duration_sec']}s`",
-            f"*Entry* → RSI `{analysis['entry']['rsi']}`  ADX `{analysis['entry']['adx']}`  RVOL `{analysis['entry']['rvol']}`",
-            f"*Exit*  → RSI `{analysis['exit']['rsi']}`  ADX `{analysis['exit']['adx']}`  RVOL `{analysis['exit']['rvol']}`",
-        ]
-        if adjustments:
-            adj_txt = ", ".join([f"{k}:{v['old']}→{v['new']}" for k,v in adjustments.items()])
-            lines.append(f"Learned nudges → {adj_txt}")
-        if not learn_enabled:
-            lines.append("_Note: startup/maintenance exit — learning disabled_")
-        send_telegram_message("\n".join(lines))
+            # Persist learned params
+            set_learn_params(base, float(rsi_min), float(rsi_max), float(adx_min), float(rvol_base))
+            LAST_PARAM_UPDATE[base] = date.today().isoformat()
+        else:
+            # No learning this time; mark explicitly
+            learn_enabled = False
 
+        # Save analysis row
         try:
-            if pnl_usdt <= 0:
-                LAST_LOSS_INFO[symbol] = {"ts": datetime.now(timezone.utc).isoformat(), "pnl_usdt": float(pnl_usdt)}
-        except Exception:
-            pass
+            conn = sqlite3.connect(DB_NAME, timeout=10)
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT OR REPLACE INTO trade_analysis
+                (trade_id, ts, symbol, pnl_usdt, pnl_pct, duration_sec,
+                 entry_snapshot_json, exit_snapshot_json, adjustments_json, learn_enabled)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                trade_id,
+                datetime.now(timezone.utc).isoformat(),
+                symbol,
+                float(pnl_usdt),
+                float(pnl_pct),
+                int(dur_sec) if dur_sec is not None else None,
+                json.dumps(feats_entry or {}, ensure_ascii=False),
+                json.dumps(feats_exit or {}, ensure_ascii=False),
+                json.dumps(adjustments or {}, ensure_ascii=False),
+                1 if do_learn else 0
+            ))
+            conn.commit(); conn.close()
+        except Exception as e:
+            logger.warning(f"trade_analysis save failed {trade_id}: {e}")
+
+        # Telegram summary + attachment (best-effort)
+        try:
+            sign = "🟢" if pnl_usdt >= 0 else "🔴"
+            mins = (dur_sec // 60) if isinstance(dur_sec, int) else "—"
+            msg = (
+                f"{sign} *Trade Analysis* `{symbol}`\n"
+                f"PnL: `{pnl_pct:.2f}%` (`{pnl_usdt:.3f}` USDT)  |  Duration: `{mins}m`\n"
+                f"Learn: `{'on' if do_learn else 'off'}`  Adjustments: `{', '.join(adjustments.keys()) or '—'}`"
+            )
+            send_telegram_message(msg)
+
+            out_path = f"analysis_{trade_id.replace(':','-').replace('/','_')}.json"
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(analysis | {"adjustments": adjustments, "learn_enabled": do_learn}, f, indent=2, ensure_ascii=False)
+            send_telegram_document(out_path, caption=f"{symbol} trade analysis (trade {trade_id})")
+            try: os.remove(out_path)
+            except Exception: pass
+        except Exception as e:
+            logger.debug(f"Telegram analysis send failed {trade_id}: {e}")
+
+        logger.info(f"[analyze] {symbol} trade={trade_id} pnl={pnl_pct:.2f}% ({pnl_usdt:.3f} USDT) learn={do_learn} adj={list(adjustments.keys())}")
 
     except Exception as e:
-        logger.error(f"analyze_and_learn error {trade_id}: {e}", exc_info=True)
+        logger.error(f"analyze_and_learn error {trade_id}: {e}")
+
 
 
 # =========================
