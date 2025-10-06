@@ -1,7 +1,7 @@
 
 
 # =========================
-# trader_v17.py
+# trader_v18.py
 # =========================
 from __future__ import annotations
 from pathlib import Path
@@ -20,14 +20,55 @@ load_dotenv()
 
 # >>> STRATEGY PROFILE (ANCHOR SP0)
 # Selector de estrategia
+PARK_IN_MOMENTUM = bool(int(os.getenv("PARK_IN_MOMENTUM", "0")))
+
 STRATEGY_PROFILES = {"USDT_MOMENTUM", "BTC_PARK", "AUTO_HYBRID"}
 
 STRATEGY_PROFILE = (os.getenv("STRATEGY_PROFILE", "USDT_MOMENTUM") or "USDT_MOMENTUM").strip().upper()
 if STRATEGY_PROFILE not in STRATEGY_PROFILES:
     STRATEGY_PROFILE = "USDT_MOMENTUM"  # fallback seguro
 
+def allow_parking_now() -> bool:
+    """
+    Permite ejecutar el guard de BTC parking en este ciclo.
+    - Siempre True en BTC_PARK y AUTO_HYBRID.
+    - En USDT_MOMENTUM:
+        * True solo si el régimen long-term es 'bear' y no hay trades abiertos, o
+        * True si PARK_IN_MOMENTUM=1 (override por ENV).
+    """
+    try:
+        if STRATEGY_PROFILE in {"BTC_PARK", "AUTO_HYBRID"}:
+            return True
+        if STRATEGY_PROFILE == "USDT_MOMENTUM":
+            if PARK_IN_MOMENTUM:
+                return True  # override explícito por ENV
+            # Opción C + B: only-bear y sin trades abiertos
+            return longterm_regime("BTC/USDT") == "bear" and get_open_trades_count() == 0
+        return False
+    except Exception as e:
+        # Fallar "cerrado" es más seguro: si no podemos evaluar, no parqueamos.
+        logger.warning(f"[gate] allow_parking_now error: {e}")
+        return False
 
-# Parking config (solo aplica a BTC_PARK)
+# ==== LONG-TERM PARKING REGIME (ANCHOR LTP0) ====
+LONGTERM_PARKING_ENABLED   = bool(int(os.getenv("LONGTERM_PARKING_ENABLED", "1")))
+LONGTERM_TF                = os.getenv("LONGTERM_TF", "1d")  # "1d" o "1w"
+LONGTERM_EMA_LEN           = int(os.getenv("LONGTERM_EMA_LEN", "200"))
+LONGTERM_RSI_LEN           = int(os.getenv("LONGTERM_RSI_LEN", "14"))
+LONGTERM_ADX_LEN           = int(os.getenv("LONGTERM_ADX_LEN", "14"))
+
+# Objetivos de parking según régimen largo
+LONGTERM_PARK_PCT_BEAR     = float(os.getenv("LONGTERM_PARK_PCT_BEAR", "0.90"))  # bajo EMA200
+LONGTERM_PARK_PCT_BULL     = float(os.getenv("LONGTERM_PARK_PCT_BULL", "0.60"))  # sobre EMA200 + momentum
+
+# Trailing del piso (bps) según régimen largo (ensanchamos en bull para dejar correr)
+LONGTERM_TRAIL_BPS_BEAR    = int(os.getenv("LONGTERM_TRAIL_BPS_BEAR", "300"))   # 3.0%
+LONGTERM_TRAIL_BPS_BULL    = int(os.getenv("LONGTERM_TRAIL_BPS_BULL", "500"))   # 5.0%
+
+# Reclaim pad (bps) según régimen largo (pide más confirmación en bear)
+LONGTERM_RECLAIM_PAD_BEAR  = int(os.getenv("LONGTERM_RECLAIM_PAD_BEAR", "40"))  # 0.40%
+LONGTERM_RECLAIM_PAD_BULL  = int(os.getenv("LONGTERM_RECLAIM_PAD_BULL", "25"))  # 0.25%
+
 PARK_PCT = float(os.getenv("PARK_PCT", "0.90"))   # % del USDT libre (después de RESERVE_USDT) a parquear
 PARK_STATE = {"active": False}                    # estado en memoria (simple)
 
@@ -594,31 +635,51 @@ def _free_balances() -> tuple[float, float]:
     except Exception:
         return 0.0, 0.0
 
-# >>> STRATEGY HELPERS (ANCHOR AH2) — reemplaza la función existente si ya la tenías
+# >>> STRATEGY HELPERS (ANCHOR AH2) — DROP-IN REPLACEMENT
 def park_to_btc_if_needed() -> bool:
     """
-    Parquear a BTC (en realidad salir a USDT en BTC/USDT) cuando se rompe un piso dinámico,
-    y “des-parquear” (reentrar) sólo cuando:
-      1) ha pasado un tiempo mínimo en parking (PARK_MIN_HOLD_MIN), y
-      2) el precio recupera al menos hasta (high * (1 - PARK_REENTRY_PAD_BPS/10000)).
-
-    Requiere vars globales:
-      - PARK_PROTECT_ENABLED (bool)
-      - PARK_GUARD (dict con claves: anchor, high, floor, last_change, reason, parked)
-      - PARK_TRAIL_BPS (int, bps para trailing del piso)
-      - PARK_REENTRY_PAD_BPS (int, bps para “reclaim”)
-      - PARK_MIN_HOLD_MIN (int, minutos de bloqueo antes de re-entrar)
-      - MIN_NOTIONAL (float, notional mínimo del exchange)
-      - MIN_RESERVE_USDT (float, USDT a reservar sin usar)
+    Guard de parking para BTC/USDT con:
+      - trailing por HIGH (floor dinámico)
+      - venta si rompe el piso
+      - re-entrada sólo tras cooldown + reclaim
+    Gate por perfil: NO hace nada si STRATEGY_PROFILE == 'USDT_MOMENTUM'.
+    Devuelve True si ejecuta orden (sell/buy), False si no.
+    Requiere:
+      PARK_PROTECT_ENABLED, PARK_GUARD, PARK_TRAIL_BPS, PARK_REENTRY_PAD_BPS,
+      PARK_MIN_HOLD_MIN, MIN_NOTIONAL, MIN_RESERVE_USDT.
     """
-
     global PARK_GUARD
+
+    # === Trailing / reclaim por régimen + detección de "bear falso" ===
+    regime = longterm_regime("BTC/USDT")  # 'bull' o 'bear'
+
+    # Por defecto: knobs por régimen largo
+    trail_bps   = LONGTERM_TRAIL_BPS_BULL if regime == "bull" else LONGTERM_TRAIL_BPS_BEAR
+    reclaim_pad = LONGTERM_RECLAIM_PAD_BULL if regime == "bull" else LONGTERM_RECLAIM_PAD_BEAR
+    target_park_pct = LONGTERM_PARK_PCT_BULL if regime == "bull" else LONGTERM_PARK_PCT_BEAR
+
+    # Bear falso: si long-term dice 'bear' pero 4h muestra momentum (paciencia extra)
+    false_bear = False
+    try:
+        snap_4h = quick_tf_snapshot("BTC/USDT", "4h", limit=LONGTERM_ADX_LEN + 80) or {}
+        rsi4h = snap_4h.get("RSI")
+        adx4h = snap_4h.get("ADX")
+        if regime == "bear" and rsi4h is not None and adx4h is not None and rsi4h >= 55 and adx4h >= 18:
+            false_bear = True
+            trail_bps   = LONGTERM_TRAIL_BPS_BULL    # ensancha el trailing como bull
+            reclaim_pad = LONGTERM_RECLAIM_PAD_BULL  # relaja el reclaim para no re-comprar demasiado pronto
+    except Exception as e:
+        logger.debug(f"[park] false-bear check skipped: {e}")
+
+    logger.info(f"[park] regime={regime} false_bear={false_bear} trail={trail_bps}bps reclaim={reclaim_pad}bps target_pct={target_park_pct}")
+    # --- GATE por estrategia: inerte en USDT_MOMENTUM ---
+    if not allow_parking_now():
+        return False
 
     symbol = "BTC/USDT"
 
-    # --- helpers locales ---------------------------
+    # --- helpers locales ---
     def _init_guard():
-        """Asegura estructura y valores por defecto del guard."""
         global PARK_GUARD
         with PARK_LOCK:
             if not isinstance(PARK_GUARD, dict):
@@ -626,146 +687,123 @@ def park_to_btc_if_needed() -> bool:
             PARK_GUARD.setdefault("anchor", None)
             PARK_GUARD.setdefault("high", None)
             PARK_GUARD.setdefault("floor", None)
-            PARK_GUARD.setdefault("last_change", None)  # epoch seconds
+            PARK_GUARD.setdefault("last_change", None)  # epoch
             PARK_GUARD.setdefault("reason", None)
             PARK_GUARD.setdefault("parked", False)
 
     def _floor_guard_active(btc_val_usdt: float) -> bool:
-        # Evita ruido si la posición es demasiado pequeña
+        # Evita ruido si la posición es muy pequeña
         return PARK_PROTECT_ENABLED and btc_val_usdt >= max(MIN_NOTIONAL, 25)
 
     def _update_anchor_and_floor(last_px: float):
-        """Actualiza high/anchor y recalcula floor con trailing bps."""
-        g = PARK_GUARD
         with PARK_LOCK:
-            if g["high"] is None or last_px > g["high"]:
-                g["high"] = last_px
-                g["anchor"] = last_px
-                g["last_change"] = time.time()
-            # trailing floor desde el HIGH
-            g["floor"] = (g["high"] or last_px) * (1.0 - (PARK_TRAIL_BPS * 0.0001))
+            if PARK_GUARD["high"] is None or last_px > PARK_GUARD["high"]:
+                PARK_GUARD["high"] = last_px
+                PARK_GUARD["anchor"] = last_px
+                PARK_GUARD["last_change"] = time.time()
+            base_high = PARK_GUARD["high"] if PARK_GUARD["high"] is not None else last_px
+            # >>> usa trail_bps LOCAL (no el global)
+            PARK_GUARD["floor"] = base_high * (1.0 - (trail_bps * 0.0001))
 
     def _reentry_trigger_price(current_px: float) -> float:
-        """Precio de 'reclaim' para poder re-entrar (pad por debajo del high)."""
-        g = PARK_GUARD
         with PARK_LOCK:
-            base = g["high"] or current_px
-            return base * (1.0 - (PARK_REENTRY_PAD_BPS * 0.0001))
+            base = PARK_GUARD.get("high") or current_px
+        # >>> usa reclaim_pad LOCAL
+        return base * (1.0 - (reclaim_pad * 0.0001))
+
 
     def _now_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    # --- inicio -----------------------------------
+    # --- inicio ---
     _init_guard()
 
-    # Balances y precio actual
+    # Balances y precio
     usdt_free, btc_free = _free_balances()
     btc_px = float(fetch_price(symbol) or 0.0)
     if btc_px <= 0:
         return False
 
-    btc_val = btc_free * btc_px  # valor de la posición BTC en USDT
+    btc_val = btc_free * btc_px
     now_epoch = time.time()
 
-    # 1) Si tengo BTC (posición) y el guard está activo, mantener trailing y vender si rompe el piso
+    # (1) Si tengo BTC y guard activo → trailing y vender si rompe piso
     if _floor_guard_active(btc_val):
         _update_anchor_and_floor(btc_px)
-
-        # Rompe el piso => vender a USDT (parquear)
         floor = PARK_GUARD.get("floor") or 0.0
         if btc_px <= floor and btc_free > 0.0:
-            # Respetar reserva de USDT: no vender el BTC equivalente a MIN_RESERVE_USDT
+            # Respeta reserva de USDT: no vendas el equivalente a MIN_RESERVE_USDT
             reserve_btc = max(0.0, MIN_RESERVE_USDT / btc_px)
             qty_to_sell = max(0.0, btc_free - reserve_btc)
-
             if qty_to_sell * btc_px >= MIN_NOTIONAL:
                 trade_id = f"PARK-FLOOR-{_now_iso()}"
-
-                # Enviar snapshot de features de salida
+                # Log rico (no interrumpe si falla)
                 try:
                     features = build_rich_features(symbol)
                     extra = f"Price: {btc_px:,.2f}  Amount: {qty_to_sell:.8f}"
                     send_feature_bundle_telegram(
-                        side="exit",
-                        symbol=symbol,
-                        trade_id=trade_id,
-                        features=features,
-                        extra_lines=extra,
+                        side="exit", symbol=symbol, trade_id=trade_id,
+                        features=features, extra_lines=extra,
                     )
                 except Exception as e:
-                    logger.warning(f"[park] no se pudo enviar features de salida: {e}")
+                    logger.warning(f"[park] snapshot salida falló: {e}")
 
-                # Vender
                 try:
                     sell_symbol(symbol, qty_to_sell, trade_id=trade_id, source="park-floor")
-                    PARK_GUARD["last_change"] = now_epoch
-                    PARK_GUARD["reason"] = "floor_break"
-                    PARK_GUARD["parked"] = True
+                    with PARK_LOCK:
+                        PARK_GUARD["last_change"] = now_epoch
+                        PARK_GUARD["reason"] = "floor_break"
+                        PARK_GUARD["parked"] = True
                     return True
                 except Exception as e:
-                    logger.error(f"[park] error al vender BTC por floor-break: {e}")
-                    # aunque falle, no devolvemos True
-            # si la qty no alcanza el mínimo, no hacemos nada
-        # si no rompe el piso, no hacemos nada
+                    logger.error(f"[park] error sell BTC por floor-break: {e}")
+            # si qty mínima no da, no se hace nada
 
-    # 2) Si estoy aparcado (sin BTC) y tengo USDT suficientes, evaluar des-parking (re-entrada)
-    #    Condiciones: cooldown y reclaim del precio
+    # (2) Si estoy aparcado (sin BTC) → re-entrada sólo si cooldown + reclaim
     if PARK_PROTECT_ENABLED and btc_free <= 0.0 and usdt_free >= (MIN_NOTIONAL + 1.0):
         last_change = PARK_GUARD.get("last_change")
         hold_secs = (now_epoch - last_change) if last_change else None
         min_hold_secs = float(PARK_MIN_HOLD_MIN) * 60.0
 
-        # (a) cooldown: esperar al menos PARK_MIN_HOLD_MIN min tras el parking
+        # (a) cooldown
         if hold_secs is not None and hold_secs < min_hold_secs:
-            # Demasiado pronto para re-entrar
             return False
 
-        # (b) reclaim: precio actual debe estar por encima del trigger de re-entrada
+        # (b) reclaim
         reclaim_px = _reentry_trigger_price(btc_px)
         if btc_px >= reclaim_px:
-            # Notional a usar: todo lo que supere la reserva
             buy_usdt = max(0.0, usdt_free - MIN_RESERVE_USDT)
             if buy_usdt >= MIN_NOTIONAL:
-                qty_to_buy = round(buy_usdt / btc_px, 8)  # granularidad suficiente p/ BTC
-
+                qty_to_buy = round(buy_usdt / btc_px, 8)
                 trade_id = f"PARK-UNWIND-{_now_iso()}"
-
-                # Ejecutar la compra primero (para que el order fill dispare el mensaje "BUY")
                 try:
                     execute_order_buy(
-                        symbol,
-                        qty_to_buy,
+                        symbol, qty_to_buy,
                         signals={"confidence": 60, "score": 0.0},
                     )
                 except Exception as e:
-                    logger.error(f"[unwind] error al recomprar BTC: {e}")
+                    logger.error(f"[unwind] error recomprando BTC: {e}")
                     return False
 
-                # Enviar snapshot de features de entrada
+                # Telemetría posterior (no bloqueante)
                 try:
                     features = build_rich_features(symbol)
                     extra = f"Price: {btc_px:,.2f}  Amount: {qty_to_buy:.8f}"
                     send_feature_bundle_telegram(
-                        side="entry",
-                        symbol=symbol,
-                        trade_id=trade_id,
-                        features=features,
-                        extra_lines=extra,
+                        side="entry", symbol=symbol, trade_id=trade_id,
+                        features=features, extra_lines=extra,
                     )
                 except Exception as e:
-                    logger.warning(f"[unwind] no se pudo enviar features de entrada: {e}")
+                    logger.warning(f"[unwind] snapshot entrada falló: {e}")
 
-                # Reset del guard
-                PARK_GUARD["parked"] = False
-                PARK_GUARD["anchor"] = btc_px
-                PARK_GUARD["high"] = btc_px
-                PARK_GUARD["floor"] = btc_px * (1.0 - (PARK_TRAIL_BPS * 0.0001))
-                PARK_GUARD["last_change"] = now_epoch
-                PARK_GUARD["reason"] = "reclaim"
-
+                with PARK_LOCK:
+                    PARK_GUARD["last_change"] = now_epoch
+                    PARK_GUARD["reason"] = "reclaim"
+                    PARK_GUARD["parked"] = False
                 return True
 
     return False
+
 
 
 
@@ -981,8 +1019,13 @@ def compute_timeframe_features(df: pd.DataFrame, label: str):
         # Keep original as 'RVOL10_live'
         df['RVOL10_live'] = (df['volume'] / rv_mean) if rv_ok else np.nan
         # In features dict: add both
-        features["rvol10_closed"] = float(df['RVOL10_closed'].iloc[-1]) if pd.notna(df['RVOL10_closed'].iloc[-1]) else None
-        features["rvol10_live"] = rvv  # existing
+        # RVOL10 (closed vs live) — ya calculado arriba
+        features["rvol10_closed"] = float(df['RVOL10_closed'].iloc[-1]) if 'RVOL10_closed' in df and pd.notna(df['RVOL10_closed'].iloc[-1]) else None
+        features["rvol10_live"]   = float(df['RVOL10_live'].iloc[-1])   if 'RVOL10_live'   in df and pd.notna(df['RVOL10_live'].iloc[-1])   else None
+
+        # Elegimos un RVOL “principal” para lógica general: prioriza closed; si no hay, usa live
+        rvv = features["rvol10_closed"] if features["rvol10_closed"] is not None else features["rvol10_live"]
+
         # Slopes de 10 barras
         price_slope10 = vol_slope10 = np.nan
         if len(df) >= 10:
@@ -1015,12 +1058,6 @@ def compute_timeframe_features(df: pd.DataFrame, label: str):
         except Exception:
             pass
 
-        # RVOL último (solo si la media es válida)
-        try:
-            rv_last_val = df['RVOL10'].iloc[-1]
-            rvv = float(rv_last_val) if pd.notna(rv_last_val) else None
-        except Exception:
-            rvv = None
 
         # Ensamblar features (mezclando 'extras' al final)
         features = {
@@ -1171,7 +1208,50 @@ def quick_tf_snapshot(symbol: str, timeframe: str, limit: int = 120):
         snap['STOCHRSIk'] = float(srs.iloc[-1, 0]) if srs is not None and not srs.empty else None
     except Exception:
         pass
+    # EMA200 para régimen de largo plazo
+    try:
+        ema200_series = ta.ema(df['close'], length=200)
+        snap['EMA200'] = float(ema200_series.iloc[-1]) if ema200_series is not None and len(ema200_series) >= 200 else None
+    except Exception:
+        pass
+
     return snap
+
+# ==== LONG-TERM SNAPSHOT (ANCHOR LTP1) ====
+_LTP_CACHE = {"ts": 0, "tf": None, "sym": None, "data": {}}
+_LTP_TTL   = 300  # 5 min
+
+def longterm_snapshot(symbol: str) -> dict:
+    """Devuelve {'last','EMA200','RSI','ADX'} del TF largo con caché."""
+    if not LONGTERM_PARKING_ENABLED:
+        return {}
+    now = time.time()
+    if (_LTP_CACHE["sym"] == symbol and _LTP_CACHE["tf"] == LONGTERM_TF 
+        and now - _LTP_CACHE["ts"] < _LTP_TTL and _LTP_CACHE["data"]):
+        return dict(_LTP_CACHE["data"])
+
+    snap = quick_tf_snapshot(symbol, LONGTERM_TF, limit=LONGTERM_EMA_LEN + 80) or {}
+    out = {
+        "last": snap.get("last"),
+        "EMA200": snap.get("EMA200"),
+        "RSI": snap.get("RSI"),
+        "ADX": snap.get("ADX"),
+    }
+    _LTP_CACHE.update({"ts": now, "tf": LONGTERM_TF, "sym": symbol, "data": out})
+    return out
+
+def longterm_regime(symbol: str) -> str:
+    """
+    Clasifica 'bull' si precio > EMA200 y (RSI>50 y ADX>20); si no, 'bear'.
+    Heurística simple y robusta (evita look-ahead).
+    """
+    s = longterm_snapshot(symbol)
+    px, ema, rsi, adx = s.get("last"), s.get("EMA200"), s.get("RSI"), s.get("ADX")
+    if all(v is not None for v in (px, ema, rsi, adx)) and px > ema and rsi > 50 and adx > 20:
+        return "bull"
+    return "bear"
+
+
 
 # === Breadth cache / regime helpers ===
 _BREADTH_CACHE = {"ts": 0, "ok": True, "count": 0, "leaders_ok": True}
@@ -3813,7 +3893,7 @@ def startup_cleanup():
 # Main loop (r4.2)
 # =========================
 if __name__ == "__main__":
-    VERSION = "v17"
+    VERSION = "v18"
     logger.info(f"Starting hybrid trader ({VERSION}, profile={STRATEGY_PROFILE})…")
     try:
         try: exchange.load_markets()
@@ -3825,6 +3905,12 @@ if __name__ == "__main__":
             check_log_rotation()
 
             crash_active = crash_halt()
+            # Parking de BTC: inerte si el perfil es USDT_MOMENTUM (gate interno)
+            try:
+                park_to_btc_if_needed()
+            except Exception as e:
+                logger.warning(f"park_to_btc_if_needed error: {e}")
+
             cycle_decisions = []
             
                         # >>> FGI Cycle Gate (ANCHOR FGI3)
