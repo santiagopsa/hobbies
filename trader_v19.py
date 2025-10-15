@@ -646,51 +646,50 @@ def send_telegram_document(file_path: str, caption: str = ""):
             logger.error(f"Telegram fallback snippet error: {e2}")
 
 # =========================
-# Per-symbol trailing overrides (bps & absolute floor)
+# Overrides de trailing por símbolo (bps y piso absoluto)
 # =========================
-TRAIL_OVERRIDES = {}   # symbol -> {"bps": int|None, "absolute_floor": float|None, "expires_at": float|None}
+TRAIL_OVERRIDES: dict[str, dict] = {}   # symbol -> {"bps": int|None, "floor": float|None, "exp": float|None}
 TRAIL_OVR_LOCK = threading.Lock()
 
-def set_symbol_trailing(symbol: str, trail_bps: int | None = None, absolute_floor: float | None = None, ttl_sec: int | None = None):
+def set_symbol_trailing(
+    symbol: str,
+    trail_bps: int | None = None,
+    absolute_floor: float | None = None,
+    ttl_sec: int | None = None,
+) -> None:
     """
-    Set per-symbol trailing overrides.
-      - trail_bps: width in basis points (e.g., 500 = 5%). If set, the effective stop
-        each loop will be clamped to at most price*(1 - bps/10000).
-      - absolute_floor: hard floor price clamp (never set stop below this).
-      - ttl_sec: optional time-to-live for the override entry.
-    Passing both as None clears the overrides for that symbol.
+    Define overrides del trailing para un símbolo.
+      - trail_bps: ancho en basis points (500 = 5%). Si está, se clampa el stop a price*(1 - bps/10000).
+      - absolute_floor: piso absoluto del stop. Nunca bajará de este precio.
+      - ttl_sec: tiempo de vida opcional (segundos). Al expirar, se purga el override.
+    Si ambos (trail_bps y absolute_floor) son None, elimina el override del símbolo.
     """
-    try:
-        with TRAIL_OVR_LOCK:
-            if trail_bps is None and absolute_floor is None:
-                TRAIL_OVERRIDES.pop(symbol, None)
-                return
-            exp = (time.time() + float(ttl_sec)) if ttl_sec else None
-            data = TRAIL_OVERRIDES.get(symbol, {})
-            if trail_bps is not None: data["bps"] = int(trail_bps)
-            if absolute_floor is not None: data["absolute_floor"] = float(absolute_floor)
-            data["expires_at"] = exp
-            TRAIL_OVERRIDES[symbol] = data
-    except Exception as e:
-        logger.debug(f"set_symbol_trailing failed for {symbol}: {e}")
+    with TRAIL_OVR_LOCK:
+        if trail_bps is None and absolute_floor is None:
+            TRAIL_OVERRIDES.pop(symbol, None)
+            return
+        data = TRAIL_OVERRIDES.get(symbol, {})
+        if trail_bps is not None:
+            data["bps"] = int(trail_bps)
+        if absolute_floor is not None:
+            data["floor"] = float(absolute_floor)
+        data["exp"] = (time.time() + float(ttl_sec)) if ttl_sec else None
+        TRAIL_OVERRIDES[symbol] = data
 
-def _get_trail_overrides(symbol: str) -> tuple[int|None, float|None]:
-    """Return (bps, absolute_floor) for symbol (None if not set). Purges expired."""
-    bps = floor = None
-    try:
-        with TRAIL_OVR_LOCK:
-            data = TRAIL_OVERRIDES.get(symbol)
-            if not data:
-                return (None, None)
-            exp = data.get("expires_at")
-            if exp and time.time() >= exp:
-                TRAIL_OVERRIDES.pop(symbol, None)
-                return (None, None)
-            bps = data.get("bps")
-            floor = data.get("absolute_floor")
-    except Exception as e:
-        logger.debug(f"_get_trail_overrides error for {symbol}: {e}")
-    return (bps, floor)
+def _get_trail_overrides(symbol: str) -> tuple[int | None, float | None]:
+    """
+    Devuelve (bps, floor). Purga si expiró.
+    """
+    with TRAIL_OVR_LOCK:
+        d = TRAIL_OVERRIDES.get(symbol)
+        if not d:
+            return (None, None)
+        exp = d.get("exp")
+        if exp and time.time() >= exp:
+            TRAIL_OVERRIDES.pop(symbol, None)
+            return (None, None)
+        return (d.get("bps"), d.get("floor"))
+
 
 
 # =========================
@@ -992,6 +991,11 @@ def count_closed_bars_since(df: pd.DataFrame, ts_open: datetime) -> int:
         return 0
 
 # >>> CHAN HELPERS END
+def get_last_price(symbol: str) -> float:
+    px = fetch_price(symbol)
+    if px is None:
+        raise RuntimeError(f"get_last_price: no price for {symbol}")
+    return float(px)
 
 
 def fetch_price(symbol: str):
@@ -2762,18 +2766,20 @@ def execute_order_buy(symbol: str, amount: float, signals: dict):
         return None
 
 
-def execute_order_sell(symbol: str, amount: float, signals: dict):
-    """Place a *partial* market sell and record it WITHOUT closing the trade.
-    Inserts a transactions row with side='sell' and status='partial' (or 'open' if you prefer),
-    but does **not** mark the associated 'buy' row closed.
+def execute_order_sell(symbol: str, amount: float, signals: dict | None = None) -> dict | None:
+    """
+    Venta *parcial* por mercado que NO cierra el trade.
+    Inserta una fila en transactions con side='sell_partial' (status='open'),
+    dejando intacto el 'buy' (status 'open') y permitiendo que el trailing continúe.
     """
     try:
+        # 1) Precio de referencia y orden
         price_now = fetch_price(symbol)
         order = exchange.create_market_sell_order(symbol, amount)
         sell_price = order.get("price", price_now) or price_now or 0.0
         sell_ts = datetime.now(timezone.utc).isoformat()
 
-        # Try to infer the current open trade_id (last open buy for this symbol)
+        # 2) Determinar el trade_id abierto de este símbolo
         trade_id = None
         try:
             conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
@@ -2782,34 +2788,66 @@ def execute_order_sell(symbol: str, amount: float, signals: dict):
                 WHERE symbol=? AND side='buy' AND status='open'
                 ORDER BY ts DESC LIMIT 1
             """, (symbol,))
-            row = cur.fetchone(); conn.close()
+            row = cur.fetchone()
+            conn.close()
             trade_id = row[0] if row else None
         except Exception:
             trade_id = None
 
+        if not trade_id:
+            # Fallback si no hay 'buy' abierto (no debería pasar si controlas 1 posición por símbolo)
+            trade_id = f"{symbol}-{sell_ts.replace(':','-')}-partial"
+
+        # 3) Registrar la venta parcial (NO usar side='sell' para no cerrar)
         conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
         cur.execute("""
-            INSERT INTO transactions (symbol, side, price, amount, ts, trade_id, adx, rsi, rvol, atr, score, confidence, status)
-            VALUES (?, 'sell', ?, ?, ?, COALESCE(?, ''), ?, ?, ?, ?, ?, ?, 'partial')
+            INSERT INTO transactions (
+                symbol, side, price, amount, ts, trade_id,
+                adx, rsi, rvol, atr, score, confidence, status
+            ) VALUES (
+                ?, 'sell_partial', ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, 'open'
+            )
         """, (
             symbol, float(sell_price), float(amount), sell_ts, trade_id,
-            signals.get('adx'), signals.get('rsi'), signals.get('rvol'), signals.get('atr'),
-            signals.get('score'), signals.get('confidence')
+            (signals or {}).get('adx'),
+            (signals or {}).get('rsi'),
+            (signals or {}).get('rvol'),
+            (signals or {}).get('atr'),
+            (signals or {}).get('score'),
+            (signals or {}).get('confidence'),
         ))
         conn.commit(); conn.close()
 
+        # 4) Notificación
         try:
-            send_telegram_message(f"↘️ Partial SELL {symbol}\nPrice: {sell_price}\nAmount: {amount}")
+            reason = (signals or {}).get("reason", "partial")
+            send_telegram_message(
+                f"🟡 PARTIAL SELL {symbol}\n"
+                f"Price: {sell_price}\n"
+                f"Amount: {amount}\n"
+                f"Reason: {reason}"
+            )
         except Exception:
             pass
+
         return {
-            "symbol": symbol, "amount": float(amount), "price": float(sell_price),
-            "ts": sell_ts, "trade_id": trade_id, "status": "partial"
+            "symbol": symbol,
+            "amount": float(amount),
+            "price": float(sell_price),
+            "ts": sell_ts,
+            "trade_id": trade_id,
+            "status": "partial",
         }
+
     except Exception as e:
         logger.error(f"execute_order_sell error {symbol}: {e}")
-        send_telegram_message(f"❌ SELL (partial) failed {symbol}: {e}")
+        try:
+            send_telegram_message(f"❌ PARTIAL SELL failed {symbol}: {e}")
+        except Exception:
+            pass
         return None
+
 
 
 def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"):
@@ -3219,6 +3257,13 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 if c_stop is not None:
                     candidate = max(candidate, c_stop, initial_stop)
 
+                # === APPLY TRAIL OVERRIDES (bps / floor)
+                _bps, _floor = _get_trail_overrides(symbol)
+                if _bps:
+                    candidate = min(candidate, price * (1.0 - int(_bps) / 10000.0))  # ensancha (deja correr)
+                if _floor:
+                    candidate = max(candidate, float(_floor))                         # piso duro
+
                 # Apply per-symbol trailing overrides (if any)
                 try:
                     _bps, _floor = _get_trail_overrides(symbol)
@@ -3502,10 +3547,16 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                         return
 
                 time.sleep(EXIT_CHECK_EVERY_SEC)
-
+                
         except Exception as e:
             logger.error(f"Trailing error {symbol}: {e}")
             try:
+                # No cierres si el trade tiene segundos de vida: reintenta el loop
+                age_s = (datetime.now(timezone.utc) - opened_ts).total_seconds()
+                if age_s < 60:
+                    time.sleep(2)
+                    threading.Thread(target=loop, daemon=True).start()
+                    return
                 if not trade_is_closed():
                     sell_symbol(symbol, amount, trade_id, source="trail")
             except Exception:
