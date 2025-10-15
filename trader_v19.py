@@ -646,6 +646,54 @@ def send_telegram_document(file_path: str, caption: str = ""):
             logger.error(f"Telegram fallback snippet error: {e2}")
 
 # =========================
+# Per-symbol trailing overrides (bps & absolute floor)
+# =========================
+TRAIL_OVERRIDES = {}   # symbol -> {"bps": int|None, "absolute_floor": float|None, "expires_at": float|None}
+TRAIL_OVR_LOCK = threading.Lock()
+
+def set_symbol_trailing(symbol: str, trail_bps: int | None = None, absolute_floor: float | None = None, ttl_sec: int | None = None):
+    """
+    Set per-symbol trailing overrides.
+      - trail_bps: width in basis points (e.g., 500 = 5%). If set, the effective stop
+        each loop will be clamped to at most price*(1 - bps/10000).
+      - absolute_floor: hard floor price clamp (never set stop below this).
+      - ttl_sec: optional time-to-live for the override entry.
+    Passing both as None clears the overrides for that symbol.
+    """
+    try:
+        with TRAIL_OVR_LOCK:
+            if trail_bps is None and absolute_floor is None:
+                TRAIL_OVERRIDES.pop(symbol, None)
+                return
+            exp = (time.time() + float(ttl_sec)) if ttl_sec else None
+            data = TRAIL_OVERRIDES.get(symbol, {})
+            if trail_bps is not None: data["bps"] = int(trail_bps)
+            if absolute_floor is not None: data["absolute_floor"] = float(absolute_floor)
+            data["expires_at"] = exp
+            TRAIL_OVERRIDES[symbol] = data
+    except Exception as e:
+        logger.debug(f"set_symbol_trailing failed for {symbol}: {e}")
+
+def _get_trail_overrides(symbol: str) -> tuple[int|None, float|None]:
+    """Return (bps, absolute_floor) for symbol (None if not set). Purges expired."""
+    bps = floor = None
+    try:
+        with TRAIL_OVR_LOCK:
+            data = TRAIL_OVERRIDES.get(symbol)
+            if not data:
+                return (None, None)
+            exp = data.get("expires_at")
+            if exp and time.time() >= exp:
+                TRAIL_OVERRIDES.pop(symbol, None)
+                return (None, None)
+            bps = data.get("bps")
+            floor = data.get("absolute_floor")
+    except Exception as e:
+        logger.debug(f"_get_trail_overrides error for {symbol}: {e}")
+    return (bps, floor)
+
+
+# =========================
 # Utils
 # =========================
 
@@ -2713,6 +2761,57 @@ def execute_order_buy(symbol: str, amount: float, signals: dict):
         send_telegram_message(f"❌ BUY failed {symbol}: {e}")
         return None
 
+
+def execute_order_sell(symbol: str, amount: float, signals: dict):
+    """Place a *partial* market sell and record it WITHOUT closing the trade.
+    Inserts a transactions row with side='sell' and status='partial' (or 'open' if you prefer),
+    but does **not** mark the associated 'buy' row closed.
+    """
+    try:
+        price_now = fetch_price(symbol)
+        order = exchange.create_market_sell_order(symbol, amount)
+        sell_price = order.get("price", price_now) or price_now or 0.0
+        sell_ts = datetime.now(timezone.utc).isoformat()
+
+        # Try to infer the current open trade_id (last open buy for this symbol)
+        trade_id = None
+        try:
+            conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+            cur.execute("""
+                SELECT trade_id FROM transactions
+                WHERE symbol=? AND side='buy' AND status='open'
+                ORDER BY ts DESC LIMIT 1
+            """, (symbol,))
+            row = cur.fetchone(); conn.close()
+            trade_id = row[0] if row else None
+        except Exception:
+            trade_id = None
+
+        conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO transactions (symbol, side, price, amount, ts, trade_id, adx, rsi, rvol, atr, score, confidence, status)
+            VALUES (?, 'sell', ?, ?, ?, COALESCE(?, ''), ?, ?, ?, ?, ?, ?, 'partial')
+        """, (
+            symbol, float(sell_price), float(amount), sell_ts, trade_id,
+            signals.get('adx'), signals.get('rsi'), signals.get('rvol'), signals.get('atr'),
+            signals.get('score'), signals.get('confidence')
+        ))
+        conn.commit(); conn.close()
+
+        try:
+            send_telegram_message(f"↘️ Partial SELL {symbol}\nPrice: {sell_price}\nAmount: {amount}")
+        except Exception:
+            pass
+        return {
+            "symbol": symbol, "amount": float(amount), "price": float(sell_price),
+            "ts": sell_ts, "trade_id": trade_id, "status": "partial"
+        }
+    except Exception as e:
+        logger.error(f"execute_order_sell error {symbol}: {e}")
+        send_telegram_message(f"❌ SELL (partial) failed {symbol}: {e}")
+        return None
+
+
 def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"):
     try:
         price_now = fetch_price(symbol)
@@ -2824,7 +2923,7 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
             try:
                 conn = sqlite3.connect(DB_NAME)
                 cur = conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM transactions WHERE trade_id=? AND side='sell' LIMIT 1", (trade_id,))
+                cur.execute("SELECT COUNT(*) FROM transactions WHERE trade_id=? AND side='sell' AND status='closed' LIMIT 1", (trade_id,))
                 n = cur.fetchone()[0]
                 conn.close()
                 return n > 0
@@ -2858,7 +2957,101 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
             rebound_pending_until = None
             last_exit_trigger_reason = None
 
+            # >>> SAFETY INIT (HOOK SAFE0)
+            base = symbol.split("/")[0]
+            CATA_MAX_DD_BPS_BTC = int(os.getenv("CATA_MAX_DD_BPS_BTC", "350"))  # 3.5% BTC/ETH
+            CATA_MAX_DD_BPS_ALT = int(os.getenv("CATA_MAX_DD_BPS_ALT", "600"))  # 6.0% ALTs
+            cata_dd_bps = CATA_MAX_DD_BPS_BTC if base in {"BTC", "ETH"} else CATA_MAX_DD_BPS_ALT
+
+            PREARM_ENABLE       = int(os.getenv("PREARM_ENABLE", "1"))
+            PREARM_MAX_LOSS_BPS = int(os.getenv("PREARM_MAX_LOSS_BPS", "250"))   # 2.5% before trail arms
+            PREARM_ATR_MULT     = float(os.getenv("PREARM_ATR_MULT", "1.2"))     # ATR*mult component
+            ARM_TIME_MAX_MIN    = int(os.getenv("ARM_TIME_MAX_MIN", "45"))       # auto-arm after N min
+
+            # rapid-kill thresholds (tune via .env as needed)
+            RK_RSI15_MAX   = float(os.getenv("RK_RSI15_MAX", "45"))
+            RK_MACDH15_MAX = float(os.getenv("RK_MACDH15_MAX", "0"))
+            RK_RSI1H_MAX   = float(os.getenv("RK_RSI1H_MAX", "50"))
+            RK_RVOL15_MIN  = float(os.getenv("RK_RVOL15_MIN", "1.20"))
+
+            opened_at_ts = time.time()     # or your entry timestamp
+            prearm_floor = None            # hard floor while trail not armed
+            trail_armed  = False           # flip to True when your normal arming condition triggers
+
+            # Optional ATR% to size prearm floor
+            try:
+                snap1h = quick_tf_snapshot(symbol, "1h", limit=100) or {}
+                atr_pct = float(snap1h.get("ATR%") or 0.0)  # e.g., 1.25 means 1.25%
+            except Exception:
+                atr_pct = 0.0
+
+
             while True:
+                last_price = get_last_price(symbol)  # or your own px getter
+
+                # >>> CATASTROPHIC FLOOR (HOOK SAFE1)
+                try:
+                    dd_bps = int(round((1.0 - (last_price / entry_price)) * 10000))
+                    if dd_bps >= cata_dd_bps:
+                        logger.warning(f"[cata] {symbol} max DD {dd_bps}bps >= {cata_dd_bps}bps — force exit")
+                        sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="catastrophic")
+                        time.sleep(EXIT_CHECK_EVERY_SEC)
+                        continue
+                except Exception as e:
+                    logger.warning(f"[cata] check failed {symbol}: {e}")
+
+                # >>> PRE-ARM FLOOR (HOOK SAFE2)
+                try:
+                    if PREARM_ENABLE and not trail_armed:
+                        minutes_open = (time.time() - opened_at_ts) / 60.0
+                        floor_by_loss = entry_price * (1.0 - PREARM_MAX_LOSS_BPS * 0.0001)
+                        floor_by_atr  = entry_price * (1.0 - max(0.0, atr_pct) * PREARM_ATR_MULT * 0.01)
+                        cand_floor = max(floor_by_loss, floor_by_atr)   # tighter of the two
+                        prearm_floor = cand_floor if prearm_floor is None else max(prearm_floor, cand_floor)
+
+                        if last_price <= prearm_floor:
+                            logger.info(f"[prearm-stop] {symbol} hit {prearm_floor:.4f} (entry={entry_price:.4f}) — exit before arming")
+                            sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="prearm-stop")
+                            time.sleep(EXIT_CHECK_EVERY_SEC)
+                            continue
+
+                        if minutes_open >= ARM_TIME_MAX_MIN:
+                            trail_armed = True
+                            # seed your trail manager with an absolute floor clamp
+                            set_symbol_trailing(symbol, trail_bps=None, absolute_floor=prearm_floor)  # implement clamp inside
+                            logger.info(f"[prearm-arm] {symbol} auto-armed after {minutes_open:.1f}m; floor={prearm_floor:.4f}")
+                except Exception as e:
+                    logger.warning(f"[prearm] check failed {symbol}: {e}")
+
+                # >>> RAPID DETERIORATION KILL (HOOK SAFE3)
+                try:
+                    tf15 = quick_tf_snapshot(symbol, "15m", limit=40) or {}
+                    tf1h = quick_tf_snapshot(symbol, "1h",  limit=60) or {}
+
+                    rsi15   = tf15.get("RSI")
+                    macdh15 = (tf15.get("MACD-h") or tf15.get("MACDh") or tf15.get("MACD_HIST"))
+                    rvol15  = (tf15.get("RVOL_live") or tf15.get("RVOL10_live") or tf15.get("RVOL") or tf15.get("RVOL10"))
+                    rsi1h   = tf1h.get("RSI")
+
+                    # Slightly looser for BTC/ETH (optional)
+                    rsi15_max = RK_RSI15_MAX + (3 if base in {"BTC","ETH"} else 0)
+                    rsi1h_max = RK_RSI1H_MAX + (2 if base in {"BTC","ETH"} else 0)
+                    rvol15_min = RK_RVOL15_MIN - (0.2 if base in {"BTC","ETH"} else 0.0)
+
+                    bad_15m = (rsi15 is not None and rsi15 <= rsi15_max) and (macdh15 is not None and macdh15 <= RK_MACDH15_MAX)
+                    bad_1h  = (rsi1h is not None and rsi1h <= rsi1h_max)
+                    vol_ok  = (rvol15 is not None and float(rvol15) >= rvol15_min)
+
+                    if bad_15m and bad_1h and vol_ok:
+                        logger.info(f"[rapid-kill] {symbol} RSI15={rsi15:.1f} MACDh15={macdh15:.3f} "
+                                    f"RSI1h={rsi1h:.1f} RVOL15={float(rvol15):.2f}")
+                        sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="rapid-kill")
+                        time.sleep(EXIT_CHECK_EVERY_SEC)
+                        continue
+                except Exception as e:
+                    logger.warning(f"[rapid-kill] check failed {symbol}: {e}")
+
+
                 if trade_is_closed():
                     logger.info(f"[trailing] {symbol} trade {trade_id} already closed — stopping trailing thread.")
                     return
@@ -3026,6 +3219,19 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 if c_stop is not None:
                     candidate = max(candidate, c_stop, initial_stop)
 
+                # Apply per-symbol trailing overrides (if any)
+                try:
+                    _bps, _floor = _get_trail_overrides(symbol)
+                    if _bps:
+                        clamp_by_bps = price * (1.0 - (int(_bps) * 0.0001))
+                        # widening = allow deeper pullback → take the LOWER of candidate and clamp_by_bps
+                        candidate = min(candidate, clamp_by_bps)
+                    if _floor:
+                        candidate = max(candidate, float(_floor))
+                except Exception as _e:
+                    logger.debug(f"trail override apply failed {symbol}: {_e}")
+
+
                 if (price - purchase_price) < 0.6 * initial_R:
                     grace_cap = purchase_price - 0.2 * initial_R
                     candidate = max(stop_price, min(candidate, grace_cap))
@@ -3073,6 +3279,38 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                                     continue
                             except Exception as _e:
                                 logger.warning(f"[exit-hold] check failed {symbol}: {_e}")
+
+                            # >>> EXIT HOLD-IN-VOLUME (HOOK EXITVOL)
+                            try:
+                                tf15 = quick_tf_snapshot(symbol, "15m", limit=60) or {}
+                                tf1h = quick_tf_snapshot(symbol, "1h",  limit=60) or {}
+                                rvol15_closed = (tf15.get("RVOL10_closed") or tf15.get("RVOL") or tf15.get("RVOL10"))
+                                rvol15_live   = (tf15.get("RVOL_live") or tf15.get("RVOL10_live"))
+                                adx1h = tf1h.get("ADX"); rsi1h = tf1h.get("RSI")
+
+                                HOLD_RVOL15_MIN     = float(os.getenv("HOLD_RVOL15_MIN", "1.50"))
+                                HOLD_RVOL1H_MIN     = float(os.getenv("HOLD_RVOL1H_MIN", "1.10"))
+                                HOLD_ADX1H_MIN      = float(os.getenv("HOLD_ADX1H_MIN", "30"))
+                                HOLD_PARTIAL_SELL   = float(os.getenv("HOLD_PARTIAL_SELL", "0.30"))
+
+                                wide_bps = 500 if base in {"BTC", "ETH"} else 700
+
+                                rvol_ok = ((rvol15_closed and rvol15_closed >= HOLD_RVOL15_MIN) or
+                                        (tf1h.get("RVOL") or tf1h.get("RVOL10") or 0) >= HOLD_RVOL1H_MIN)
+                                structure_up = (adx1h and adx1h >= HOLD_ADX1H_MIN) and (rsi1h and rsi1h >= 52.0)
+
+                                if rvol_ok and structure_up:
+                                    pos_qty = current_position_qty(symbol)
+                                    qty_partial = round(pos_qty * max(0.10, min(0.70, HOLD_PARTIAL_SELL)), 8)
+                                    if qty_partial * last_price >= MIN_NOTIONAL and qty_partial > 0:
+                                        execute_order_sell(symbol, qty_partial, signals={"reason": "volume-partial"})
+                                    set_symbol_trailing(symbol, trail_bps=wide_bps)  # widen trailing for the runner
+                                    logger.info(f"[exit-hold] {symbol}: RVOL ok & 1h structure up — partial + widen to {wide_bps}bps; defer full exit")
+                                    time.sleep(EXIT_CHECK_EVERY_SEC)
+                                    continue  # IMPORTANT: keep loop alive, skip full exit this pass
+                            except Exception as _e:
+                                logger.warning(f"[exit-hold] check failed {symbol}: {_e}")
+
 
                             sell_symbol(symbol, amount, trade_id, source="collapse")
                             return
@@ -3142,6 +3380,37 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                             (macdh15 is not None and macdh15 > MACDH15_MIN):
                                 logger.info(f"[exit-hold] {symbol}: strong 15m RVOL / 1h trend; deferring sell (reason=time-stop)")
                                 return
+                        except Exception as _e:
+                            logger.warning(f"[exit-hold] check failed {symbol}: {_e}")
+
+                        # >>> EXIT HOLD-IN-VOLUME (HOOK EXITVOL)
+                        try:
+                            tf15 = quick_tf_snapshot(symbol, "15m", limit=60) or {}
+                            tf1h = quick_tf_snapshot(symbol, "1h",  limit=60) or {}
+                            rvol15_closed = (tf15.get("RVOL10_closed") or tf15.get("RVOL") or tf15.get("RVOL10"))
+                            rvol15_live   = (tf15.get("RVOL_live") or tf15.get("RVOL10_live"))
+                            adx1h = tf1h.get("ADX"); rsi1h = tf1h.get("RSI")
+
+                            HOLD_RVOL15_MIN     = float(os.getenv("HOLD_RVOL15_MIN", "1.50"))
+                            HOLD_RVOL1H_MIN     = float(os.getenv("HOLD_RVOL1H_MIN", "1.10"))
+                            HOLD_ADX1H_MIN      = float(os.getenv("HOLD_ADX1H_MIN", "30"))
+                            HOLD_PARTIAL_SELL   = float(os.getenv("HOLD_PARTIAL_SELL", "0.30"))
+
+                            wide_bps = 500 if base in {"BTC", "ETH"} else 700
+
+                            rvol_ok = ((rvol15_closed and rvol15_closed >= HOLD_RVOL15_MIN) or
+                                    (tf1h.get("RVOL") or tf1h.get("RVOL10") or 0) >= HOLD_RVOL1H_MIN)
+                            structure_up = (adx1h and adx1h >= HOLD_ADX1H_MIN) and (rsi1h and rsi1h >= 52.0)
+
+                            if rvol_ok and structure_up:
+                                pos_qty = current_position_qty(symbol)
+                                qty_partial = round(pos_qty * max(0.10, min(0.70, HOLD_PARTIAL_SELL)), 8)
+                                if qty_partial * last_price >= MIN_NOTIONAL and qty_partial > 0:
+                                    execute_order_sell(symbol, qty_partial, signals={"reason": "volume-partial"})
+                                set_symbol_trailing(symbol, trail_bps=wide_bps)  # widen trailing for the runner
+                                logger.info(f"[exit-hold] {symbol}: RVOL ok & 1h structure up — partial + widen to {wide_bps}bps; defer full exit")
+                                time.sleep(EXIT_CHECK_EVERY_SEC)
+                                continue  # IMPORTANT: keep loop alive, skip full exit this pass
                         except Exception as _e:
                             logger.warning(f"[exit-hold] check failed {symbol}: {_e}")
 
@@ -3259,7 +3528,7 @@ def fetch_trade_legs(trade_id: str):
     cur.execute("""
         SELECT price, amount, ts
         FROM transactions
-        WHERE trade_id=? AND side='sell'
+        WHERE trade_id=? AND side='sell' AND status='closed'
         ORDER BY ts DESC LIMIT 1
     """, (trade_id,)); sell = cur.fetchone()
     cur.execute("SELECT side, features_json FROM trade_features WHERE trade_id=?", (trade_id,))
