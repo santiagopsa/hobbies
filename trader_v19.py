@@ -3264,18 +3264,6 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 if _floor:
                     candidate = max(candidate, float(_floor))                         # piso duro
 
-                # Apply per-symbol trailing overrides (if any)
-                try:
-                    _bps, _floor = _get_trail_overrides(symbol)
-                    if _bps:
-                        clamp_by_bps = price * (1.0 - (int(_bps) * 0.0001))
-                        # widening = allow deeper pullback → take the LOWER of candidate and clamp_by_bps
-                        candidate = min(candidate, clamp_by_bps)
-                    if _floor:
-                        candidate = max(candidate, float(_floor))
-                except Exception as _e:
-                    logger.debug(f"trail override apply failed {symbol}: {_e}")
-
 
                 if (price - purchase_price) < 0.6 * initial_R:
                     grace_cap = purchase_price - 0.2 * initial_R
@@ -3548,16 +3536,14 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
 
                 time.sleep(EXIT_CHECK_EVERY_SEC)
                 
-        except Exception as e:
+       except Exception as e:
             logger.error(f"Trailing error {symbol}: {e}")
             try:
-                # No cierres si el trade tiene segundos de vida: reintenta el loop
+                # Protección: si el trade es muy reciente, no cierres por un glitch, reintenta.
                 age_s = (datetime.now(timezone.utc) - opened_ts).total_seconds()
-                if age_s < 60:
-                    time.sleep(2)
-                    threading.Thread(target=loop, daemon=True).start()
-                    return
-                if not trade_is_closed():
+                if age_s is None or age_s < 30:   # 30s de gracia
+                    time.sleep(EXIT_CHECK_EVERY_SEC)
+                elif not trade_is_closed():
                     sell_symbol(symbol, amount, trade_id, source="trail")
             except Exception:
                 pass
