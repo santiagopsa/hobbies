@@ -3572,7 +3572,7 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
 
                 time.sleep(EXIT_CHECK_EVERY_SEC)
                 
-       except Exception as e:
+        except Exception as e:
             logger.error(f"Trailing error {symbol}: {e}")
             try:
                 # Protección: si el trade es muy reciente, no cierres por un glitch, reintenta.
