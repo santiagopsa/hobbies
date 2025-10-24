@@ -140,6 +140,27 @@ MIN_NOTIONAL = 8.0
 MAX_OPEN_TRADES = 5
 RESERVE_USDT = 20.0
 RISK_FRACTION = 0.18  # base fraction per trade (modulated)
+# ==== Scale-in / Pyramiding ====
+ALLOW_SCALE_IN = True                 # activar re-compras en el mismo símbolo
+SCALE_IN_MAX_BUYS_PER_SYMBOL = 2      # 1 base + 1 add-on
+SCALE_IN_ADD_FRACTION = 0.55          # tamaño del add-on vs el tamaño base teórico
+SCALE_IN_MIN_ADX_1H = 22.0            # exige tendencia decente
+SCALE_IN_STRONG_ADX_1H = 35.0         # atajo de fuerza HTF
+SCALE_IN_STRONG_ADX_4H = 25.0
+SCALE_IN_MIN_RVOL15_CLOSED = 1.10     # cinta viva en 15m (closed bar RVOL)
+SCALE_IN_MIN_RVOL15_CLOSED_RELAX = 1.00
+SCALE_IN_MIN_RVOL15_LIVE = 1.40
+SCALE_IN_COOLDOWN_MIN = 20            # enfriar entre add-ons en el mismo símbolo (min)
+SCALE_IN_MIN_R_MULT = 1.0             # sólo si el trade ya está >= 1R desde la entrada
+
+# ==== Slot stealing / rotation ====
+SLOT_STEAL_ENABLED = True
+SLOT_STEAL_MAX_PER_DAY = 3
+SLOT_STEAL_MIN_CONF = 65
+SLOT_STEAL_SCORE_DELTA = 1.2
+SLOT_STEAL_MIN_HOLD_MINUTES = 15
+SLOT_STEAL_MIN_NOTIONAL = 50.0  # no intentes rotar por montos muy bajos
+
 MIN_RESERVE_USDT = RESERVE_USDT
 # Decision params (defaults)
 DECISION_TIMEFRAME = "1h"
@@ -1704,12 +1725,19 @@ def controller_autotune():
         execs = sum(1 for (e,) in rows if e == 1)
         ratio = execs / len(rows)
         gate = get_score_gate()
+        # === Bull-aware step ===
+        try:
+            mk_bull, _, _ = is_market_bullish()
+        except Exception:
+            mk_bull = False
+        step = GATE_STEP * (2.0 if (mk_bull and ratio < (TARGET_BUY_RATIO - BUY_RATIO_DELTA)) else 1.0)
         if ratio < (TARGET_BUY_RATIO - BUY_RATIO_DELTA):
-            gate = set_score_gate(gate - GATE_STEP)
-            logger.info(f"[controller] Low buy ratio {ratio:.2f} < target {TARGET_BUY_RATIO:.2f}. Decreasing score_gate -> {gate:.2f}")
+            gate = set_score_gate(gate - step)
+            logger.info(f"[controller] Low buy ratio {ratio:.2f} < target {TARGET_BUY_RATIO:.2f}. Decreasing score_gate -> {gate:.2f} (step {step:.2f})")
         elif ratio > (TARGET_BUY_RATIO + BUY_RATIO_DELTA):
-            gate = set_score_gate(gate + GATE_STEP)
-            logger.info(f"[controller] High buy ratio {ratio:.2f} > target {TARGET_BUY_RATIO:.2f}. Increasing score_gate -> {gate:.2f}")
+            gate = set_score_gate(gate + step)
+            logger.info(f"[controller] High buy ratio {ratio:.2f} > target {TARGET_BUY_RATIO:.2f}. Increasing score_gate -> {gate:.2f} (step {step:.2f})")
+
     except Exception as e:
         logger.debug(f"controller_autotune error: {e}")
 
@@ -2371,9 +2399,17 @@ def hybrid_decision(symbol: str):
     trades_today, losers_last, n_last = daily_trade_counts()
     if trades_today >= DAILY_TRADE_THROTTLE_N or (n_last >= LOSS_STREAK_WINDOW and losers_last >= LOSS_STREAK_MAX):
         # In throttle mode we require both trend & volume proof
-        if not (adx4h_now and adx4h_rising_gate and (rv15_closed or 0) >= 1.5):
-            blocks.append("HARD block: throttle mode → need 4h ADX rising & RVOL15_closed≥1.5")
+        rvol_req = 1.5
+        try:
+            mk_bull, _, _ = is_market_bullish()
+            if mk_bull:
+                rvol_req = 1.3
+        except Exception:
+            pass
+        if not (adx4h_now and adx4h_rising_gate and (rv15_closed or 0) >= rvol_req):
+            blocks.append(f"HARD block: throttle mode → need 4h ADX rising & RVOL15_closed≥{rvol_req}")
             level = "HARD"
+
 
 
     # Two scratches in <2h → block for 60m
@@ -3953,6 +3989,178 @@ def crash_halt():
     except Exception:
         return False
 
+# =========================
+# Scale-in / Slot-steal helpers
+# =========================
+
+def _open_buys_for_symbol(symbol: str) -> list[dict]:
+    conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+    cur.execute("""SELECT id, trade_id, symbol, price, amount, ts, confidence
+                   FROM transactions
+                   WHERE symbol=? AND side='buy' AND status='open'""", (symbol,))
+    rows = cur.fetchall(); conn.close()
+    out = []
+    for (iid, tid, sym, px, amt, ts, conf) in rows:
+        out.append({"id": iid, "trade_id": tid, "symbol": sym, "price": float(px),
+                    "amount": float(amt), "ts": ts, "confidence": int(conf or 0)})
+    return out
+
+def _open_buys_all() -> list[dict]:
+    conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+    cur.execute("""SELECT id, trade_id, symbol, price, amount, ts, confidence
+                   FROM transactions
+                   WHERE side='buy' AND status='open'""")
+    rows = cur.fetchall(); conn.close()
+    out = []
+    for (iid, tid, sym, px, amt, ts, conf) in rows:
+        out.append({"id": iid, "trade_id": tid, "symbol": sym, "price": float(px),
+                    "amount": float(amt), "ts": ts, "confidence": int(conf or 0)})
+    return out
+
+def _minutes_since(dt_iso: str) -> float:
+    try:
+        dt = datetime.fromisoformat(dt_iso.replace("Z",""))  # tolera 'Z'
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
+    except Exception:
+        return 9999.0
+
+def _last_closed_rvol15(symbol: str) -> float | None:
+    return get_rvol_closed(symbol, timeframe="15m")
+
+def get_rvol_live(symbol: str, timeframe: str = "15m") -> float | None:
+    snap = quick_tf_snapshot(symbol, timeframe=timeframe, limit=120) or {}
+    return (snap.get('RVOL10') or snap.get('RVOL') or snap.get('RVOL10_live'))
+
+def get_macd_hist(symbol: str, timeframe: str = "15m") -> float | None:
+    snap = quick_tf_snapshot(symbol, timeframe=timeframe, limit=120) or {}
+    return snap.get('MACDh')
+
+def price_above_ema(symbol: str, timeframe: str = "15m", length: int = 20) -> bool:
+    snap = quick_tf_snapshot(symbol, timeframe=timeframe, limit=120) or {}
+    last = snap.get('last'); ema20 = snap.get('EMA20') if length == 20 else None
+    return bool(last is not None and ema20 is not None and last > ema20)
+
+def _calc_scale_in_amount(symbol: str, price: float) -> float:
+    try:
+        bal = exchange.fetch_balance() or {}
+        usdt_free = float(bal.get('free', {}).get('USDT', 0.0) or 0.0)
+        opens = _open_buys_for_symbol(symbol)
+        conf = int(opens[0]['confidence']) if opens else 60
+        base_amt = size_position(price, usdt_free, confidence=conf, symbol=symbol)
+        desired = base_amt * SCALE_IN_ADD_FRACTION
+        amt, _ = _prepare_buy_amount(symbol, desired, price)
+        return float(max(0.0, amt))
+    except Exception:
+        return 0.0
+
+def _unrealized_pct(row: dict) -> float:
+    try:
+        nowp = get_last_price(row["symbol"])
+        return (nowp / row["price"] - 1.0) * 100.0
+    except Exception:
+        return -999.0
+
+def _todays_slot_steals() -> int:
+    try:
+        s, e = _today_range_utc()
+        conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+        cur.execute("""SELECT COUNT(*) FROM decision_log
+                       WHERE ts>=? AND ts<? AND action='slot-steal'""", (s, e))
+        n = int(cur.fetchone()[0] or 0); conn.close(); return n
+    except Exception:
+        return 0
+
+def _sell_row(row: dict, reason: str = "slot-steal") -> bool:
+    try:
+        ok = False
+        try:
+            ok, msg = sell_symbol(row["symbol"], amount=row["amount"], trade_id=row["trade_id"])
+        except TypeError:
+            sell_symbol(row["symbol"], amount=row["amount"], trade_id=row["trade_id"])
+            ok = True
+        try:
+            log_decision(row["symbol"], 0.0, "slot-steal", True)
+        except Exception:
+            pass
+        logger.info(f"slot-steal SELL {row['symbol']} → {ok}")
+        return ok
+    except Exception as e:
+        logger.debug(f"slot-steal sell failed {row['symbol']}: {e}")
+        return False
+
+def maybe_slot_steal(symbol: str, need_notional: float, score: float, conf: int) -> bool:
+    if not SLOT_STEAL_ENABLED: return False
+    if _todays_slot_steals() >= SLOT_STEAL_MAX_PER_DAY: return False
+    try:
+        gate = get_score_gate()
+    except Exception:
+        gate = SCORE_GATE_START
+    try:
+        snap1h = quick_tf_snapshot(symbol, '1h', limit=120) or {}
+        adx1h = float(snap1h.get('ADX') or 0.0)
+    except Exception:
+        adx1h = 0.0
+    min_conf = SLOT_STEAL_MIN_CONF - (5 if adx1h >= 30 else 0)
+    delta = SLOT_STEAL_SCORE_DELTA - (0.2 if adx1h >= 30 else 0.0)
+
+    if int(conf) < min_conf: return False
+    if float(score) < (float(gate) + float(delta)): return False
+    if need_notional < max(SLOT_STEAL_MIN_NOTIONAL, MIN_NOTIONAL): return False
+
+    candidates = [r for r in _open_buys_all()
+                  if r["symbol"] != symbol and _minutes_since(r["ts"]) >= SLOT_STEAL_MIN_HOLD_MINUTES]
+    if not candidates: return False
+
+    candidates.sort(key=lambda r: (_unrealized_pct(r), r["confidence"]))  # más negativo primero
+
+    def current_spendable():
+        util, total, free, used = portfolio_utilization()
+        return max(0.0, min(free, PORTFOLIO_MAX_UTIL * total - used) - MIN_RESERVE_USDT)
+
+    sold_any = False
+    for r in candidates:
+        if current_spendable() >= need_notional: break
+        sold_any |= _sell_row(r, reason="slot-steal")
+    return sold_any and (current_spendable() >= need_notional * 0.98)
+
+def _can_scale_in_now(symbol: str, entry_price: float | None = None) -> bool:
+    df1h = fetch_and_prepare_data_hybrid(symbol, timeframe="1h", limit=120)
+    if df1h is None or len(df1h) < 30: return False
+    adx1h = float(df1h['ADX'].iloc[-1]) if pd.notna(df1h['ADX'].iloc[-1]) else 0.0
+    df4h = fetch_and_prepare_data_hybrid(symbol, timeframe="4h", limit=120)
+    adx4h = float(df4h['ADX'].iloc[-1]) if (df4h is not None and pd.notna(df4h['ADX'].iloc[-1])) else 0.0
+
+    rv15_closed = _last_closed_rvol15(symbol) or 0.0
+    rv15_live   = get_rvol_live(symbol, timeframe="15m") or 0.0
+    macdh_15    = get_macd_hist(symbol, timeframe="15m") or 0.0
+    ema_ok_15   = price_above_ema(symbol, timeframe="15m", length=20)
+
+    try:
+        opens = _open_buys_for_symbol(symbol)
+        if not opens: return False
+        base = min(opens, key=lambda r: r["ts"])
+        px_now = get_last_price(symbol)
+        atr1h = float(ta.atr(df1h['high'], df1h['low'], df1h['close'], length=14).iloc[-1] or 0.0)
+        if not atr1h or not px_now: return False
+        if (px_now - base["price"]) < (SCALE_IN_MIN_R_MULT * atr1h):
+            return False
+    except Exception:
+        return False
+
+    try:
+        last_ts = max(r["ts"] for r in opens)
+        if _minutes_since(last_ts) < SCALE_IN_COOLDOWN_MIN: return False
+        if len(opens) >= SCALE_IN_MAX_BUYS_PER_SYMBOL: return False
+    except Exception:
+        pass
+
+    route1 = (adx1h >= SCALE_IN_MIN_ADX_1H) and (
+              rv15_closed >= SCALE_IN_MIN_RVOL15_CLOSED or
+             (rv15_closed >= SCALE_IN_MIN_RVOL15_CLOSED_RELAX and rv15_live >= SCALE_IN_MIN_RVOL15_LIVE)
+            )
+    route2 = ((adx1h >= SCALE_IN_STRONG_ADX_1H) or (adx4h >= SCALE_IN_STRONG_ADX_4H)) and (macdh_15 > 0 or ema_ok_15)
+    return bool(route1 or route2)
+
 def strong_symbol_momentum_15m(symbol: str) -> bool:
     if not CRASH_HALT_ENABLE_OVERRIDE:
         return False
@@ -4010,10 +4218,42 @@ def trade_once_with_report(symbol: str):
     try:
         # 1) Ya hay posición abierta en este símbolo
         if has_open_position(symbol):
+            # Intento de scale-in si hay tendencia y límites
+            if ALLOW_SCALE_IN:
+                try:
+                    if _can_scale_in_now(symbol):
+                        price = get_last_price(symbol)
+                        amt = _calc_scale_in_amount(symbol, price)
+                        if amt > 0:
+                            # ATR abs para trailing
+                            df1h_si = fetch_and_prepare_data_hybrid(symbol, timeframe="1h", limit=120)
+                            atr_abs = float(df1h_si['ATR'].iloc[-1]) if (df1h_si is not None and pd.notna(df1h_si['ATR'].iloc[-1])) else 0.0
+                            snap15 = quick_tf_snapshot(symbol, "15m", limit=120) or {}
+                            snap1h = quick_tf_snapshot(symbol, "1h", limit=120) or {}
+                            order = execute_order_buy(symbol, amt, {
+                                'adx': float(snap1h.get('ADX') or 0.0),
+                                'rsi': float(snap1h.get('RSI') or 0.0),
+                                'rvol': float(snap1h.get('RVOL10') or 0.0),
+                                'atr': atr_abs,
+                                'score': 0.0,
+                                'confidence': int((_open_buys_for_symbol(symbol)[0]['confidence']) if _open_buys_for_symbol(symbol) else 60),
+                            })
+                            if order:
+                                report["executed"] = True
+                                report["action"] = "buy"
+                                report["note"] = "scale-in"
+                                log_decision(symbol, 0.0, "buy-scale-in", True)
+                                logger.info(f"{symbol}: SCALE-IN @ {order['price']} ({amt} units)")
+                                dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], atr_abs)
+                                return report
+                except Exception as _e:
+                    logger.debug(f"scale-in check failed {symbol}: {_e}")
+
             report["note"] = "already holding"
             logger.info(f"{symbol}: {report['note']}")
             log_decision(symbol, 0.0, "hold", False)
             return report
+
 
         # 2) Chequeo de utilización de portafolio
         util, total, free, used = portfolio_utilization()
@@ -4122,19 +4362,41 @@ def trade_once_with_report(symbol: str):
                 report["note"] = f"amount rejected by filters: {reason}"
                 log_decision(symbol, score, "hold", False)
                 return report
-
             trade_val = amount * price
             if trade_val > free_after_reserve:
-                # Ultra-defensa: si después del piso de step/minQty nos pasamos de presupuesto, reduce un pelín
-                # y vuelve a pisar al step. Si no entra, aborta.
-                shrink_amt = max(0.0, (free_after_reserve * 0.998) / price)
-                amount2, reason2 = _prepare_buy_amount(symbol, shrink_amt, price)
-                if amount2 <= 0 or (amount2 * price) > free_after_reserve:
-                    report["note"] = f"insufficient USDT for filtered amount ({trade_val:.2f} > {free_after_reserve:.2f})"
-                    log_decision(symbol, score, "hold", False)
-                    return report
-                amount = amount2
+                # 0) Intentar rotación de slots si la señal es élite
+                try:
+                    need = max(0.0, trade_val - free_after_reserve)
+                    if SLOT_STEAL_ENABLED and maybe_slot_steal(
+                        symbol, need_notional=need, score=float(score), conf=int(conf)
+                    ):
+                        # Recalcular presupuesto disponible respetando límites de portafolio
+                        try:
+                            util, total, free, used = portfolio_utilization()
+                            free_after_reserve = max(
+                                0.0,
+                                min(free, PORTFOLIO_MAX_UTIL * total - used) - MIN_RESERVE_USDT
+                            )
+                        except Exception:
+                            balances = exchange.fetch_balance() or {}
+                            usdt = float(balances.get('free', {}).get('USDT', 0.0) or 0.0)
+                            free_after_reserve = max(0.0, usdt - RESERVE_USDT)
+                except Exception as _e:
+                    logger.debug(f"slot-steal attempt failed {symbol}: {_e}")
+
+                # 1) Revalidar tras posible rotación
                 trade_val = amount * price
+                if trade_val > free_after_reserve:
+                    # 2) Ultra-defensa: reducir un pelín y ajustar al step/minQty. Si no entra, abortar.
+                    shrink_amt = max(0.0, (free_after_reserve * 0.998) / price)
+                    amount2, reason2 = _prepare_buy_amount(symbol, shrink_amt, price)
+                    if amount2 <= 0 or (amount2 * price) > free_after_reserve:
+                        report["note"] = f"insufficient USDT for filtered amount ({trade_val:.2f} > {free_after_reserve:.2f})"
+                        log_decision(symbol, score, "hold", False)
+                        return report
+                    amount = amount2
+                    trade_val = amount * price
+
 
             # 9) Ejecutar compra y lanzar trailing
             order = execute_order_buy(symbol, amount, {
@@ -4335,7 +4597,7 @@ if __name__ == "__main__":
 
             cycle_decisions = []
             
-                        # >>> FGI Cycle Gate (ANCHOR FGI3)
+            # >>> FGI Cycle Gate (ANCHOR FGI3)
             try:
                 mk_bull, fgi_v, tag = is_market_bullish()
                 # Si hay extreme fear y además el régimen está apagado, pausamos ciclo (low-frequency en bears)
