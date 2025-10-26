@@ -2155,6 +2155,20 @@ def hybrid_decision(symbol: str):
 
     # ===== local 1h features =====
     in_lane = bool(row['EMA20'] > row['EMA50'] and row['close'] > row['EMA20'])
+    # --- RVOL/ADX locals (safe) ---
+    def _f(x, d=0.0):
+        try:
+            return float(x) if x is not None else d
+        except Exception:
+            return d
+
+    # Expect tf15/tf1h/row to exist already in this scope
+    rv15      = _f((tf15.get('RVOL10') if isinstance(tf15, dict) else None) or (tf15.get('RVOL') if isinstance(tf15, dict) else None))
+    rvol_1h   = _f((tf1h.get('RVOL10') if isinstance(tf1h, dict) else None) or (tf1h.get('RVOL') if isinstance(tf1h, dict) else None) or row.get('RVOL1h'))
+    adx1_now  = _f((tf1h.get('ADX') if isinstance(tf1h, dict) else None) or row.get('ADX1h'))
+    adx1_prev = _f((tf1h.get('ADX_prev') if isinstance(tf1h, dict) else None) or (tf1h.get('ADX_lag1') if isinstance(tf1h, dict) else None) or (tf1h.get('ADX-1') if isinstance(tf1h, dict) else None))
+    adx_slope_1h = adx1_now - adx1_prev
+
     # Early-breakout override: price>EMA20 + RVOL1h≥1.20 + ADX slope>0
     override_in_lane = (row['close'] > row['EMA20']) and ((rvol_1h or 0) >= 1.20) and (adx_slope_1h > 0)
     if not in_lane and override_in_lane:
