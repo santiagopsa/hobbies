@@ -2169,6 +2169,28 @@ def hybrid_decision(symbol: str):
     adx1_prev = _f((tf1h.get('ADX_prev') if isinstance(tf1h, dict) else None) or (tf1h.get('ADX_lag1') if isinstance(tf1h, dict) else None) or (tf1h.get('ADX-1') if isinstance(tf1h, dict) else None))
     adx_slope_1h = adx1_now - adx1_prev
 
+    # --- RVOL/ADX locals (safe) ---
+    def _f(x, d=0.0):
+        try:
+            return float(x) if x is not None else d
+        except Exception:
+            return d
+
+    # Ensure dict-like views
+    tf15d = tf15 if isinstance(tf15, dict) else {}
+    tf1hd = tf1h if isinstance(tf1h, dict) else {}
+
+    # RVOL (15m & 1h), ADX now/prev, and slope
+    rv15_closed = _f(tf15d.get('RVOL10', tf15d.get('RVOL')))
+    rvol_1h     = _f(tf1hd.get('RVOL10', tf1hd.get('RVOL', row.get('RVOL1h'))))
+    adx1_now    = _f(tf1hd.get('ADX', row.get('ADX1h')))
+    adx1_prev   = _f(tf1hd.get('ADX_prev', tf1hd.get('ADX_lag1', tf1hd.get('ADX-1'))))
+    adx_slope_1h = adx1_now - adx1_prev
+
+    # Optional alias if other blocks reference 'rv15'
+    rv15 = rv15_closed
+
+
     # Early-breakout override: price>EMA20 + RVOL1h≥1.20 + ADX slope>0
     override_in_lane = (row['close'] > row['EMA20']) and ((rvol_1h or 0) >= 1.20) and (adx_slope_1h > 0)
     if not in_lane and override_in_lane:
