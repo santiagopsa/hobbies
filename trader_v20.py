@@ -1,7 +1,7 @@
 
 
 # =========================
-# trader_v20.py
+# trader_vX.py -- ver variable VERSION
 # =========================
 from __future__ import annotations
 from pathlib import Path
@@ -22,6 +22,8 @@ load_dotenv()
 
 # >>> STRATEGY PROFILE (ANCHOR SP0)
 # Selector de estrategia
+
+VERSION = "v20"
 PARK_IN_MOMENTUM = bool(int(os.getenv("PARK_IN_MOMENTUM", "0")))
 
 STRATEGY_PROFILES = {"USDT_MOMENTUM", "BTC_PARK", "AUTO_HYBRID"}
@@ -223,6 +225,13 @@ ARM_TRAIL_PCT = float(os.getenv("ARM_TRAIL_PCT", "0.7"))  # arm trailing only af
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+APP_NAME    = os.getenv("APP_NAME", "HybridTrader")
+BOT_VERSION = os.getenv("BOT_VERSION", VERSION)  # e.g., v20.0.1 or a git short SHA
+def _tg_prefix() -> str:
+    # Keep it short; avoid weird markdown collisions
+    return f"[{APP_NAME} {BOT_VERSION}] "
+
 
 # Exit mode & cadence
 EXIT_MODE = os.getenv("EXIT_MODE", "hybrid")  # "price" | "indicators" | "hybrid"
@@ -638,23 +647,30 @@ def _prepare_sell_amount(symbol, desired_amt, px):
 # =========================
 # Telegram helpers
 # =========================
-def send_telegram_message(text: str):
+def send_telegram_message(text: str, *, no_prefix: bool = False):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=8)
+        prefix = "" if no_prefix else _tg_prefix()
+        requests.post(
+            url,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": prefix + text, "parse_mode": "Markdown"},
+            timeout=8
+        )
     except Exception as e:
         logger.error(f"Telegram sendMessage error: {e}")
 
-def send_telegram_document(file_path: str, caption: str = ""):
+
+def send_telegram_document(file_path: str, caption: str = "", *, no_prefix: bool = False):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
         with open(file_path, "rb") as f:
             files = {"document": (os.path.basename(file_path), f, "application/json")}
-            data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]}
+            cap = ("" if no_prefix else _tg_prefix()) + (caption or "")
+            data = {"chat_id": TELEGRAM_CHAT_ID, "caption": cap[:1024]}
             requests.post(url, files=files, data=data, timeout=60)
     except Exception as e:
         logger.error(f"Telegram sendDocument error: {e}")
@@ -665,6 +681,7 @@ def send_telegram_document(file_path: str, caption: str = ""):
             send_telegram_message(f"*Document upload failed; inline snippet:*\n```\n{snippet}\n```")
         except Exception as e2:
             logger.error(f"Telegram fallback snippet error: {e2}")
+
 
 # =========================
 # Overrides de trailing por símbolo (bps y piso absoluto)
@@ -3851,13 +3868,22 @@ def analyze_and_learn(trade_id: str, sell_price: float = None, learn_enabled: bo
             msg = (
                 f"{sign} *Trade Analysis* `{symbol}`\n"
                 f"PnL: `{pnl_pct:.2f}%` (`{pnl_usdt:.3f}` USDT)  |  Duration: `{mins}m`\n"
-                f"Learn: `{'on' if do_learn else 'off'}`  Adjustments: `{', '.join(adjustments.keys()) or '—'}`"
+                f"Ver: `{BOT_VERSION}`  Profile: `{STRATEGY_PROFILE}`  Learn: `{'on' if do_learn else 'off'}`\n"
+                f"Adjustments: `{', '.join(adjustments.keys()) or '—'}`"
             )
             send_telegram_message(msg)
 
             out_path = f"analysis_{trade_id.replace(':','-').replace('/','_')}.json"
             with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(analysis | {"adjustments": adjustments, "learn_enabled": do_learn}, f, indent=2, ensure_ascii=False)
+                json.dump(
+                    analysis | {
+                        "adjustments": adjustments,
+                        "learn_enabled": do_learn,
+                        "version": BOT_VERSION,
+                        "profile": STRATEGY_PROFILE
+                    },
+                    f, indent=2, ensure_ascii=False
+                )
             send_telegram_document(out_path, caption=f"{symbol} trade analysis (trade {trade_id})")
             try: os.remove(out_path)
             except Exception: pass
@@ -4462,6 +4488,8 @@ def write_status_json(decisions: list, path: str = "status.json"):
             "usdt": usdt,
             "score_gate": get_score_gate(),
             "decisions": decisions,
+            "version": BOT_VERSION,   # ← usa el heredado de VERSION o el del entorno
+            "app_name": APP_NAME
         }
         with open(path, "w") as f:
             json.dump(payload, f, indent=2)
@@ -4592,7 +4620,6 @@ def startup_cleanup():
 # Main loop (r4.2)
 # =========================
 if __name__ == "__main__":
-    VERSION = "v20"
     logger.info(f"Starting hybrid trader ({VERSION}, profile={STRATEGY_PROFILE})…")
     try:
         try: exchange.load_markets()
