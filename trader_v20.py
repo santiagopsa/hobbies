@@ -210,7 +210,7 @@ FEE_BPS_PER_SIDE = float(os.getenv("FEE_BPS_PER_SIDE", "10"))
 EDGE_SAFETY_MULT = float(os.getenv("EDGE_SAFETY_MULT", "1.3"))
 
 # >>> PATCH: ENTRY EDGE / QUALITY / COOLDOWNS (ANCHOR EDGE1)
-ENTRY_EDGE_MULT = float(os.getenv("ENTRY_EDGE_MULT", "2.5"))         # x required_edge_pct for entry
+ENTRY_EDGE_MULT = float(os.getenv("ENTRY_EDGE_MULT", "2.0"))         # x required_edge_pct for entry
 RVOL15_ENTRY_MIN = float(os.getenv("RVOL15_ENTRY_MIN", "1.2"))       # closed 15m RVOL floor for momentum entries
 RVOL15_BREAKOUT_MIN = float(os.getenv("RVOL15_BREAKOUT_MIN", "1.5")) # closed RVOL needed when 4h trend is weak (<20)
 
@@ -2129,7 +2129,25 @@ def hybrid_decision(symbol: str):
     except Exception:
         projected_move = None
 
-    need_edge = required_edge_pct() * ENTRY_EDGE_MULT
+    # Local tape strength for dynamic softening
+    try:
+        adx_local  = float(row['ADX']) if pd.notna(row['ADX']) else 0.0
+        rvol1_local = float(row['RVOL10']) if pd.notna(row['RVOL10']) else 0.0
+    except Exception:
+        adx_local, rvol1_local = 0.0, 0.0
+
+    edge_mult_eff = 1.7 if (rvol1_local >= 1.30 or adx_local >= 30.0) else ENTRY_EDGE_MULT  # specific numbers
+    need_edge = required_edge_pct() * edge_mult_eff
+
+    if projected_move is not None and projected_move < need_edge:
+        msg = f"projected move {projected_move:.2f}% < req {need_edge:.2f}% (fees x{edge_mult_eff:.1f})"
+        if (rvol1_local >= 1.30 or adx_local >= 30.0):
+            blocks.append("SOFT block: " + msg)
+            if level != "HARD": level = "SOFT"
+        else:
+            blocks.append("HARD block: " + msg)
+            level = "HARD"
+
     if projected_move is not None and projected_move < need_edge:
         blocks.append(f"HARD block: projected move {projected_move:.2f}% < req {need_edge:.2f}% (fees x{ENTRY_EDGE_MULT:.1f})")
         level = "HARD"
@@ -2137,6 +2155,12 @@ def hybrid_decision(symbol: str):
 
     # ===== local 1h features =====
     in_lane = bool(row['EMA20'] > row['EMA50'] and row['close'] > row['EMA20'])
+    # Early-breakout override: price>EMA20 + RVOL1h≥1.20 + ADX slope>0
+    override_in_lane = (row['close'] > row['EMA20']) and ((rvol_1h or 0) >= 1.20) and (adx_slope_1h > 0)
+    if not in_lane and override_in_lane:
+        blocks.append("SOFT override: early-breakout (px>EMA20, RVOL1h≥1.20, ADX slope>0)")
+        in_lane = True
+
     adx = float(row['ADX']) if pd.notna(row['ADX']) else 0.0
     rvol_1h = float(row['RVOL10']) if pd.notna(row['RVOL10']) else None
     price_slope = float(row.get('PRICE_SLOPE10', 0.0) or 0.0)
@@ -2273,9 +2297,20 @@ def hybrid_decision(symbol: str):
     # ===== 15m weakness/4h OB hard-blocks (keep) =====
     try:
         rsi_15 = tf15.get('RSI'); macdh_15 = tf15.get('MACDh')
+        # Improvement = RVOL (1h or 15m) waking + ADX improving/strong
+        rv15_closed = (tf15.get('RVOL10') or tf15.get('RVOL') or 0)
+        improving = (
+            ((rvol_1h or 0) >= 1.10 or (rv15_closed or 0) >= 1.10) and
+            ((adx_slope_1h > 0) or (adx is not None and adx >= 25.0))
+        )
         if (macdh_15 is not None and macdh_15 < 0) and (rsi_15 is not None and rsi_15 < 48):
-            blocks.append("HARD block: 15m weakness")
-            level = "HARD"
+            if improving:
+                blocks.append("SOFT block: 15m weakness but improving (MACDh≤0, RVOL/ADX improving)")
+                if level != "HARD": level = "SOFT"
+            else:
+                blocks.append("HARD block: 15m weakness")
+                level = "HARD"
+
     except Exception:
         pass
     try:
@@ -3156,6 +3191,32 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                         continue
                 except Exception as e:
                     logger.warning(f"[rapid-kill] check failed {symbol}: {e}")
+
+                # >>> TIGHT TRAIL @ +3% (HOOK TIGHT3)
+                try:
+                    up_pct = (last_price / entry_price - 1.0) * 100.0
+                    if up_pct >= 3.00:
+                        # BE + fees floor
+                        total_fee_bps = int(round(FEE_BPS_PER_SIDE * 2))  # buy+sell
+                        be_plus_fees_floor = entry_price * (1.0 + total_fee_bps / 10000.0)
+
+                        # ATR-aware trailing width (specific constants)
+                        # base: max( ATR% * 160 bps, 90 bps ); boost to min( ATR% * 180 bps, 110 bps )
+                        trail_bps = max(int((atr_pct or 0.0) * 160.0), 90)
+                        # get fresh context
+                        tf15c = quick_tf_snapshot(symbol, "15m", limit=40) or {}
+                        tf1hc = quick_tf_snapshot(symbol, "1h",  limit=60) or {}
+                        rvol15_closed = (tf15c.get("RVOL10_closed") or tf15c.get("RVOL") or tf15c.get("RVOL10") or 0.0)
+                        adx1h = float(tf1hc.get("ADX") or 0.0)
+
+                        if adx1h >= 30.0 or rvol15_closed >= 1.30:
+                            trail_bps = min(max(int((atr_pct or 0.0) * 180.0), 90), 110)
+
+                        # keep it alive 30 minutes; the manager re-applies as needed
+                        set_symbol_trailing(symbol, trail_bps=trail_bps, absolute_floor=be_plus_fees_floor, ttl_sec=1800)
+                        logger.info(f"[tight3] +3% reached — set trail {trail_bps}bps & BE+fees floor")
+                except Exception as _e:
+                    logger.debug(f"[tight3] skipped: {_e}")
 
 
                 if trade_is_closed():
