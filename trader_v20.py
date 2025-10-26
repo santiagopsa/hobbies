@@ -2169,50 +2169,30 @@ def hybrid_decision(symbol: str):
     adx1_prev = _f((tf1h.get('ADX_prev') if isinstance(tf1h, dict) else None) or (tf1h.get('ADX_lag1') if isinstance(tf1h, dict) else None) or (tf1h.get('ADX-1') if isinstance(tf1h, dict) else None))
     adx_slope_1h = adx1_now - adx1_prev
 
-    # --- RVOL/ADX locals (safe) ---
-    def _f(x, d=0.0):
+    # --- FIX: ensure RVOL/ADX locals exist (safe, no 'tf1h'/'tf15' reference) ---
+    def _fx(x, d=0.0):
         try:
             return float(x) if x is not None else d
         except Exception:
             return d
 
-    # Ensure dict-like views
-    tf15d = tf15 if isinstance(tf15, dict) else {}
-    tf1hd = tf1h if isinstance(tf1h, dict) else {}
+    # Grab whatever might already exist without touching the local names that are assigned later
+    _tmp_tf15 = locals().get('tf15', None)
+    _tmp_tf1h = locals().get('tf1h', None)
 
-    # RVOL (15m & 1h), ADX now/prev, and slope
-    rv15_closed = _f(tf15d.get('RVOL10', tf15d.get('RVOL')))
-    rvol_1h     = _f(tf1hd.get('RVOL10', tf1hd.get('RVOL', row.get('RVOL1h'))))
-    adx1_now    = _f(tf1hd.get('ADX', row.get('ADX1h')))
-    adx1_prev   = _f(tf1hd.get('ADX_prev', tf1hd.get('ADX_lag1', tf1hd.get('ADX-1'))))
+    # If not dicts yet, pull lightweight snapshots
+    tf15d = _tmp_tf15 if isinstance(_tmp_tf15, dict) else (quick_tf_snapshot(symbol, "15m", limit=60) or {})
+    tf1hd = _tmp_tf1h if isinstance(_tmp_tf1h, dict) else (quick_tf_snapshot(symbol, "1h",  limit=60) or {})
+
+    # RVOL (closed preferred), ADX slope
+    rv15_closed  = _fx(tf15d.get('RVOL10', tf15d.get('RVOL')))
+    rvol_1h      = _fx(tf1hd.get('RVOL10', tf1hd.get('RVOL', row.get('RVOL1h'))))
+    adx1_now     = _fx(tf1hd.get('ADX', row.get('ADX1h')))
+    adx1_prev    = _fx(tf1hd.get('ADX_prev', tf1hd.get('ADX_lag1', tf1hd.get('ADX-1'))))
     adx_slope_1h = adx1_now - adx1_prev
 
-    # Optional alias if other blocks reference 'rv15'
+    # Optional alias used elsewhere
     rv15 = rv15_closed
-
-    # --- FIX: ensure snapshots + safe locals before using rvol_1h/ADX slope ---
-    # make sure we have 15m/1h mini-snapshots available in this scope
-    _tf15 = locals().get('tf15')
-    _tf1h = locals().get('tf1h')
-    tf15  = _tf15 if isinstance(_tf15, dict) else (quick_tf_snapshot(symbol, "15m", limit=60) or {})
-    tf1h  = _tf1h if isinstance(_tf1h, dict) else (quick_tf_snapshot(symbol, "1h",  limit=60) or {})
-
-    def _f(x, d=0.0):
-        try:
-            return float(x) if x is not None else d
-        except Exception:
-            return d
-
-    # safe dict-views
-    tf15d = tf15 if isinstance(tf15, dict) else {}
-    tf1hd = tf1h if isinstance(tf1h, dict) else {}
-
-    # compute the values that override_in_lane needs
-    rv15         = _f(tf15d.get('RVOL10') or tf15d.get('RVOL'))
-    rvol_1h      = _f(tf1hd.get('RVOL10') or tf1hd.get('RVOL') or row.get('RVOL1h'))
-    adx1_now     = _f(tf1hd.get('ADX') or row.get('ADX1h'))
-    adx1_prev    = _f(tf1hd.get('ADX_prev') or tf1hd.get('ADX_lag1') or tf1hd.get('ADX-1'))
-    adx_slope_1h = adx1_now - adx1_prev
     # --- end FIX ---
 
     # Early-breakout override: price>EMA20 + RVOL1h≥1.20 + ADX slope>0
