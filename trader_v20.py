@@ -2177,16 +2177,15 @@ def hybrid_decision(symbol: str):
     rv15 = rv15_closed
     # --- end FIX ---
 
+    adx = float(row['ADX']) if pd.notna(row['ADX']) else 0.0
+    rvol_1h = float(row['RVOL10']) if pd.notna(row['RVOL10']) else None
+    price_slope = float(row.get('PRICE_SLOPE10', 0.0) or 0.0)
 
-    # Early-breakout override: price>EMA20 + RVOL1h≥1.20 + ADX slope>0
+        # Early-breakout override: price>EMA20 + RVOL1h≥1.20 + ADX slope>0
     override_in_lane = (row['close'] > row['EMA20']) and ((rvol_1h or 0) >= 1.20) and (adx_slope_1h > 0)
     if not in_lane and override_in_lane:
         blocks.append("SOFT override: early-breakout (px>EMA20, RVOL1h≥1.20, ADX slope>0)")
         in_lane = True
-
-    adx = float(row['ADX']) if pd.notna(row['ADX']) else 0.0
-    rvol_1h = float(row['RVOL10']) if pd.notna(row['RVOL10']) else None
-    price_slope = float(row.get('PRICE_SLOPE10', 0.0) or 0.0)
 
     try:
         adx_slope_1h = series_slope_last_n(df['ADX'], ADX_SCRATCH_SLOPE_BARS)
