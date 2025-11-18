@@ -114,7 +114,7 @@ AUTO_SAFE_ATRP_BTC = float(os.getenv("AUTO_SAFE_ATRP_BTC", "1.2"))  # ATR% 30d d
 DB_NAME = "trading_real.db"
 LOG_PATH = os.path.expanduser("~/hobbies/trading.log")
 
-TOP_COINS = ['BTC','ETH','BNB','SOL','XRP','DOGE','TON','ADA','TRX','AVAX']
+TOP_COINS = ['BTC','ETH','BNB','SOL','XRP','TRX']
 SELECTED_CRYPTOS = [f"{c}/USDT" for c in TOP_COINS]
 
 # >>> REGIME/BREADTH CONFIG (ANCHOR RBG)
@@ -236,7 +236,7 @@ def _tg_prefix() -> str:
 # Exit mode & cadence
 EXIT_MODE = os.getenv("EXIT_MODE", "hybrid")  # "price" | "indicators" | "hybrid"
 EXIT_CHECK_EVERY_SEC = int(os.getenv("EXIT_CHECK_EVERY_SEC", "30"))
-TRAIL_TP_MULT = float(os.getenv("TRAIL_TP_MULT", "1.08"))
+TRAIL_TP_MULT = float(os.getenv("TRAIL_TP_MULT", "1.10"))
 # >>> PATCH START: REBOUND/TRAIL/TIME knobs
 # --- Exit anti-whipsaw / rebound guard ---
 REBOUND_GUARD_ENABLED = True
@@ -334,8 +334,8 @@ PREFLIGHT_RVOL1H_MIN   = 0.80   # antes 1.00
 
 
 # No-buy-under-sell thresholds
-NBUS_RSI15_OB = 77.0
-NBUS_MACDH15_NEG = -0.003
+NBUS_RSI15_OB = 75.0
+NBUS_MACDH15_NEG = -0.002
 
 # >>> PATCH A1: BEAR/THIN-TAPE & COLLAPSE KNOBS
 # Bearish-context gate (4h) & Thin-tape RVOL floors
@@ -343,8 +343,8 @@ RSI4H_HARD_MIN = 45.0       # HARD block if 4h RSI <45 and trending down
 RSI4H_SOFT_MIN = 50.0       # SOFT block if 45≤RSI<50 and trending down unless RVOL strong
 RSI4H_SLOPE_BARS = 6        # slope lookback (4h bars)
 
-RVOL_1H_MIN  = 0.80         # base floors to avoid thin tape at entry
-RVOL_15M_MIN = 0.60
+RVOL_1H_MIN  = 0.75         # base floors to avoid thin tape at entry
+RVOL_15M_MIN = 0.55
 RVOL_FLOOR_STABLE_BONUS   = -0.10  # stable: allow 0.10 lower
 RVOL_FLOOR_UNSTABLE_BONUS = +0.10  # unstable: require 0.10 higher
 
