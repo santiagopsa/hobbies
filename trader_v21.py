@@ -23,7 +23,7 @@ load_dotenv()
 # >>> STRATEGY PROFILE (ANCHOR SP0)
 # Selector de estrategia
 
-VERSION = "v21"
+VERSION = "v21.1"
 PARK_IN_MOMENTUM = bool(int(os.getenv("PARK_IN_MOMENTUM", "0")))
 
 STRATEGY_PROFILES = {"USDT_MOMENTUM", "BTC_PARK", "AUTO_HYBRID"}
@@ -59,7 +59,7 @@ VOL_SIZE_MIN        = float(os.getenv("VOL_SIZE_MIN", "0.70"))   # 70% base on t
 VOL_SIZE_MAX        = float(os.getenv("VOL_SIZE_MAX", "1.60"))   # 160% base on hot volume
 VOL_SIZE_MIN_NOTION = float(os.getenv("VOL_SIZE_MIN_NOTION", "10"))
 
-HOLD_RVOL15_MIN     = float(os.getenv("HOLD_RVOL15_MIN", "1.50"))   # keep runner if >=
+HOLD_RVOL15_MIN     = float(os.getenv("HOLD_RVOL15_MIN", "2.0"))   # keep runner if >=
 HOLD_RVOL1H_MIN     = float(os.getenv("HOLD_RVOL1H_MIN", "1.10"))
 HOLD_ADX1H_MIN      = float(os.getenv("HOLD_ADX1H_MIN", "30"))
 HOLD_TRAIL_WIDE_BPS = int(os.getenv("HOLD_TRAIL_WIDE_BPS", "600"))  # 6%
@@ -169,13 +169,13 @@ DECISION_TIMEFRAME = "1h"
 SPREAD_MAX_PCT_DEFAULT = 0.005   # 0.5%
 MIN_QUOTE_VOL_24H_DEFAULT = 3_000_000
 
-ADX_MIN_DEFAULT = 20
-RSI_MIN_DEFAULT, RSI_MAX_DEFAULT = 45, 72
+ADX_MIN_DEFAULT = 22
+RSI_MIN_DEFAULT, RSI_MAX_DEFAULT = 48, 72
 RVOL_BASE_DEFAULT = 1.5
 # >>> PATCH START: gate & cooldowns
 SCORE_GATE_START = 4.8
-SCORE_GATE_MAX = 6.0
-SCORE_GATE_HARD_MIN = 4.0  # tougher floor to avoid low-quality buys
+SCORE_GATE_MAX = 5.8
+SCORE_GATE_HARD_MIN = 5 # tougher floor to avoid low-quality buys
 
 # re-entry/cooldowns
 COOLDOWN_AFTER_COLLAPSE_MIN = 60   # minutes — after a volume-collapse exit
@@ -211,7 +211,7 @@ EDGE_SAFETY_MULT = float(os.getenv("EDGE_SAFETY_MULT", "1.3"))
 
 # >>> PATCH: ENTRY EDGE / QUALITY / COOLDOWNS (ANCHOR EDGE1)
 ENTRY_EDGE_MULT = float(os.getenv("ENTRY_EDGE_MULT", "2.0"))         # x required_edge_pct for entry
-RVOL15_ENTRY_MIN = float(os.getenv("RVOL15_ENTRY_MIN", "1.1"))       # closed 15m RVOL floor for momentum entries
+RVOL15_ENTRY_MIN = float(os.getenv("RVOL15_ENTRY_MIN", "1.3"))       # closed 15m RVOL floor for momentum entries
 RVOL15_BREAKOUT_MIN = float(os.getenv("RVOL15_BREAKOUT_MIN", "1.5")) # closed RVOL needed when 4h trend is weak (<20)
 
 QUICK_LOSS_COOLDOWN_MIN = int(os.getenv("QUICK_LOSS_COOLDOWN_MIN", "30"))  # re-entry ban after quick small loss
@@ -351,6 +351,9 @@ RVOL_FLOOR_UNSTABLE_BONUS = +0.10  # unstable: require 0.10 higher
 # Volume-collapse exit (post-entry)
 RVOL_COLLAPSE_EXIT_ENABLED = True
 RVOL_COLLAPSE_EXIT = 0.50   # if 15m RVOL < 0.50 after min hold → exit
+
+MACD_H_ENTRY_MIN = 0.0 # Require positive MACD hist for entries (earlier signal than RSI/ADX alone).
+TRAIL_WIDEN_MULT = 1.2 # Widen trail 20% if RVOL >2.0 (grace for vol dips).
 
 # >>> FGI CONFIG (ANCHOR FGI0)
 FGI_API_URL = "https://api.alternative.me/fng/?limit=2&format=json"
@@ -586,6 +589,9 @@ def hold_in_volume(symbol: str) -> dict:
 
     if _DECAY_STREAK[symbol] >= DECAY_BARS:
         return {"hold": False, "trail_bps": int(HOLD_TRAIL_WIDE_BPS * 0.5), "partial": 0.0}
+
+    if rvol15 >= 2.0 and adx1h >= 30:  # Updated hold min + ADX
+        return {"hold": True, "trail_bps": HOLD_TRAIL_WIDE_BPS * 1.2, "partial": 0.3}  # Widen trail, partial at 1R
 
     return {"hold": False, "trail_bps": None, "partial": 0.0}
 
@@ -1129,7 +1135,16 @@ def compute_timeframe_features(df: pd.DataFrame, label: str):
         macd_df = ta.macd(df['close'], fast=12, slow=26, signal=9)
         macd  = macd_df['MACD_12_26_9']  if macd_df is not None and not macd_df.empty else pd.Series(index=df.index, dtype=float)
         macds = macd_df['MACDs_12_26_9'] if macd_df is not None and not macd_df.empty else pd.Series(index=df.index, dtype=float)
-        macdh = macd_df['MACDh_12_26_9'] if macd_df is not None and not macd_df.empty else pd.Series(index=df.index, dtype=float)
+        macdh = macd_df['MACDh_12_26_9'].iloc[-1] if macd_df is not None else -999
+        if macdh <= 0:  # New: Early momentum filter
+            return "hold", 50, 0.0, "MACD hist negative"
+        # Loosen RVOL check
+        if rvol < 1.3:  # Updated min
+            return "hold", 50, 0.0, "low RVOL"
+        # ADX slope for trend build
+        adx_slope = linregress(range(6), df['ADX'].iloc[-6:]).slope
+        if adx_slope <= 0 and adx < 22:
+            return "hold", 50, 0.0, "ADX not rising"
 
         stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3, smooth_k=3)
         stoch_k = stoch['STOCHk_14_3_3'] if stoch is not None and not stoch.empty else pd.Series(index=df.index, dtype=float)
@@ -2217,14 +2232,26 @@ def hybrid_decision(symbol: str):
                     if level != "HARD": level = "SOFT"
 
 
-    # Keep minimal volume sanity (slightly softer)
-    if rvol_1h is not None and rvol_1h < 0.80:
-        blocks.append("HARD block: 1h RVOL << 0.8 (thin tape)")
+    # Keep minimal volume sanity (by volatility class)
+    rvol1_floor, rvol15_floor = rvol_floors_by_regime(klass)
+
+    # Para coins "stable" permitimos algo menos de RVOL1h, para "unstable" exigimos más
+    if klass == "stable":
+        hard_floor = max(0.70, rvol1_floor - 0.10)  # p.ej. ~0.80
+    else:
+        hard_floor = rvol1_floor
+
+    soft_floor = max(hard_floor + 0.10, 0.90)
+
+    if rvol_1h is not None and rvol_1h < hard_floor:
+        blocks.append(f"HARD block: 1h RVOL too low for {klass} (rvol={rvol_1h:.2f} < {hard_floor:.2f})")
         level = "HARD"
-    elif rvol_1h is not None and rvol_1h < 0.90:
-        if not ((macdh15 or 0) >= 0 and (rv15 or 0) >= 0.90):
-            blocks.append("SOFT block: 1h RVOL ~0.9 need MACDh≥0 and RVOL15≥0.9")
-            if level != "HARD": level = "SOFT"
+
+    if (rvol_1h is not None and rvol_1h < soft_floor) and level != "HARD":
+        if not ((macdh15 or 0) >= 0 and (rv15 or 0) >= 1.00):
+            blocks.append(f"SOFT block: 1h RVOL<{soft_floor:.2f} without MACDh≥0 & RVOL15≥1.0")
+            level = "SOFT"
+
 
 
     # ===== fast snapshots (needed for anchors 2,8) =====
@@ -2301,7 +2328,14 @@ def hybrid_decision(symbol: str):
             ema50_1h = float(row['EMA50']) if pd.notna(row['EMA50']) else None
         except Exception:
             ema20_1h = ema50_1h = None
-        proof = ((rvol_1h or 0) >= 1.2) and ((macdh15 or 0) > 0) and (ema20_1h is None or last >= ema20_1h) and (ema50_1h is None or last >= ema50_1h)
+        proof = (
+            klass == "stable"
+            and (rvol_1h or 0) >= 1.2
+            and (macdh15 or 0) > 0
+            and ema20_1h is not None
+            and last >= ema20_1h
+            and (ema50_1h is None or last >= ema50_1h)
+        )
         if not proof:
             blocks.append("SOFT block: 4h drifting down (<47) — need RVOL1h≥1.2, MACDh15>0 & EMA20/50 reclaim")
             if level != "HARD": level = "SOFT"
