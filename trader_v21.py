@@ -2204,34 +2204,107 @@ def hybrid_decision(symbol: str):
 
 
 
-    # >>> SIMPLIFIED: Hard filters based on clean trends analysis (MFE≥5%, MAE≥-3%)
-    # ADX: winners ~31, losers ~27, optimal range 16-52, but minimum floor ~18 to avoid chop
+    # >>> REGIME-BASED ENTRY: Two modes based on analysis segmentation
+    # Detect regime: trending vs non-trending based on lookback
+    trending_up_flag = 0
+    price_slope_lookback = 0.0
+    avg_rsi_lookback = None
+    
+    try:
+        if len(df) >= 20:
+            lookback_start = max(0, len(df) - 20)
+            lookback_data = df.iloc[lookback_start:]
+            close_start = float(lookback_data['close'].iloc[0])
+            close_end = float(lookback_data['close'].iloc[-1])
+            trending_up_flag = 1 if close_end > close_start else 0
+            price_slope_lookback = ((close_end / close_start) - 1.0) * 100.0
+            if 'RSI' in lookback_data.columns:
+                avg_rsi_lookback = float(lookback_data['RSI'].mean()) if pd.notna(lookback_data['RSI'].mean()) else None
+    except Exception:
+        pass
+    
+    regime_trending = (trending_up_flag == 1 and price_slope_lookback > 0)
+    regime_non_trending = (trending_up_flag == 0 or price_slope_lookback <= 0)
+    
+    # Global filters (apply to both modes)
+    # ADX: minimum floor ~18 to avoid chop
     if adx is not None:
         if adx < 18.0:
             blocks.append(f"HARD block: ADX<18 ({adx:.1f}) - avoid total chop")
             level = "HARD"
-        # No upper limit: analysis shows range up to 52, but higher can still work
-
-    # RSI: winners ~44, losers ~51, optimal range 30-52 (buy pullbacks, not overbought)
-    # Analysis shows: improvement ~+18% in precision with this range
-    rsi = float(row['RSI']) if pd.notna(row['RSI']) else None
-    if rsi is not None:
-        if rsi < 30.0:
-            blocks.append(f"HARD block: RSI too low ({rsi:.1f} < 30)")
-            level = "HARD"
-        elif rsi > 52.0:
-            blocks.append(f"HARD block: RSI too high ({rsi:.1f} > 52) - avoid overbought")
-            level = "HARD"
     
-    # RVOL10: winners ~1.43, losers ~1.03, optimal range 0.6-2.3
-    # Avoid dead zones (<0.6) and extreme blow-offs (>2.5)
+    # RVOL10: avoid dead zones and extreme blow-offs
     if rvol_1h is not None:
         if rvol_1h < 0.6:
             blocks.append(f"HARD block: RVOL10 too low ({rvol_1h:.2f} < 0.6) - dead zone")
             level = "HARD"
-        elif rvol_1h > 2.5:
-            blocks.append(f"HARD block: RVOL10 too high ({rvol_1h:.2f} > 2.5) - likely blow-off")
+        elif rvol_1h > 2.4:
+            blocks.append(f"HARD block: RVOL10 too high ({rvol_1h:.2f} > 2.4) - likely blow-off")
             level = "HARD"
+    
+    # Mode A: Trend continuation (regime_trending)
+    # Activate only if: trending_up_flag==1, ema20>ema50, close>ema20, RSI 47-64, ADX 20-45
+    mode_a_active = False
+    mode_b_active = False
+    
+    if regime_trending:
+        ema20_1h = float(row['EMA20']) if pd.notna(row['EMA20']) else None
+        ema50_1h = float(row['EMA50']) if pd.notna(row['EMA50']) else None
+        close_1h = float(row['close'])
+        
+        mode_a_active = (
+            trending_up_flag == 1 and
+            ema20_1h is not None and ema50_1h is not None and ema20_1h > ema50_1h and
+            close_1h > ema20_1h
+        )
+        
+        if mode_a_active:
+            # RSI between 47-64 for trending mode
+            rsi = float(row['RSI']) if pd.notna(row['RSI']) else None
+            if rsi is not None:
+                if rsi < 47.0 or rsi > 64.0:
+                    blocks.append(f"HARD block: Mode A (trending) RSI out of range ({rsi:.1f}, need 47-64)")
+                    level = "HARD"
+            
+            # ADX between 20-45 for trending mode
+            if adx is not None:
+                if adx < 20.0 or adx > 45.0:
+                    blocks.append(f"HARD block: Mode A (trending) ADX out of range ({adx:.1f}, need 20-45)")
+                    level = "HARD"
+    
+    # Mode B: Pullback (regime_non_trending)
+    # Activate if: trending_up_flag==0, avg_RSI>45, RSI current < avg_RSI, RSI 30-50, price_near_high -3% to -9%
+    if regime_non_trending:
+        rsi = float(row['RSI']) if pd.notna(row['RSI']) else None
+        price_near_high_pct = float(row.get('PRICE_NEAR_HIGH_PCT', -10.0) or -10.0)
+        
+        mode_b_active = (
+            trending_up_flag == 0 and
+            avg_rsi_lookback is not None and avg_rsi_lookback > 45.0 and
+            rsi is not None and rsi < avg_rsi_lookback
+        )
+        
+        if mode_b_active:
+            # RSI between 30-50 for pullback mode
+            if rsi is not None:
+                if rsi < 30.0 or rsi > 50.0:
+                    blocks.append(f"HARD block: Mode B (pullback) RSI out of range ({rsi:.1f}, need 30-50)")
+                    level = "HARD"
+            
+            # price_near_high between -3% and -9% (discount, not free fall)
+            if price_near_high_pct < -9.0 or price_near_high_pct > -3.0:
+                blocks.append(f"HARD block: Mode B (pullback) price_near_high out of range ({price_near_high_pct:.2f}%, need -9% to -3%)")
+                level = "HARD"
+    
+    # If neither mode is active, block entry
+    if not mode_a_active and not mode_b_active:
+        if regime_trending:
+            blocks.append("HARD block: Mode A (trending) requires trending_up_flag=1, EMA20>EMA50, close>EMA20")
+        elif regime_non_trending:
+            blocks.append("HARD block: Mode B (pullback) requires trending_up_flag=0, avg_RSI>45, RSI<avg_RSI")
+        else:
+            blocks.append("HARD block: Cannot determine regime (trending/non-trending)")
+        level = "HARD"
 
 
 
@@ -3364,143 +3437,77 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 # Replace held_long_enough
                 held_long_enough = held >= max(60, effective_min_hold)
 
-                # Arm trailing based on R-multiple (not fixed %)
-                # Based on analysis: good trades have MFE ~6%, TP at 5%, MAE ~-2% with SL -3%
-                # This suggests: "Let me reach at least ~1R before putting on the safety belt"
+                # >>> SIMPLIFIED TRAILING: Based on R-multiples only (price + ATR, no indicators)
+                # Analysis shows: MFE ~6%, MAE ~0.1-0.2% for good trends, worst MAE ~-3%
+                # Trailing should be pure price + ATR + R-multiples, not based on indicators
                 gain = price - purchase_price
                 gain_pct_now = (price / purchase_price - 1.0) * 100.0
+                gain_in_R = gain / initial_R if initial_R > 0 else 0.0
                 
-                # Modular activation: strong trends get more breathing room
-                if strong_trend:
-                    # In strong trends (ADX1h/4h >= 30): let winners breathe, arm at 1.5R
-                    trail_armed = gain >= 1.5 * initial_R
-                else:
-                    # In non-trending markets: arm earlier at 1.0R (more noise, need protection)
-                    trail_armed = gain >= BE_R_MULT * initial_R
-
-                # Effective k
-                k_eff = base_k
-
-                # RVOL spike grace (use CLOSED 15m bars)
-                if RVOL_SPIKE_GRACE:
-                    try:
-                        df15v = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=60)
-                        if df15v is not None and len(df15v) > 20:
-                            vol_closed = df15v['volume'].shift(1)  # closed bar
-                            rv_mean = vol_closed.rolling(10).mean().iloc[-1]
-                            rvals = []
-                            for i in (2, 3, 4):  # last 3 closed bars
-                                if rv_mean and rv_mean > RVOL_MEAN_MIN:
-                                    rvals.append(float(vol_closed.iloc[-i] / rv_mean))
-                            if rvals and max(rvals) >= RVOL_SPIKE_THRESHOLD:
-                                rv_grace_until = time.time() + RVOL_K_BONUS_MINUTES * 60
-                        if rv_grace_until and time.time() <= rv_grace_until:
-                            k_eff += RVOL_SPIKE_K_BONUS
-                    except Exception:
-                        pass
-
-                # >>> REMOVED: Dynamic k adjustment based on volume_slope/volume_ratio
-                # Analysis shows: volume_slope10, volume_ratio don't improve precision (some even have improvement_factor < 1)
-                # They only add friction without edge. Trailing should be based on price + ATR + R-multiples only.
-                # Volume collapse exit (RVOL_COLLAPSE_EXIT) is still used as a kill switch, but not for k adjustment.
-
-                # Soft tighten via 15m signals (disabled in strong trend)
-                if not strong_trend:
-                    try:
-                        df15t = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=60)
-                        if df15t is not None and len(df15t) > 20:
-                            willr = ta.willr(df15t['high'], df15t['low'], df15t['close'], length=14)
-                            w = float(willr.iloc[-1]) if willr is not None else None  # -100..0
-                            if w is not None:
-                                if w > -20:         # very overbought → tighten
-                                    k_eff = max(1.2, k_eff - 0.2)
-                                elif w < -80:       # very oversold → a tad more room
-                                    k_eff = k_eff + 0.1
-
-                            rsi15 = float(ta.rsi(df15t['close'], length=14).iloc[-1])
-                            macd15t = ta.macd(df15t['close'], fast=12, slow=26, signal=9)
-                            macdh15t = float(macd15t['MACDh_12_26_9'].iloc[-1]) if macd15t is not None else None
-                            
-                            # Improved soft-tighten based on analysis:
-                            # Analysis shows: good entries at RSI 40-60, not 70-80
-                            # In trailing: RSI15 high + MACDh turning negative = exhaustion signal
-                            # Soft-tighten when: RSI15 > 65-70 and MACDh15 <= 0
-                            if rsi15 >= 65.0 and (macdh15t or 0) <= 0:
-                                # More aggressive tightening for exhaustion
-                                soft_tighten_until = time.time() + 2 * 15 * 60
-                                if rsi15 >= 70.0:
-                                    # Very overbought: more aggressive
-                                    k_eff = max(1.2, k_eff - SOFT_TIGHTEN_K - 0.2)
-                                else:
-                                    # Moderately overbought: standard tightening
-                                    k_eff = max(1.2, k_eff - SOFT_TIGHTEN_K)
-                        if soft_tighten_until and time.time() <= soft_tighten_until:
-                            # Apply additional tightening if still in soft-tighten window
-                            if k_eff > 1.2:  # Only if not already at minimum
-                                k_eff = max(1.2, k_eff - SOFT_TIGHTEN_K * 0.5)
-                    except Exception:
-                        pass
-                # >>> TWEAK5: early_flip_tighten (within 30m of entry)
-                try:
-                    within_30min = (datetime.now(timezone.utc) - opened_ts).total_seconds() <= 1800
-                    if within_30min:
-                        df15_w = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=80)
-                        macd15_w = ta.macd(df15_w['close'], fast=12, slow=26, signal=9) if df15_w is not None else None
-                        macdh15 = float(macd15_w['MACDh_12_26_9'].iloc[-1]) if (macd15_w is not None and not macd15_w.empty) else None
-                        rsi15 = float(ta.rsi(df15_w['close'], length=14).iloc[-1]) if df15_w is not None else None
-                        ema20_15 = float(ta.ema(df15_w['close'], length=20).iloc[-1]) if df15_w is not None else None
-                        close_15 = float(df15_w['close'].iloc[-1]) if df15_w is not None else None
-
-                        flip_macd = (macdh15 is not None and macdh15 <= 0)
-                        flip_rsi  = (rsi15 is not None and rsi15 < 52)
-                        flip_ema  = (close_15 is not None and ema20_15 is not None and close_15 < ema20_15)
-                        severity = int(flip_macd) + int(flip_rsi) + int(flip_ema)
-
-                        strong_4h = (adx4h is not None and adx4h > 40.0)
-                        if not strong_4h and severity >= 2:
-                            k_eff -= (0.2 if severity == 2 else 0.3)
-                            k_eff = max(1.2, k_eff)
-                except Exception:
-                    pass
-
-                # Strong-trend floor for k (let it run)
-                if strong_trend:
-                    if   klass_local == "unstable": k_eff = max(k_eff, STRONG_TREND_K_UNSTABLE)
-                    elif klass_local == "stable":   k_eff = max(k_eff, STRONG_TREND_K_STABLE)
-                    else:                           k_eff = max(k_eff, STRONG_TREND_K_MEDIUM)
-
-                # R tiers: BE and tier2 tighten
-                # (gain already calculated above for trail_armed)
-                if gain >= BE_R_MULT * initial_R:
+                # Detect regime for trailing aggressiveness
+                regime_trending_trail = strong_trend  # Use strong_trend as proxy for regime_trending
+                
+                # Trailing activation and stop levels based on R-multiples
+                # 0-1R: stop stays at -1R (no trail yet)
+                # 1-2R: move to BE or +0.2R (~+0.6%)
+                # 2-3.5R: stop minimum at +1R (+3%)
+                # >3.5R: switch to Chandelier ATR (k=3 for trending, k=2 for non-trending)
+                
+                if gain_in_R < 1.0:
+                    # 0-1R: stop stays at initial stop (-1R)
+                    trail_armed = False
+                    stop_price = initial_stop
+                elif gain_in_R < 2.0:
+                    # 1-2R: move to BE or +0.2R
+                    trail_armed = True
                     be_stop = purchase_price * (1.0 + required_edge_pct()/100.0)
-                    stop_price = max(stop_price, be_stop)
-                if gain >= TIER2_R_MULT * initial_R:
-                    k_eff = max(1.2, k_eff - TIER2_K_TIGHTEN)
+                    stop_at_02R = purchase_price + 0.2 * initial_R
+                    stop_price = max(initial_stop, be_stop, stop_at_02R)
+                elif gain_in_R < 3.5:
+                    # 2-3.5R: stop minimum at +1R
+                    trail_armed = True
+                    stop_at_1R = purchase_price + 1.0 * initial_R
+                    stop_price = max(initial_stop, stop_at_1R)
+                else:
+                    # >3.5R: switch to Chandelier ATR
+                    trail_armed = True
+                    # k = 3 for trending, k = 2 for non-trending
+                    k_for_trail = 3.0 if regime_trending_trail else 2.0
+                    c_stop = chandelier_stop_long(df1h, atr_len=CHAN_ATR_LEN, hh_len=CHAN_LEN_HIGH, k=k_for_trail)
+                    stop_at_1R = purchase_price + 1.0 * initial_R
+                    if c_stop is not None:
+                        stop_price = max(initial_stop, stop_at_1R, c_stop)
+                    else:
+                        stop_price = max(initial_stop, stop_at_1R)
 
-                # Chandelier + ratchet + early-grace
-                c_stop = chandelier_stop_long(df1h, atr_len=CHAN_ATR_LEN, hh_len=CHAN_LEN_HIGH, k=k_eff)
-                candidate = stop_price
-                if c_stop is not None:
-                    candidate = max(candidate, c_stop, initial_stop)
+                # >>> SIMPLIFIED TRAILING: R-multiples only (no indicator-based adjustments)
+                # Analysis shows: best exits are pure price + ATR, not based on RSI/ADX/RVOL/slopes
+                # These variables are good for filtering entries, not for deciding exits
+                
+                # Track highest price for MFE calculation (for kill switch)
+                if not hasattr(loop, '_highest_price'):
+                    loop._highest_price = purchase_price
+                if price > loop._highest_price:
+                    loop._highest_price = price
+                mfe_in_R = (loop._highest_price - purchase_price) / initial_R if initial_R > 0 else 0.0
+                
+                # Kill switch for non-trending regime: MFE≥2R and close<EMA20 → exit
+                # Only in non-trending (more noise, need to protect gains)
+                if not regime_trending_trail and mfe_in_R >= 2.0:
+                    if ema20_1h is not None and close1h < ema20_1h:
+                        logger.info(f"[kill-switch] {symbol} non-trending: MFE≥2R ({mfe_in_R:.2f}R) and close<EMA20 → exit")
+                        sell_symbol(symbol, amount, trade_id, source="kill-switch-non-trending")
+                        return
 
-                # === APPLY TRAIL OVERRIDES (bps / floor)
+                # Apply trail overrides if any (bps / floor)
                 _bps, _floor = _get_trail_overrides(symbol)
                 if _bps:
-                    candidate = min(candidate, price * (1.0 - int(_bps) / 10000.0))  # ensancha (deja correr)
+                    stop_price = min(stop_price, price * (1.0 - int(_bps) / 10000.0))  # widen (let it run)
                 if _floor:
-                    candidate = max(candidate, float(_floor))                         # piso duro
-
-
-                if (price - purchase_price) < 0.6 * initial_R:
-                    grace_cap = purchase_price - 0.2 * initial_R
-                    candidate = max(stop_price, min(candidate, grace_cap))
-                stop_price = candidate
+                    stop_price = max(stop_price, float(_floor))  # hard floor
                 
-                # if trailing not armed yet, do not choke the trade
-                if not trail_armed:
-                    # cap the stop so we don't scratch out before trend develops
-                    grace_cap = max(initial_stop, purchase_price * (1.0 - 0.004))  # ~-0.4%
-                    candidate = max(stop_price, min(candidate, grace_cap))
+                # Ensure stop never goes below initial stop
+                stop_price = max(stop_price, initial_stop)
 
                 # Volume-collapse exit (15m closed) — skip in strong trend
                 if RVOL_COLLAPSE_EXIT_ENABLED and not strong_trend:

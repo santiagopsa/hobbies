@@ -865,10 +865,19 @@ def main():
     end_date = args.end or backtest.BACKTEST_END_DATE
     
     # Train/validate split
-    train_start = args.train_start or start_date
-    train_end = args.train_end or (args.validate_start if args.validate_start else end_date)
-    validate_start = args.validate_start
-    validate_end = args.validate_end or end_date
+    # Default split: Train 2024-01-01 to 2024-09-30, Validate 2024-10-01 to 2024-12-31
+    # This ensures patterns learned in training are validated on out-of-sample data
+    if args.train_start is None and args.validate_start is None:
+        # Default to recommended split
+        train_start = "2024-01-01"
+        train_end = "2024-09-30"
+        validate_start = "2024-10-01"
+        validate_end = "2024-12-31"
+    else:
+        train_start = args.train_start or start_date
+        train_end = args.train_end or (args.validate_start if args.validate_start else end_date)
+        validate_start = args.validate_start
+        validate_end = args.validate_end or end_date
     
     print("=" * 80)
     print("TREND PATTERN ANALYSIS (Enhanced)")
@@ -950,8 +959,10 @@ def main():
                                                                min_gain_pct=args.min_gain, max_mae_pct=args.max_mae)
         
         # Grid search for optimal ranges
+        # Only use indicators that improve precision (improvement_factor > 1)
+        # Based on analysis: ADX, RSI, RVOL10 improve; price_slope10_pct, volume_ratio don't
         print("Finding optimal ranges (grid search method)...")
-        indicators_for_grid = ['ADX', 'RSI', 'RVOL10', 'price_slope10_pct', 'volume_ratio']
+        indicators_for_grid = ['ADX', 'RSI', 'RVOL10']  # Removed price_slope10_pct, volume_ratio (improvement_factor < 1)
         optimal_ranges = find_optimal_ranges_grid_search(successful_trends, failed_trends, indicators_for_grid)
         
         # Calculate expected return (both optimistic and realistic)
