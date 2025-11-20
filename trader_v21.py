@@ -2204,33 +2204,34 @@ def hybrid_decision(symbol: str):
 
 
 
-    # >>> SIMPLIFIED: ADX hard filter (based on analysis: winners ~31, losers ~28, range 18-50)
-    # Analysis shows: too low = no trend, too high = often too late/exhausted
+    # >>> SIMPLIFIED: Hard filters based on clean trends analysis (MFE≥5%, MAE≥-3%)
+    # ADX: winners ~31, losers ~27, optimal range 16-52, but minimum floor ~18 to avoid chop
     if adx is not None:
         if adx < 18.0:
-            blocks.append(f"HARD block: ADX<18 ({adx:.1f})")
+            blocks.append(f"HARD block: ADX<18 ({adx:.1f}) - avoid total chop")
             level = "HARD"
-        elif adx > 50.0:
-            blocks.append(f"HARD block: ADX>50 ({adx:.1f}) - likely exhausted")
-            level = "HARD"
+        # No upper limit: analysis shows range up to 52, but higher can still work
 
-
-    # RSI: winners ~44, losers ~51 (anti-overbought filter)
-    # Best trades don't enter with very high RSI
+    # RSI: winners ~44, losers ~51, optimal range 30-52 (buy pullbacks, not overbought)
+    # Analysis shows: improvement ~+18% in precision with this range
     rsi = float(row['RSI']) if pd.notna(row['RSI']) else None
     if rsi is not None:
         if rsi < 30.0:
             blocks.append(f"HARD block: RSI too low ({rsi:.1f} < 30)")
             level = "HARD"
-        elif rsi > 60.0:
-            blocks.append(f"HARD block: RSI too high ({rsi:.1f} > 60) - likely overbought")
+        elif rsi > 52.0:
+            blocks.append(f"HARD block: RSI too high ({rsi:.1f} > 52) - avoid overbought")
             level = "HARD"
     
-    # RVOL10: winners ~1.43, losers ~1.03 (simple soft filter)
-    # Don't enter when volume is dead, but don't require huge spikes
-    if rvol_1h is not None and rvol_1h < 0.6:
-        blocks.append(f"HARD block: RVOL10 too low ({rvol_1h:.2f} < 0.6)")
-        level = "HARD"
+    # RVOL10: winners ~1.43, losers ~1.03, optimal range 0.6-2.3
+    # Avoid dead zones (<0.6) and extreme blow-offs (>2.5)
+    if rvol_1h is not None:
+        if rvol_1h < 0.6:
+            blocks.append(f"HARD block: RVOL10 too low ({rvol_1h:.2f} < 0.6) - dead zone")
+            level = "HARD"
+        elif rvol_1h > 2.5:
+            blocks.append(f"HARD block: RVOL10 too high ({rvol_1h:.2f} > 2.5) - likely blow-off")
+            level = "HARD"
 
 
 
@@ -2725,7 +2726,7 @@ def hybrid_decision(symbol: str):
     except Exception:
         pass
 
-    # >>> SIMPLIFIED: EMA/EMA50 and price_slope are now score bonuses, not hard filters
+    # >>> SIMPLIFIED: EMA/EMA50 are score bonuses, NOT hard filters
     # Analysis shows: ~47% of winners don't have EMA20>EMA50, ~67% don't have close>EMA20
     # These are bonuses for trend-following entries, but don't block mean-reversion trades
     
@@ -2739,21 +2740,9 @@ def hybrid_decision(symbol: str):
         score += 0.5
         notes.append("close>EMA20 bonus")
     
-    # Price slope bonus (positive = continuation, negative = pullback)
-    # Not a hard filter, just helps classify trade type
-    if price_slope > 0:
-        score += 0.5
-        notes.append("price_slope>0 (continuation signal)")
-    elif price_slope < 0:
-        score += 0.3
-        notes.append("price_slope<0 (pullback signal)")
-    
-    # Price near high bonus (winners tend to enter after small pullback from high)
-    # Winners: ~-4%, Losers: ~-1.8% → entering after pullback is better
-    price_near_high_pct = float(row.get('PRICE_NEAR_HIGH_PCT', -10.0) or -10.0)
-    if -10.0 <= price_near_high_pct <= -0.7:
-        score += 1.0
-        notes.append(f"price_near_high_pct in sweet spot ({price_near_high_pct:.2f}%)")
+    # NOTE: price_slope, volume_slope, volume_ratio, price_near_high_pct are NOT used as filters
+    # Analysis shows: these don't improve precision (some even have improvement_factor < 1)
+    # They only add friction without edge. Removed from scoring to keep it simple.
     
     # Defensa 6: Alineación MTF light (aplica leading_bonus SOLO si alineado)
     if not (row['EMA20'] > row['EMA50'] and adx_slope_1h > 0):
@@ -2762,20 +2751,18 @@ def hybrid_decision(symbol: str):
     else:
         score += leading_bonus  # apply once when aligned
 
-    # RSI band (already filtered by hard filter 30-60, so this is just scoring)
-    if 30.0 <= rsi <= 60.0:
+    # RSI band (already filtered by hard filter 30-52, so this is just scoring)
+    if 30.0 <= rsi <= 52.0:
         score += 1.0; notes.append(f"RSI in band ({rsi:.1f})")
-    if rsi >= 45.0:  # Middle of range
+    if rsi >= 41.0:  # Middle of range (30-52)
         score += 0.5
 
     if adx >= 18.0:  # Already filtered by hard filter, so this is just scoring
         score += 1.0; notes.append(f"ADX≥18 ({adx:.1f})")
-
-    # Volume slope bonus (not a hard filter, just helps prioritize)
-    vol_slope = float(row.get('VOL_SLOPE10', 0.0) or 0.0)
-    if vol_slope > 0: 
-        score += 0.5
-        notes.append("vol_slope>0 bonus")
+    
+    # NOTE: volume_slope removed from scoring
+    # Analysis shows: volume_slope10 doesn't improve precision (improvement_factor < 1)
+    # It only adds friction without edge. Removed to keep it simple.
 
     # Spread penalty
     try:
@@ -3412,49 +3399,10 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                     except Exception:
                         pass
 
-                # >>> Dynamic k adjustment based on volume (from analysis)
-                # Analysis shows: successful trends have much higher volume_slope10, volume_ratio, RVOL10
-                # While RVOL and volume_slope10 are strong → keep k high (loose trailing)
-                # When volume collapses → tighten k (aggressive trailing) or let Donchian/EMA take the trade
-                try:
-                    df15v_k = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=60)
-                    if df15v_k is not None and len(df15v_k) > 20:
-                        # RVOL15 closed (more reliable than live)
-                        vol_closed_k = df15v_k['volume'].shift(1)
-                        rv_mean_k = vol_closed_k.rolling(10).mean().iloc[-1]
-                        rvol15_closed_k = float(vol_closed_k.iloc[-1] / rv_mean_k) if (rv_mean_k and rv_mean_k > RVOL_MEAN_MIN) else None
-                        
-                        # Volume slope (10 periods)
-                        if len(df15v_k) >= 10:
-                            from scipy.stats import linregress
-                            x_vol = np.arange(10)
-                            volume_slope10 = linregress(x_vol, df15v_k['volume'].iloc[-10:]).slope
-                        else:
-                            volume_slope10 = None
-                        
-                        # Volume ratio (current / 20-period avg)
-                        vol_20_avg = df15v_k['volume'].rolling(20).mean().iloc[-1]
-                        volume_ratio = float(df15v_k['volume'].iloc[-1] / vol_20_avg) if (vol_20_avg and vol_20_avg > 0) else None
-                        
-                        # Tighten k if volume collapses
-                        if rvol15_closed_k is not None and rvol15_closed_k < 0.75:
-                            # Volume collapse: tighten trailing
-                            k_eff = max(1.2, k_eff - 0.3)
-                            logger.debug(f"[trail-vol] {symbol} RVOL15_closed={rvol15_closed_k:.2f} < 0.75 → tightening k")
-                        elif volume_slope10 is not None and volume_slope10 < 0:
-                            # Volume slope negative: tightening
-                            k_eff = max(1.2, k_eff - 0.2)
-                            logger.debug(f"[trail-vol] {symbol} volume_slope10={volume_slope10:.0f} < 0 → tightening k")
-                        elif volume_ratio is not None and volume_ratio < 0.8:
-                            # Volume ratio falling: slight tightening
-                            k_eff = max(1.2, k_eff - 0.15)
-                            logger.debug(f"[trail-vol] {symbol} volume_ratio={volume_ratio:.2f} < 0.8 → slight tightening")
-                        elif rvol15_closed_k is not None and rvol15_closed_k >= 1.3 and volume_slope10 is not None and volume_slope10 > 0:
-                            # Strong volume: maintain or slightly widen k
-                            k_eff = min(k_eff + 0.1, base_k + 0.5)
-                            logger.debug(f"[trail-vol] {symbol} strong volume (RVOL={rvol15_closed_k:.2f}, slope>0) → maintaining k")
-                except Exception as e:
-                    logger.debug(f"[trail-vol] volume-based k adjustment failed {symbol}: {e}")
+                # >>> REMOVED: Dynamic k adjustment based on volume_slope/volume_ratio
+                # Analysis shows: volume_slope10, volume_ratio don't improve precision (some even have improvement_factor < 1)
+                # They only add friction without edge. Trailing should be based on price + ATR + R-multiples only.
+                # Volume collapse exit (RVOL_COLLAPSE_EXIT) is still used as a kill switch, but not for k adjustment.
 
                 # Soft tighten via 15m signals (disabled in strong trend)
                 if not strong_trend:
