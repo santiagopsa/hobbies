@@ -229,13 +229,26 @@ class BacktestEngine:
         # Indicator tracking for analysis
         self.entry_indicators = []  # Store indicator values at entry for each trade
         
-        # Exchange for fetching data
-        self.exchange = ccxt.binance({
-            'apiKey': os.getenv('BINANCE_API_KEY', ''),
-            'secret': os.getenv('BINANCE_SECRET', ''),
+        # Exchange for fetching data (no API keys needed for public historical data)
+        # For backtesting, we use public endpoints which don't require authentication
+        # Set USE_API_KEYS_IN_BACKTEST=1 in .env if you want to use API keys (not recommended)
+        use_api_keys = os.getenv('USE_API_KEYS_IN_BACKTEST', '0') == '1'
+        
+        exchange_config = {
             'enableRateLimit': True,
             'options': {'defaultType': 'spot'}
-        })
+        }
+        
+        # Only add API keys if explicitly enabled (not recommended for backtesting)
+        # Public historical data doesn't require authentication
+        if use_api_keys:
+            api_key = os.getenv('BINANCE_API_KEY', '')
+            api_secret = os.getenv('BINANCE_SECRET', '')
+            if api_key and api_secret:
+                exchange_config['apiKey'] = api_key
+                exchange_config['secret'] = api_secret
+        
+        self.exchange = ccxt.binance(exchange_config)
     
     def get_available_balance(self) -> float:
         """Get available balance for new trades"""
@@ -534,6 +547,31 @@ class BacktestEngine:
         
         total_return = (self.balance - self.initial_balance) / self.initial_balance * 100.0
         
+        # Trend accuracy metrics (NEW - for trend prediction optimization)
+        # Measure if price actually went up after entry (regardless of exit timing)
+        trend_correct = 0  # Trades where price went up after entry
+        trend_avg_gain = 0.0  # Average price gain (even if exited early)
+        trend_max_gain = 0.0  # Average maximum gain reached
+        
+        if len(df) > 0:
+            # For each trade, check if price went up after entry
+            trend_correct_trades = df[df['max_gain_pct'] > 0]  # Price went up at some point
+            trend_correct = len(trend_correct_trades)
+            trend_accuracy = (trend_correct / len(df) * 100.0) if len(df) > 0 else 0.0
+            
+            # Average gain (using max_gain_pct which shows how much price went up)
+            trend_avg_gain = df['max_gain_pct'].mean() if len(df) > 0 else 0.0
+            
+            # Average of maximum gains (how much price typically went up)
+            trend_max_gain = df['max_gain_pct'].mean() if len(df) > 0 else 0.0
+            
+            # Trades where price went up AND stayed up (sustained trend)
+            sustained_trends = df[(df['max_gain_pct'] > 2.0) & (df['pnl_pct'] > 0)]  # Went up 2%+ and closed positive
+            sustained_trend_pct = (len(sustained_trends) / len(df) * 100.0) if len(df) > 0 else 0.0
+        else:
+            trend_accuracy = 0.0
+            sustained_trend_pct = 0.0
+        
         return {
             'initial_balance': self.initial_balance,
             'final_balance': self.balance,
@@ -550,6 +588,12 @@ class BacktestEngine:
             'avg_trade_duration_hours': df['duration_hours'].mean() if len(df) > 0 else 0.0,
             'best_trade_pct': df['pnl_pct'].max() if len(df) > 0 else 0.0,
             'worst_trade_pct': df['pnl_pct'].min() if len(df) > 0 else 0.0,
+            # Trend accuracy metrics (NEW)
+            'trend_accuracy_pct': trend_accuracy,
+            'trend_correct_trades': trend_correct,
+            'trend_avg_gain_pct': trend_avg_gain,
+            'trend_max_gain_pct': trend_max_gain,
+            'sustained_trend_pct': sustained_trend_pct,
         }
     
     def get_indicator_analysis(self) -> Dict:
@@ -596,7 +640,7 @@ class BacktestEngine:
         return analysis
 
 
-def get_buy_signal_from_data(symbol: str, df: pd.DataFrame, current_price: float) -> Tuple[str, int, float, str]:
+def get_buy_signal_from_data(symbol: str, df: pd.DataFrame, current_price: float, params: Dict = None) -> Tuple[str, int, float, str]:
     """
     Simplified buy signal extraction from prepared dataframe
     This is a simplified version of hybrid_decision that works with historical data
@@ -662,6 +706,48 @@ def get_buy_signal_from_data(symbol: str, df: pd.DataFrame, current_price: float
         # Lane check
         in_lane = bool(row['EMA20'] > row['EMA50'] and row['close'] > row['EMA20'])
         
+        # Trend validation - clear upward trend required
+        # Get trend thresholds from params (optimizable) or use defaults
+        if params is not None:
+            MIN_SLOPE10_PCT = params.get('MIN_SLOPE10_PCT', 0.05)
+            MIN_SLOPE20_PCT = params.get('MIN_SLOPE20_PCT', 0.02)
+            MAX_NEAR_HIGH_PCT = params.get('MAX_NEAR_HIGH_PCT', -1.0)
+        else:
+            # Try to get from trader module if available (for optimization)
+            try:
+                MIN_SLOPE10_PCT = getattr(trader, 'MIN_SLOPE10_PCT', 0.05)
+                MIN_SLOPE20_PCT = getattr(trader, 'MIN_SLOPE20_PCT', 0.02)
+                MAX_NEAR_HIGH_PCT = getattr(trader, 'MAX_NEAR_HIGH_PCT', -1.0)
+            except:
+                MIN_SLOPE10_PCT = 0.05
+                MIN_SLOPE20_PCT = 0.02
+                MAX_NEAR_HIGH_PCT = -1.0
+        
+        price_slope10_pct = float(row.get('PRICE_SLOPE10_PCT', 0.0) or 0.0)
+        price_slope20_pct = float(row.get('PRICE_SLOPE20_PCT', 0.0) or 0.0)
+        price_near_high = float(row.get('PRICE_NEAR_HIGH_PCT', -10.0) or -10.0)
+        
+        # Validate clear upward trend (not just a peak)
+        # 1. Short-term slope must be positive and significant
+        # 2. Medium-term slope should also be positive (sustained trend)
+        # 3. Price should not be too close to recent high (avoid buying at peaks)
+        clear_uptrend = (
+            price_slope10_pct > MIN_SLOPE10_PCT and
+            (pd.isna(price_slope20_pct) or price_slope20_pct > MIN_SLOPE20_PCT) and
+            price_near_high < MAX_NEAR_HIGH_PCT
+        )
+        
+        # Hard block: reject if no clear uptrend
+        if not clear_uptrend:
+            trend_reason = []
+            if price_slope10_pct <= MIN_SLOPE10_PCT:
+                trend_reason.append(f"slope10_pct={price_slope10_pct:.3f}% <= {MIN_SLOPE10_PCT:.3f}%")
+            if not pd.isna(price_slope20_pct) and price_slope20_pct <= MIN_SLOPE20_PCT:
+                trend_reason.append(f"slope20_pct={price_slope20_pct:.3f}% <= {MIN_SLOPE20_PCT:.3f}%")
+            if price_near_high >= MAX_NEAR_HIGH_PCT:
+                trend_reason.append(f"near_high={price_near_high:.2f}% >= {MAX_NEAR_HIGH_PCT:.2f}% (too close to peak)")
+            return "hold", 50, 0.0, f"no_clear_uptrend: {', '.join(trend_reason)}"
+        
         # Score calculation (simplified)
         score = 0.0
         notes = []
@@ -682,15 +768,18 @@ def get_buy_signal_from_data(symbol: str, df: pd.DataFrame, current_price: float
             score += 1.0
             notes.append(f"RSI={rsi:.1f}")
         
-        price_slope = float(row.get('PRICE_SLOPE10', 0.0) or 0.0)
-        if price_slope > 0:
-            score += 0.5
-            notes.append("price_up")
+        # Strong trend bonus (both slopes positive and significant)
+        if price_slope10_pct > 0.1 and (pd.isna(price_slope20_pct) or price_slope20_pct > 0.05):
+            score += 1.5
+            notes.append(f"strong_trend (slope10={price_slope10_pct:.3f}%, slope20={price_slope20_pct:.3f}%)")
+        elif price_slope10_pct > 0.05:
+            score += 0.8
+            notes.append(f"clear_uptrend (slope10={price_slope10_pct:.3f}%)")
         
         score_gate = trader.get_score_gate()
         
         if score >= score_gate:
-            conf = int(min(50 + 10*(1 if in_lane else 0) + 5*(1 if price_slope>0 else 0), 100))
+            conf = int(min(50 + 10*(1 if in_lane else 0) + 10*(1 if clear_uptrend else 0), 100))
             return "buy", conf, score, ", ".join(notes)
         else:
             return "hold", 50, score, f"score {score:.1f} < gate {score_gate:.1f}"
@@ -714,13 +803,44 @@ def prepare_data_from_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     rv_mean = df['volume'].rolling(10).mean()
     rv_ok = rv_mean.iloc[-1] and rv_mean.iloc[-1] > trader.RVOL_MEAN_MIN
     df['RVOL10'] = (df['volume'] / rv_mean) if rv_ok else np.nan
-    if len(df) >= 10:
+    # Calculate multiple price slopes for trend validation
+    if len(df) >= 20:
+        from scipy.stats import linregress
+        # Short-term slope (last 10 periods) - for immediate trend
+        x10 = np.arange(10)
+        df.loc[df.index[-1], 'PRICE_SLOPE10'] = linregress(x10, df['close'].iloc[-10:]).slope
+        
+        # Medium-term slope (last 20 periods) - for sustained trend
+        x20 = np.arange(20)
+        df.loc[df.index[-1], 'PRICE_SLOPE20'] = linregress(x20, df['close'].iloc[-20:]).slope
+        
+        # Calculate slope as percentage of price (normalized)
+        current_price = df['close'].iloc[-1]
+        df.loc[df.index[-1], 'PRICE_SLOPE10_PCT'] = (df.loc[df.index[-1], 'PRICE_SLOPE10'] / current_price * 100) if current_price > 0 else 0
+        df.loc[df.index[-1], 'PRICE_SLOPE20_PCT'] = (df.loc[df.index[-1], 'PRICE_SLOPE20'] / current_price * 100) if current_price > 0 else 0
+        
+        # Check if price is near recent high (to avoid buying at peaks)
+        recent_high_20 = df['high'].iloc[-20:].max()
+        df.loc[df.index[-1], 'PRICE_NEAR_HIGH_PCT'] = ((current_price / recent_high_20 - 1) * 100) if recent_high_20 > 0 else 0
+        
+        # Volume slope
+        df.loc[df.index[-1], 'VOL_SLOPE10'] = linregress(x10, df['volume'].iloc[-10:]).slope
+    elif len(df) >= 10:
         from scipy.stats import linregress
         x = np.arange(10)
         df.loc[df.index[-1], 'PRICE_SLOPE10'] = linregress(x, df['close'].iloc[-10:]).slope
+        current_price = df['close'].iloc[-1]
+        df.loc[df.index[-1], 'PRICE_SLOPE10_PCT'] = (df.loc[df.index[-1], 'PRICE_SLOPE10'] / current_price * 100) if current_price > 0 else 0
+        df.loc[df.index[-1], 'PRICE_SLOPE20'] = np.nan
+        df.loc[df.index[-1], 'PRICE_SLOPE20_PCT'] = np.nan
+        df.loc[df.index[-1], 'PRICE_NEAR_HIGH_PCT'] = np.nan
         df.loc[df.index[-1], 'VOL_SLOPE10'] = linregress(x, df['volume'].iloc[-10:]).slope
     else:
         df['PRICE_SLOPE10'] = np.nan
+        df['PRICE_SLOPE10_PCT'] = np.nan
+        df['PRICE_SLOPE20'] = np.nan
+        df['PRICE_SLOPE20_PCT'] = np.nan
+        df['PRICE_NEAR_HIGH_PCT'] = np.nan
         df['VOL_SLOPE10'] = np.nan
     try:
         df['VWAP'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
@@ -731,7 +851,10 @@ def prepare_data_from_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
 def fetch_historical_data(symbol: str, timeframe: str, start_date: str, end_date: str, 
                          exchange: ccxt.Exchange) -> pd.DataFrame:
-    """Fetch historical OHLCV data"""
+    """Fetch historical OHLCV data with retry logic"""
+    max_retries = 3
+    retry_delay = 2  # seconds
+    
     try:
         since = exchange.parse8601(start_date + 'T00:00:00Z')
         until = exchange.parse8601(end_date + 'T23:59:59Z')
@@ -740,14 +863,45 @@ def fetch_historical_data(symbol: str, timeframe: str, start_date: str, end_date
         current = since
         
         while current < until:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=current, limit=1000)
+            # Retry logic for each batch
+            ohlcv = None
+            for attempt in range(max_retries):
+                try:
+                    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=current, limit=1000)
+                    if ohlcv:
+                        break
+                except ccxt.AuthenticationError as e:
+                    # If it's an auth error, try without API keys (public data doesn't need them)
+                    print(f"  Warning: Authentication error for {symbol}, trying public access...")
+                    if hasattr(exchange, 'apiKey') and exchange.apiKey:
+                        # Remove API keys and retry
+                        exchange.apiKey = None
+                        exchange.secret = None
+                        try:
+                            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=current, limit=1000)
+                            if ohlcv:
+                                break
+                        except Exception as e2:
+                            print(f"  Error fetching {symbol} (attempt {attempt+1}/{max_retries}): {e2}")
+                    else:
+                        print(f"  Error fetching {symbol} (attempt {attempt+1}/{max_retries}): {e}")
+                except Exception as e:
+                    print(f"  Error fetching {symbol} (attempt {attempt+1}/{max_retries}): {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay * (attempt + 1))
+            
             if not ohlcv:
+                print(f"  Failed to fetch data for {symbol} after {max_retries} attempts")
                 break
+            
             all_ohlcv.extend(ohlcv)
             current = ohlcv[-1][0] + 1
-            time.sleep(exchange.rateLimit / 1000)  # Rate limiting
+            
+            # Rate limiting
+            time.sleep(exchange.rateLimit / 1000)
         
         if not all_ohlcv:
+            print(f"  No data retrieved for {symbol}")
             return None
         
         df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -761,11 +915,14 @@ def fetch_historical_data(symbol: str, timeframe: str, start_date: str, end_date
         return df
     except Exception as e:
         print(f"Error fetching data for {symbol}: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
 def run_backtest(symbols: List[str] = None, start_date: str = None, end_date: str = None,
-                initial_balance: float = INITIAL_BALANCE) -> BacktestEngine:
+                initial_balance: float = INITIAL_BALANCE, entry_only: bool = False, 
+                entry_hold_periods: int = 24) -> BacktestEngine:
     """Run backtest on specified symbols"""
     if symbols is None:
         symbols = BACKTEST_SYMBOLS
@@ -777,241 +934,312 @@ def run_backtest(symbols: List[str] = None, start_date: str = None, end_date: st
     engine = BacktestEngine(initial_balance)
     exchange = engine.exchange
     
-    print(f"Starting backtest from {start_date} to {end_date}")
-    print(f"Symbols: {symbols}")
-    print(f"Initial balance: ${initial_balance:.2f}")
-    print("-" * 80)
+    # Patch trader_v21's exchange to use our backtest exchange (without API keys)
+    # This prevents authentication errors when trader_v21 functions are called
+    original_trader_exchange = trader.exchange
+    trader.exchange = exchange
     
-    # Fetch historical data for all symbols
-    symbol_data = {}
-    for symbol in symbols:
-        print(f"Fetching data for {symbol}...")
-        df = fetch_historical_data(symbol, BACKTEST_TIMEFRAME, start_date, end_date, exchange)
-        if df is not None and len(df) > 200:  # Need enough data for indicators
-            symbol_data[symbol] = df
-            print(f"  Loaded {len(df)} candles for {symbol}")
-        else:
-            print(f"  Failed to load data for {symbol}")
-    
-    if not symbol_data:
-        print("No data loaded. Exiting.")
-        return engine
-    
-    # Get all unique timestamps (timestamp is the index after prepare_data_from_ohlcv)
-    all_timestamps = set()
-    for df in symbol_data.values():
-        all_timestamps.update(df.index.tolist())
-    all_timestamps = sorted(all_timestamps)
-    
-    print(f"\nProcessing {len(all_timestamps)} time steps...")
-    print("-" * 80)
-    
-    # Process each timestamp
-    for i, timestamp in enumerate(all_timestamps):
-        if i % 100 == 0:
-            print(f"Processing step {i}/{len(all_timestamps)}... Balance: ${engine.balance:.2f}, Open trades: {len(engine.open_trades)}")
+    try:
+        print(f"Starting backtest from {start_date} to {end_date}")
+        print(f"Symbols: {symbols}")
+        print(f"Initial balance: ${initial_balance:.2f}")
+        print("-" * 80)
         
-        # Check exits for open trades
-        for symbol, trade in list(engine.open_trades.items()):
-            if symbol not in symbol_data:
-                continue
-            
-            df = symbol_data[symbol]
-            # timestamp is the index, so check if it exists
-            if timestamp not in df.index:
-                continue
-            current_row = df.loc[[timestamp]]
-            
-            current_price = float(current_row['close'].iloc[0])
-            current_idx = df.index.get_loc(timestamp)
-            
-            # Get dataframes for indicators (use data up to current point)
-            df1h = df.iloc[:current_idx+1].copy() if current_idx >= 60 else None
-            if df1h is None or len(df1h) < 60:
-                continue
-            
-            # Prepare data for indicators
-            try:
-                df1h = prepare_data_from_ohlcv(df1h)
-                if df1h is None or len(df1h) < 60:
-                    continue
-            except Exception:
-                continue
-            
-            # For 15m and 4h, we'll use 1h data as approximation (in full backtest, fetch separately)
-            df15m = df1h
-            df4h = None
-            
-            should_exit, reason = engine.check_exit_conditions(
-                trade, current_price, timestamp, df1h, df15m, df4h
-            )
-            
-            if should_exit:
-                engine.execute_sell(trade, current_price, timestamp, reason)
-                print(f"SELL {symbol} @ ${current_price:.4f} | Reason: {reason} | PnL: ${(current_price - trade.entry_price) * trade.amount:.2f}")
-        
-        # Check for new buy signals
+        # Fetch historical data for all symbols
+        symbol_data = {}
         for symbol in symbols:
-            if symbol not in symbol_data:
-                continue
-            if not engine.can_open_trade(symbol):
-                continue
+            print(f"Fetching data for {symbol}...")
+            df = fetch_historical_data(symbol, BACKTEST_TIMEFRAME, start_date, end_date, exchange)
+            if df is not None and len(df) > 200:  # Need enough data for indicators
+                symbol_data[symbol] = df
+                print(f"  Loaded {len(df)} candles for {symbol}")
+            else:
+                print(f"  Failed to load data for {symbol}")
+        
+        if not symbol_data:
+            print("No data loaded. Exiting.")
+            trader.exchange = original_trader_exchange  # Restore before early return
+            return engine
+        
+        # Get all unique timestamps (timestamp is the index after prepare_data_from_ohlcv)
+        all_timestamps = set()
+        for df in symbol_data.values():
+            all_timestamps.update(df.index.tolist())
+        all_timestamps = sorted(all_timestamps)
+        
+        print(f"\nProcessing {len(all_timestamps)} time steps...")
+        print("-" * 80)
+        
+        # Process each timestamp
+        for i, timestamp in enumerate(all_timestamps):
+            if i % 100 == 0:
+                print(f"Processing step {i}/{len(all_timestamps)}... Balance: ${engine.balance:.2f}, Open trades: {len(engine.open_trades)}")
             
-            df = symbol_data[symbol]
-            # timestamp is the index, so check if it exists
-            if timestamp not in df.index:
-                continue
-            current_row = df.loc[[timestamp]]
-            
-            current_idx = df.index.get_loc(timestamp)
-            if current_idx < 200:  # Need enough history
-                continue
-            
-            # Prepare data up to current point
-            try:
-                df_prep = df.iloc[:current_idx+1].copy()
-                if len(df_prep) < 200:  # Need enough history
-                    continue
-                
-                df_prep = prepare_data_from_ohlcv(df_prep)
-                if df_prep is None or len(df_prep) < 60:
-                    continue
-                
-                # Temporarily override trader's fetch function to use our prepared data
-                # We need to mock the exchange calls in hybrid_decision
-                # For now, we'll create a simplified version that works with prepared data
-                
-                # Get buy signal using a modified approach
-                # Since hybrid_decision uses live exchange calls, we'll need to adapt
-                # For backtesting, we'll extract the core logic
-                current_price = float(current_row['close'].iloc[0])
-                action, conf, score, note = get_buy_signal_from_data(symbol, df_prep, current_price)
-                
-                if action == "buy" and score > 0:
-                    atr_abs = float(df_prep['ATR'].iloc[-1]) if pd.notna(df_prep['ATR'].iloc[-1]) else None
-                    
-                    if atr_abs is None or atr_abs <= 0:
+            # Check exits for open trades (skip if entry_only mode)
+            if not entry_only:
+                for symbol, trade in list(engine.open_trades.items()):
+                    if symbol not in symbol_data:
                         continue
                     
-                    # Extract indicator values at entry
-                    row = df_prep.iloc[-1]
-                    entry_indicators = {
-                        'ADX': float(row['ADX']) if pd.notna(row['ADX']) else None,
-                        'RSI': float(row['RSI']) if pd.notna(row['RSI']) else None,
-                        'RVOL10': float(row['RVOL10']) if pd.notna(row['RVOL10']) else None,
-                        'EMA20_above_EMA50': bool(row['EMA20'] > row['EMA50']) if pd.notna(row['EMA20']) and pd.notna(row['EMA50']) else None,
-                        'price_slope': float(row.get('PRICE_SLOPE10', 0.0) or 0.0),
-                        'close_above_EMA20': bool(row['close'] > row['EMA20']) if pd.notna(row['EMA20']) else None,
-                        'ATR_pct': float((atr_abs / current_price) * 100) if atr_abs else None,
-                        'score': score,
-                        'confidence': conf,
-                    }
+                    df = symbol_data[symbol]
+                    # timestamp is the index, so check if it exists
+                    if timestamp not in df.index:
+                        continue
+                    current_row = df.loc[[timestamp]]
                     
-                    trade = engine.execute_buy(symbol, current_price, atr_abs, timestamp)
-                    if trade:
-                        # Store indicators with trade index
-                        engine.entry_indicators.append(entry_indicators)
-                        print(f"BUY {symbol} @ ${current_price:.4f} | Score: {score:.2f} | Conf: {conf}% | {note}")
-            except Exception as e:
-                # Silently skip errors
-                pass
+                    current_price = float(current_row['close'].iloc[0])
+                    current_idx = df.index.get_loc(timestamp)
+                    
+                    # Get dataframes for indicators (use data up to current point)
+                    df1h = df.iloc[:current_idx+1].copy() if current_idx >= 60 else None
+                    if df1h is None or len(df1h) < 60:
+                        continue
+                    
+                    # Prepare data for indicators
+                    try:
+                        df1h = prepare_data_from_ohlcv(df1h)
+                        if df1h is None or len(df1h) < 60:
+                            continue
+                    except Exception:
+                        continue
+                    
+                    # For 15m and 4h, we'll use 1h data as approximation (in full backtest, fetch separately)
+                    df15m = df1h
+                    df4h = None
+                    
+                    should_exit, reason = engine.check_exit_conditions(
+                        trade, current_price, timestamp, df1h, df15m, df4h
+                    )
+                    
+                    if should_exit:
+                        engine.execute_sell(trade, current_price, timestamp, reason)
+                        print(f"SELL {symbol} @ ${current_price:.4f} | Reason: {reason} | PnL: ${(current_price - trade.entry_price) * trade.amount:.2f}")
+            else:
+                # Entry-only mode: Close trades after fixed period (no trailing stops)
+                for symbol, trade in list(engine.open_trades.items()):
+                    if symbol not in symbol_data:
+                        continue
+                    
+                    df = symbol_data[symbol]
+                    if timestamp not in df.index:
+                        continue
+                    
+                    current_row = df.loc[[timestamp]]
+                    current_price = float(current_row['close'].iloc[0])
+                    
+                    # Calculate how many periods have passed since entry
+                    try:
+                        entry_idx = df.index.get_loc(trade.entry_time) if trade.entry_time in df.index else None
+                        current_idx = df.index.get_loc(timestamp)
+                        
+                        if entry_idx is not None:
+                            periods_held = current_idx - entry_idx
+                            
+                            # Update highest price (for trend measurement)
+                            if current_price > trade.highest_price:
+                                trade.highest_price = current_price
+                            
+                            # Close after fixed period
+                            if periods_held >= entry_hold_periods:
+                                engine.execute_sell(trade, current_price, timestamp, f"entry_only_hold_{entry_hold_periods}periods")
+                                price_change_pct = ((current_price / trade.entry_price - 1) * 100)
+                                print(f"SELL {symbol} @ ${current_price:.4f} | Entry-only: {periods_held} periods | Price change: {price_change_pct:.2f}%")
+                    except (KeyError, ValueError):
+                        # Entry time not in index, skip
+                        continue
+            
+            # Check for new buy signals
+            for symbol in symbols:
+                if symbol not in symbol_data:
+                    continue
+                if not engine.can_open_trade(symbol):
+                    continue
+                
+                df = symbol_data[symbol]
+                # timestamp is the index, so check if it exists
+                if timestamp not in df.index:
+                    continue
+                current_row = df.loc[[timestamp]]
+                
+                current_idx = df.index.get_loc(timestamp)
+                if current_idx < 200:  # Need enough history
+                    continue
+                
+                # Prepare data up to current point
+                try:
+                    df_prep = df.iloc[:current_idx+1].copy()
+                    if len(df_prep) < 200:  # Need enough history
+                        continue
+                    
+                    df_prep = prepare_data_from_ohlcv(df_prep)
+                    if df_prep is None or len(df_prep) < 60:
+                        continue
+                    
+                    # Temporarily override trader's fetch function to use our prepared data
+                    # We need to mock the exchange calls in hybrid_decision
+                    # For now, we'll create a simplified version that works with prepared data
+                    
+                    # Get buy signal using a modified approach
+                    # Since hybrid_decision uses live exchange calls, we'll need to adapt
+                    # For backtesting, we'll extract the core logic
+                    current_price = float(current_row['close'].iloc[0])
+                    # Pass trend params if available from trader module
+                    trend_params = {}
+                    try:
+                        trend_params['MIN_SLOPE10_PCT'] = getattr(trader, 'MIN_SLOPE10_PCT', None)
+                        trend_params['MIN_SLOPE20_PCT'] = getattr(trader, 'MIN_SLOPE20_PCT', None)
+                        trend_params['MAX_NEAR_HIGH_PCT'] = getattr(trader, 'MAX_NEAR_HIGH_PCT', None)
+                        trend_params = {k: v for k, v in trend_params.items() if v is not None}
+                    except:
+                        pass
+                    action, conf, score, note = get_buy_signal_from_data(symbol, df_prep, current_price, params=trend_params if trend_params else None)
+                    
+                    if action == "buy" and score > 0:
+                        atr_abs = float(df_prep['ATR'].iloc[-1]) if pd.notna(df_prep['ATR'].iloc[-1]) else None
+                        
+                        if atr_abs is None or atr_abs <= 0:
+                            continue
+                        
+                        # Extract indicator values at entry
+                        row = df_prep.iloc[-1]
+                        # Calculate trend_score: composite metric combining slopes and distance from high
+                        # Based on analysis: successful trends have better price_slope10_pct, price_slope20_pct, and price_near_high_pct
+                        price_slope10_pct_val = float(row.get('PRICE_SLOPE10_PCT', 0.0) or 0.0)
+                        price_slope20_pct_val = float(row.get('PRICE_SLOPE20_PCT', 0.0) or 0.0) if pd.notna(row.get('PRICE_SLOPE20_PCT')) else 0.0
+                        price_near_high_pct_val = float(row.get('PRICE_NEAR_HIGH_PCT', -10.0) or -10.0)
+                        
+                        # trend_score: weighted combination
+                        # 0.7 * slope10 (short-term momentum) + 0.3 * slope20 (medium-term trend) + 0.2 * (-near_high) (distance from peak, negative = good)
+                        trend_score = (
+                            0.7 * price_slope10_pct_val +
+                            0.3 * price_slope20_pct_val +
+                            0.2 * (-price_near_high_pct_val)  # lejos del máximo reciente suma (negative = good)
+                        )
+                        
+                        entry_indicators = {
+                            'ADX': float(row['ADX']) if pd.notna(row['ADX']) else None,
+                            'RSI': float(row['RSI']) if pd.notna(row['RSI']) else None,
+                            'RVOL10': float(row['RVOL10']) if pd.notna(row['RVOL10']) else None,
+                            'EMA20_above_EMA50': bool(row['EMA20'] > row['EMA50']) if pd.notna(row['EMA20']) and pd.notna(row['EMA50']) else None,
+                            'price_slope10_pct': price_slope10_pct_val,
+                            'price_slope20_pct': price_slope20_pct_val if pd.notna(row.get('PRICE_SLOPE20_PCT')) else None,
+                            'price_near_high_pct': price_near_high_pct_val,
+                            'trend_score': trend_score,  # Composite trend metric
+                            'close_above_EMA20': bool(row['close'] > row['EMA20']) if pd.notna(row['EMA20']) else None,
+                            'ATR_pct': float((atr_abs / current_price) * 100) if atr_abs else None,
+                            'score': score,
+                            'confidence': conf,
+                        }
+                        
+                        trade = engine.execute_buy(symbol, current_price, atr_abs, timestamp)
+                        if trade:
+                            # Store indicators with trade index
+                            engine.entry_indicators.append(entry_indicators)
+                            print(f"BUY {symbol} @ ${current_price:.4f} | Score: {score:.2f} | Conf: {conf}% | {note}")
+                except Exception as e:
+                    # Silently skip errors
+                    pass
+            
+            # Update equity curve
+            engine.update_equity(timestamp)
         
-        # Update equity curve
-        engine.update_equity(timestamp)
-    
-    print("\n" + "=" * 80)
-    print("BACKTEST COMPLETE")
-    print("=" * 80)
-    
-    stats = engine.get_statistics()
-    print("\n--- PERFORMANCE STATISTICS ---")
-    for key, value in stats.items():
-        if isinstance(value, float):
-            print(f"{key}: {value:.2f}")
+        print("\n" + "=" * 80)
+        print("BACKTEST COMPLETE")
+        print("=" * 80)
+        
+        stats = engine.get_statistics()
+        print("\n--- PERFORMANCE STATISTICS ---")
+        for key, value in stats.items():
+            if isinstance(value, float):
+                print(f"{key}: {value:.2f}")
+            else:
+                print(f"{key}: {value}")
+        
+        # Indicator Analysis
+        print("\n" + "=" * 80)
+        print("INDICATOR ANALYSIS - What predicts steady upward trends?")
+        print("=" * 80)
+        
+        if engine.closed_trades and len(engine.entry_indicators) > 0:
+            # Ensure we have matching entries
+            min_len = min(len(engine.closed_trades), len(engine.entry_indicators))
+            engine.entry_indicators = engine.entry_indicators[:min_len]
+            
+            df_trades = pd.DataFrame(engine.closed_trades[:min_len])
+            df_indicators = pd.DataFrame(engine.entry_indicators[:min_len])
+            
+            # Separate winning and losing trades
+            winning_trades = df_trades[df_trades['pnl'] > 0]
+            losing_trades = df_trades[df_trades['pnl'] <= 0]
+            
+            print(f"\nTotal trades analyzed: {len(df_trades)}")
+            print(f"Winning trades: {len(winning_trades)} ({len(winning_trades)/len(df_trades)*100:.1f}%)")
+            print(f"Losing trades: {len(losing_trades)} ({len(losing_trades)/len(df_trades)*100:.1f}%)")
+            
+            # Analyze each indicator
+            print("\n--- INDICATOR COMPARISON (Winning vs Losing Trades) ---")
+            
+            indicators_to_check = ['ADX', 'RSI', 'RVOL10', 'price_slope10_pct', 'price_slope20_pct', 'trend_score', 'ATR_pct', 'score']
+            
+            for indicator in indicators_to_check:
+                if indicator not in df_indicators.columns:
+                    continue
+                
+                win_vals = df_indicators.loc[winning_trades.index, indicator].dropna() if len(winning_trades) > 0 else pd.Series()
+                loss_vals = df_indicators.loc[losing_trades.index, indicator].dropna() if len(losing_trades) > 0 else pd.Series()
+                
+                if len(win_vals) > 0 and len(loss_vals) > 0:
+                    win_mean = win_vals.mean()
+                    loss_mean = loss_vals.mean()
+                    diff = win_mean - loss_mean
+                    diff_pct = (diff / abs(loss_mean) * 100) if loss_mean != 0 else 0
+                    
+                    print(f"\n{indicator}:")
+                    print(f"  Winning trades avg: {win_mean:.3f} (median: {win_vals.median():.3f})")
+                    print(f"  Losing trades avg:  {loss_mean:.3f} (median: {loss_vals.median():.3f})")
+                    print(f"  Difference: {diff:+.3f} ({diff_pct:+.1f}%)")
+                    
+                    # Statistical significance (simple t-test approximation)
+                    if len(win_vals) > 5 and len(loss_vals) > 5:
+                        win_std = win_vals.std()
+                        loss_std = loss_vals.std()
+                        pooled_std = np.sqrt((win_std**2 + loss_std**2) / 2)
+                        if pooled_std > 0:
+                            t_stat = diff / (pooled_std * np.sqrt(1/len(win_vals) + 1/len(loss_vals)))
+                            print(f"  T-statistic: {t_stat:.2f} ({'***' if abs(t_stat) > 2.5 else '**' if abs(t_stat) > 2.0 else '*' if abs(t_stat) > 1.5 else ''})")
+            
+            # Analyze combinations
+            print("\n--- BEST INDICATOR COMBINATIONS FOR WINNING TRADES ---")
+            
+            # Find trades with best returns
+            top_trades = df_trades.nlargest(min(10, len(df_trades)), 'pnl_pct')
+            if len(top_trades) > 0:
+                top_indicators = df_indicators.loc[top_trades.index]
+                print(f"\nTop {len(top_trades)} trades (by return %):")
+                for indicator in ['ADX', 'RSI', 'RVOL10', 'score']:
+                    if indicator in top_indicators.columns:
+                        avg = top_indicators[indicator].mean()
+                        print(f"  {indicator}: {avg:.3f} (avg)")
+            
+            # Analyze steady trends (trades that went up and stayed up)
+            steady_winners = df_trades[
+                (df_trades['pnl_pct'] > 2.0) &  # At least 2% gain
+                (df_trades['max_gain_pct'] > df_trades['pnl_pct'] * 0.8)  # Didn't give back much
+            ]
+            
+            if len(steady_winners) > 0:
+                print(f"\n--- STEADY TREND INDICATORS ({len(steady_winners)} trades) ---")
+                steady_indicators = df_indicators.loc[steady_winners.index]
+                for indicator in ['ADX', 'RSI', 'RVOL10', 'price_slope10_pct', 'price_slope20_pct', 'trend_score', 'score']:
+                    if indicator in steady_indicators.columns:
+                        avg = steady_indicators[indicator].mean()
+                        print(f"  {indicator}: {avg:.3f} (avg)")
         else:
-            print(f"{key}: {value}")
+            print("No indicator data available for analysis")
     
-    # Indicator Analysis
-    print("\n" + "=" * 80)
-    print("INDICATOR ANALYSIS - What predicts steady upward trends?")
-    print("=" * 80)
-    
-    if engine.closed_trades and len(engine.entry_indicators) > 0:
-        # Ensure we have matching entries
-        min_len = min(len(engine.closed_trades), len(engine.entry_indicators))
-        engine.entry_indicators = engine.entry_indicators[:min_len]
-        
-        df_trades = pd.DataFrame(engine.closed_trades[:min_len])
-        df_indicators = pd.DataFrame(engine.entry_indicators[:min_len])
-        
-        # Separate winning and losing trades
-        winning_trades = df_trades[df_trades['pnl'] > 0]
-        losing_trades = df_trades[df_trades['pnl'] <= 0]
-        
-        print(f"\nTotal trades analyzed: {len(df_trades)}")
-        print(f"Winning trades: {len(winning_trades)} ({len(winning_trades)/len(df_trades)*100:.1f}%)")
-        print(f"Losing trades: {len(losing_trades)} ({len(losing_trades)/len(df_trades)*100:.1f}%)")
-        
-        # Analyze each indicator
-        print("\n--- INDICATOR COMPARISON (Winning vs Losing Trades) ---")
-        
-        indicators_to_check = ['ADX', 'RSI', 'RVOL10', 'price_slope', 'ATR_pct', 'score']
-        
-        for indicator in indicators_to_check:
-            if indicator not in df_indicators.columns:
-                continue
-            
-            win_vals = df_indicators.loc[winning_trades.index, indicator].dropna() if len(winning_trades) > 0 else pd.Series()
-            loss_vals = df_indicators.loc[losing_trades.index, indicator].dropna() if len(losing_trades) > 0 else pd.Series()
-            
-            if len(win_vals) > 0 and len(loss_vals) > 0:
-                win_mean = win_vals.mean()
-                loss_mean = loss_vals.mean()
-                diff = win_mean - loss_mean
-                diff_pct = (diff / abs(loss_mean) * 100) if loss_mean != 0 else 0
-                
-                print(f"\n{indicator}:")
-                print(f"  Winning trades avg: {win_mean:.3f} (median: {win_vals.median():.3f})")
-                print(f"  Losing trades avg:  {loss_mean:.3f} (median: {loss_vals.median():.3f})")
-                print(f"  Difference: {diff:+.3f} ({diff_pct:+.1f}%)")
-                
-                # Statistical significance (simple t-test approximation)
-                if len(win_vals) > 5 and len(loss_vals) > 5:
-                    win_std = win_vals.std()
-                    loss_std = loss_vals.std()
-                    pooled_std = np.sqrt((win_std**2 + loss_std**2) / 2)
-                    if pooled_std > 0:
-                        t_stat = diff / (pooled_std * np.sqrt(1/len(win_vals) + 1/len(loss_vals)))
-                        print(f"  T-statistic: {t_stat:.2f} ({'***' if abs(t_stat) > 2.5 else '**' if abs(t_stat) > 2.0 else '*' if abs(t_stat) > 1.5 else ''})")
-        
-        # Analyze combinations
-        print("\n--- BEST INDICATOR COMBINATIONS FOR WINNING TRADES ---")
-        
-        # Find trades with best returns
-        top_trades = df_trades.nlargest(min(10, len(df_trades)), 'pnl_pct')
-        if len(top_trades) > 0:
-            top_indicators = df_indicators.loc[top_trades.index]
-            print(f"\nTop {len(top_trades)} trades (by return %):")
-            for indicator in ['ADX', 'RSI', 'RVOL10', 'score']:
-                if indicator in top_indicators.columns:
-                    avg = top_indicators[indicator].mean()
-                    print(f"  {indicator}: {avg:.3f} (avg)")
-        
-        # Analyze steady trends (trades that went up and stayed up)
-        steady_winners = df_trades[
-            (df_trades['pnl_pct'] > 2.0) &  # At least 2% gain
-            (df_trades['max_gain_pct'] > df_trades['pnl_pct'] * 0.8)  # Didn't give back much
-        ]
-        
-        if len(steady_winners) > 0:
-            print(f"\n--- STEADY TREND INDICATORS ({len(steady_winners)} trades) ---")
-            steady_indicators = df_indicators.loc[steady_winners.index]
-            for indicator in ['ADX', 'RSI', 'RVOL10', 'price_slope', 'score']:
-                if indicator in steady_indicators.columns:
-                    avg = steady_indicators[indicator].mean()
-                    print(f"  {indicator}: {avg:.3f} (avg)")
-    else:
-        print("No indicator data available for analysis")
+    finally:
+        # Restore original exchange to avoid affecting other operations
+        trader.exchange = original_trader_exchange
     
     return engine
 

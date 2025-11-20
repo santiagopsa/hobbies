@@ -169,9 +169,9 @@ DECISION_TIMEFRAME = "1h"
 SPREAD_MAX_PCT_DEFAULT = 0.005   # 0.5%
 MIN_QUOTE_VOL_24H_DEFAULT = 3_000_000
 
-ADX_MIN_DEFAULT = 22
-RSI_MIN_DEFAULT, RSI_MAX_DEFAULT = 48, 72
-RVOL_BASE_DEFAULT = 1.5
+ADX_MIN_DEFAULT = 24  # Ajustado conservadoramente desde 22
+RSI_MIN_DEFAULT, RSI_MAX_DEFAULT = 44, 68  # Ajustado según análisis: medianas en low 40s-high 50s
+RVOL_BASE_DEFAULT = 1.35  # Ajustado desde 1.5: tendencias buenas viven entre 1.1-1.3
 # >>> PATCH START: gate & cooldowns
 SCORE_GATE_START = 4.8
 SCORE_GATE_MAX = 5.8
@@ -183,9 +183,9 @@ COOLDOWN_AFTER_SCRATCHES_MIN = 60  # minutes — after 2 scratches in <2h
 # >>> PATCH END
 
 # Learning ranges & rates
-ADX_MIN_RANGE = (15, 35)
-RSI_MAX_RANGE = (60, 80)
-RVOL_BASE_RANGE = (1.2, 3.0)
+ADX_MIN_RANGE = (15, 35)  # Sin cambios
+RSI_MAX_RANGE = (60, 80)  # Sin cambios
+RVOL_BASE_RANGE = (1.10, 2.50)  # Ajustado: piso más bajo (1.10 vs 1.2) para no perder trades válidos
 LEARN_RATE = 0.15
 LEARN_MIN_SAMPLES = 6
 LEARN_DAILY_CLIP = 0.5
@@ -275,7 +275,7 @@ RVOL_SPIKE_K_BONUS = 0.4   # aumento temporal de k si hay spike de RVOL (gracia 
 RVOL_K_BONUS_MINUTES = 15
 
 # Break-even cuando el trade alcanza X R
-BE_R_MULT = 1.3            # go BE at 1.0R to reduce scratches
+BE_R_MULT = 1.3            # go BE at 1.0R to reduce scratches (ajustar después del backtest si es necesario)
 
 # Dead-tape hard block
 DEAD_TAPE_RVOL10_HARD = 0.20
@@ -1133,18 +1133,12 @@ def compute_timeframe_features(df: pd.DataFrame, label: str):
         atr = ta.atr(df['high'], df['low'], df['close'], length=14)
 
         macd_df = ta.macd(df['close'], fast=12, slow=26, signal=9)
-        macd  = macd_df['MACD_12_26_9']  if macd_df is not None and not macd_df.empty else pd.Series(index=df.index, dtype=float)
-        macds = macd_df['MACDs_12_26_9'] if macd_df is not None and not macd_df.empty else pd.Series(index=df.index, dtype=float)
-        macdh = macd_df['MACDh_12_26_9'].iloc[-1] if macd_df is not None else -999
-        if macdh <= 0:  # New: Early momentum filter
-            return "hold", 50, 0.0, "MACD hist negative"
-        # Loosen RVOL check
-        if rvol < 1.3:  # Updated min
-            return "hold", 50, 0.0, "low RVOL"
-        # ADX slope for trend build
-        adx_slope = linregress(range(6), df['ADX'].iloc[-6:]).slope
-        if adx_slope <= 0 and adx < 22:
-            return "hold", 50, 0.0, "ADX not rising"
+        if macd_df is not None and not macd_df.empty:
+            macd  = macd_df['MACD_12_26_9']
+            macds = macd_df['MACDs_12_26_9']
+            macdh = macd_df['MACDh_12_26_9']
+        else:
+            macd = macds = macdh = pd.Series(index=df.index, dtype=float)
 
         stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3, smooth_k=3)
         stoch_k = stoch['STOCHk_14_3_3'] if stoch is not None and not stoch.empty else pd.Series(index=df.index, dtype=float)
@@ -2156,19 +2150,20 @@ def hybrid_decision(symbol: str):
 
     if projected_move is not None and projected_move < need_edge:
         msg = f"projected move {projected_move:.2f}% < req {need_edge:.2f}% (fees x{edge_mult_eff:.1f})"
-        if (rvol1_local >= 1.30 or adx_local >= 30.0):
+        if (rvol1_local >= 1.8 and adx_local >= 32.0):
+            # SOLO SOFT: bajar score, pero no bloquear todo en tapes muy fuertes
             blocks.append("SOFT block: " + msg)
             if level != "HARD": level = "SOFT"
         else:
+            # HARD gate en tapes flojos
             blocks.append("HARD block: " + msg)
             level = "HARD"
 
-    if projected_move is not None and projected_move < need_edge:
-        blocks.append(f"HARD block: projected move {projected_move:.2f}% < req {need_edge:.2f}% (fees x{ENTRY_EDGE_MULT:.1f})")
-        level = "HARD"
-
 
     # ===== local 1h features =====
+    # NOTE: EMA20/EMA50 and close_above_EMA20 are NO LONGER hard filters
+    # Analysis shows: ~47% of winners don't have EMA20>EMA50, ~67% don't have close>EMA20
+    # These are now only used for score bonus, not as entry gates
     in_lane = bool(row['EMA20'] > row['EMA50'] and row['close'] > row['EMA20'])
       # --- RVOL/ADX locals (safe, no tf1h/tf15 leakage) ---
     def _fx(x, d=0.0):
@@ -2209,48 +2204,33 @@ def hybrid_decision(symbol: str):
 
 
 
-    # >>> NEW: ADX floor + gray zone (replaces old scratch block + <15 floor)
-    # Hard block if ADX < 17.5. Gray zone 17.5–22 allowed only if slope>0 and 4h ADX≥25.
-    tf4h_for_adx = quick_tf_snapshot(symbol, '4h', limit=120)
-    adx4h_for_gate = tf4h_for_adx.get('ADX')
-
-    # ADX gray zone
+    # >>> SIMPLIFIED: ADX hard filter (based on analysis: winners ~31, losers ~28, range 18-50)
+    # Analysis shows: too low = no trend, too high = often too late/exhausted
     if adx is not None:
-        if adx < 17.5:
-            blocks.append("HARD block: ADX<17.5")
+        if adx < 18.0:
+            blocks.append(f"HARD block: ADX<18 ({adx:.1f})")
             level = "HARD"
-        elif adx < 22.0:
-            # Was hard unless slope>0 & 4h ADX>=25; now soften:
-            allow = (adx_slope_1h > 0) and ( ((rv15 or 0) >= 1.10) or (adx4h_for_gate or 0) >= 25 or retest_ok )
-            if not allow:
-                # make it SOFT unless slope≤0 and no retest
-                if adx_slope_1h <= 0 and not retest_ok:
-                    blocks.append("HARD block: ADX<22 + slope≤0 + no retest")
-                    level = "HARD"
-                else:
-                    blocks.append("SOFT block: ADX<22 needs retest or (slope>0 + RVOL15≥1.1)")
-                    if level != "HARD": level = "SOFT"
+        elif adx > 50.0:
+            blocks.append(f"HARD block: ADX>50 ({adx:.1f}) - likely exhausted")
+            level = "HARD"
 
 
-    # Keep minimal volume sanity (by volatility class)
-    rvol1_floor, rvol15_floor = rvol_floors_by_regime(klass)
-
-    # Para coins "stable" permitimos algo menos de RVOL1h, para "unstable" exigimos más
-    if klass == "stable":
-        hard_floor = max(0.70, rvol1_floor - 0.10)  # p.ej. ~0.80
-    else:
-        hard_floor = rvol1_floor
-
-    soft_floor = max(hard_floor + 0.10, 0.90)
-
-    if rvol_1h is not None and rvol_1h < hard_floor:
-        blocks.append(f"HARD block: 1h RVOL too low for {klass} (rvol={rvol_1h:.2f} < {hard_floor:.2f})")
+    # RSI: winners ~44, losers ~51 (anti-overbought filter)
+    # Best trades don't enter with very high RSI
+    rsi = float(row['RSI']) if pd.notna(row['RSI']) else None
+    if rsi is not None:
+        if rsi < 30.0:
+            blocks.append(f"HARD block: RSI too low ({rsi:.1f} < 30)")
+            level = "HARD"
+        elif rsi > 60.0:
+            blocks.append(f"HARD block: RSI too high ({rsi:.1f} > 60) - likely overbought")
+            level = "HARD"
+    
+    # RVOL10: winners ~1.43, losers ~1.03 (simple soft filter)
+    # Don't enter when volume is dead, but don't require huge spikes
+    if rvol_1h is not None and rvol_1h < 0.6:
+        blocks.append(f"HARD block: RVOL10 too low ({rvol_1h:.2f} < 0.6)")
         level = "HARD"
-
-    if (rvol_1h is not None and rvol_1h < soft_floor) and level != "HARD":
-        if not ((macdh15 or 0) >= 0 and (rv15 or 0) >= 1.00):
-            blocks.append(f"SOFT block: 1h RVOL<{soft_floor:.2f} without MACDh≥0 & RVOL15≥1.0")
-            level = "SOFT"
 
 
 
@@ -2565,17 +2545,10 @@ def hybrid_decision(symbol: str):
     except Exception:
         pass
 
-    # ===== lane/override logic (ANCHOR-5: make override a bit easier) =====
-    override = (
-        (not in_lane)
-        and (adx >= ADX_MIN_K + 6)
-        and ( ((rvol_1h or 0) >= (RVOL_BASE_K * 1.2)) or ((rv15 or 0) >= 1.2) )
-        and (price_slope > 0)
-    )
-
-    if not (in_lane or override):
-        blocks.append("not in uptrend lane; no override")
-        if level != "HARD": level = "SOFT"
+    # ===== lane/override logic: REMOVED as hard filter =====
+    # EMA20/EMA50 alignment is now only a score bonus, not a hard gate
+    # This allows mean-reversion trades that analysis shows are profitable
+    # (in_lane and override logic removed - no longer blocking entries)
 
     # >>> 15m momentum quality (ANCHOR Q15M)
     rsi15_now = tf15.get('RSI')
@@ -2752,6 +2725,36 @@ def hybrid_decision(symbol: str):
     except Exception:
         pass
 
+    # >>> SIMPLIFIED: EMA/EMA50 and price_slope are now score bonuses, not hard filters
+    # Analysis shows: ~47% of winners don't have EMA20>EMA50, ~67% don't have close>EMA20
+    # These are bonuses for trend-following entries, but don't block mean-reversion trades
+    
+    # EMA20/EMA50 alignment bonus (trend-following signal)
+    if row['EMA20'] > row['EMA50']:
+        score += 1.0
+        notes.append("EMA20>EMA50 (trend-following bonus)")
+    
+    # Close above EMA20 bonus
+    if row['close'] > row['EMA20']:
+        score += 0.5
+        notes.append("close>EMA20 bonus")
+    
+    # Price slope bonus (positive = continuation, negative = pullback)
+    # Not a hard filter, just helps classify trade type
+    if price_slope > 0:
+        score += 0.5
+        notes.append("price_slope>0 (continuation signal)")
+    elif price_slope < 0:
+        score += 0.3
+        notes.append("price_slope<0 (pullback signal)")
+    
+    # Price near high bonus (winners tend to enter after small pullback from high)
+    # Winners: ~-4%, Losers: ~-1.8% → entering after pullback is better
+    price_near_high_pct = float(row.get('PRICE_NEAR_HIGH_PCT', -10.0) or -10.0)
+    if -10.0 <= price_near_high_pct <= -0.7:
+        score += 1.0
+        notes.append(f"price_near_high_pct in sweet spot ({price_near_high_pct:.2f}%)")
+    
     # Defensa 6: Alineación MTF light (aplica leading_bonus SOLO si alineado)
     if not (row['EMA20'] > row['EMA50'] and adx_slope_1h > 0):
         notes.append("MTF misaligned → sin bonus leading")
@@ -2759,17 +2762,20 @@ def hybrid_decision(symbol: str):
     else:
         score += leading_bonus  # apply once when aligned
 
-    # RSI band
-    if RSI_MIN_K <= rsi <= RSI_MAX_K:
+    # RSI band (already filtered by hard filter 30-60, so this is just scoring)
+    if 30.0 <= rsi <= 60.0:
         score += 1.0; notes.append(f"RSI in band ({rsi:.1f})")
-    if rsi >= (RSI_MIN_K + RSI_MAX_K)/2:
+    if rsi >= 45.0:  # Middle of range
         score += 0.5
 
-    if adx >= ADX_MIN_K:
-        score += 1.0; notes.append(f"ADX≥{ADX_MIN_K:.0f} ({adx:.1f})")
+    if adx >= 18.0:  # Already filtered by hard filter, so this is just scoring
+        score += 1.0; notes.append(f"ADX≥18 ({adx:.1f})")
 
+    # Volume slope bonus (not a hard filter, just helps prioritize)
     vol_slope = float(row.get('VOL_SLOPE10', 0.0) or 0.0)
-    if vol_slope > 0: score += 0.5
+    if vol_slope > 0: 
+        score += 0.5
+        notes.append("vol_slope>0 bonus")
 
     # Spread penalty
     try:
@@ -3371,9 +3377,19 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 # Replace held_long_enough
                 held_long_enough = held >= max(60, effective_min_hold)
 
-                # Arm trailing only after +ARM_TRAIL_PCT% gain
+                # Arm trailing based on R-multiple (not fixed %)
+                # Based on analysis: good trades have MFE ~6%, TP at 5%, MAE ~-2% with SL -3%
+                # This suggests: "Let me reach at least ~1R before putting on the safety belt"
+                gain = price - purchase_price
                 gain_pct_now = (price / purchase_price - 1.0) * 100.0
-                trail_armed = gain_pct_now >= ARM_TRAIL_PCT
+                
+                # Modular activation: strong trends get more breathing room
+                if strong_trend:
+                    # In strong trends (ADX1h/4h >= 30): let winners breathe, arm at 1.5R
+                    trail_armed = gain >= 1.5 * initial_R
+                else:
+                    # In non-trending markets: arm earlier at 1.0R (more noise, need protection)
+                    trail_armed = gain >= BE_R_MULT * initial_R
 
                 # Effective k
                 k_eff = base_k
@@ -3396,6 +3412,50 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                     except Exception:
                         pass
 
+                # >>> Dynamic k adjustment based on volume (from analysis)
+                # Analysis shows: successful trends have much higher volume_slope10, volume_ratio, RVOL10
+                # While RVOL and volume_slope10 are strong → keep k high (loose trailing)
+                # When volume collapses → tighten k (aggressive trailing) or let Donchian/EMA take the trade
+                try:
+                    df15v_k = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=60)
+                    if df15v_k is not None and len(df15v_k) > 20:
+                        # RVOL15 closed (more reliable than live)
+                        vol_closed_k = df15v_k['volume'].shift(1)
+                        rv_mean_k = vol_closed_k.rolling(10).mean().iloc[-1]
+                        rvol15_closed_k = float(vol_closed_k.iloc[-1] / rv_mean_k) if (rv_mean_k and rv_mean_k > RVOL_MEAN_MIN) else None
+                        
+                        # Volume slope (10 periods)
+                        if len(df15v_k) >= 10:
+                            from scipy.stats import linregress
+                            x_vol = np.arange(10)
+                            volume_slope10 = linregress(x_vol, df15v_k['volume'].iloc[-10:]).slope
+                        else:
+                            volume_slope10 = None
+                        
+                        # Volume ratio (current / 20-period avg)
+                        vol_20_avg = df15v_k['volume'].rolling(20).mean().iloc[-1]
+                        volume_ratio = float(df15v_k['volume'].iloc[-1] / vol_20_avg) if (vol_20_avg and vol_20_avg > 0) else None
+                        
+                        # Tighten k if volume collapses
+                        if rvol15_closed_k is not None and rvol15_closed_k < 0.75:
+                            # Volume collapse: tighten trailing
+                            k_eff = max(1.2, k_eff - 0.3)
+                            logger.debug(f"[trail-vol] {symbol} RVOL15_closed={rvol15_closed_k:.2f} < 0.75 → tightening k")
+                        elif volume_slope10 is not None and volume_slope10 < 0:
+                            # Volume slope negative: tightening
+                            k_eff = max(1.2, k_eff - 0.2)
+                            logger.debug(f"[trail-vol] {symbol} volume_slope10={volume_slope10:.0f} < 0 → tightening k")
+                        elif volume_ratio is not None and volume_ratio < 0.8:
+                            # Volume ratio falling: slight tightening
+                            k_eff = max(1.2, k_eff - 0.15)
+                            logger.debug(f"[trail-vol] {symbol} volume_ratio={volume_ratio:.2f} < 0.8 → slight tightening")
+                        elif rvol15_closed_k is not None and rvol15_closed_k >= 1.3 and volume_slope10 is not None and volume_slope10 > 0:
+                            # Strong volume: maintain or slightly widen k
+                            k_eff = min(k_eff + 0.1, base_k + 0.5)
+                            logger.debug(f"[trail-vol] {symbol} strong volume (RVOL={rvol15_closed_k:.2f}, slope>0) → maintaining k")
+                except Exception as e:
+                    logger.debug(f"[trail-vol] volume-based k adjustment failed {symbol}: {e}")
+
                 # Soft tighten via 15m signals (disabled in strong trend)
                 if not strong_trend:
                     try:
@@ -3412,10 +3472,24 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                             rsi15 = float(ta.rsi(df15t['close'], length=14).iloc[-1])
                             macd15t = ta.macd(df15t['close'], fast=12, slow=26, signal=9)
                             macdh15t = float(macd15t['MACDh_12_26_9'].iloc[-1]) if macd15t is not None else None
-                            if rsi15 >= NBUS_RSI15_OB and (macdh15t or 0) < 0:
+                            
+                            # Improved soft-tighten based on analysis:
+                            # Analysis shows: good entries at RSI 40-60, not 70-80
+                            # In trailing: RSI15 high + MACDh turning negative = exhaustion signal
+                            # Soft-tighten when: RSI15 > 65-70 and MACDh15 <= 0
+                            if rsi15 >= 65.0 and (macdh15t or 0) <= 0:
+                                # More aggressive tightening for exhaustion
                                 soft_tighten_until = time.time() + 2 * 15 * 60
+                                if rsi15 >= 70.0:
+                                    # Very overbought: more aggressive
+                                    k_eff = max(1.2, k_eff - SOFT_TIGHTEN_K - 0.2)
+                                else:
+                                    # Moderately overbought: standard tightening
+                                    k_eff = max(1.2, k_eff - SOFT_TIGHTEN_K)
                         if soft_tighten_until and time.time() <= soft_tighten_until:
-                            k_eff = max(1.2, k_eff - SOFT_TIGHTEN_K)
+                            # Apply additional tightening if still in soft-tighten window
+                            if k_eff > 1.2:  # Only if not already at minimum
+                                k_eff = max(1.2, k_eff - SOFT_TIGHTEN_K * 0.5)
                     except Exception:
                         pass
                 # >>> TWEAK5: early_flip_tighten (within 30m of entry)
@@ -3448,7 +3522,7 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                     else:                           k_eff = max(k_eff, STRONG_TREND_K_MEDIUM)
 
                 # R tiers: BE and tier2 tighten
-                gain = price - purchase_price
+                # (gain already calculated above for trail_armed)
                 if gain >= BE_R_MULT * initial_R:
                     be_stop = purchase_price * (1.0 + required_edge_pct()/100.0)
                     stop_price = max(stop_price, be_stop)

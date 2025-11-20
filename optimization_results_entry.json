@@ -1,0 +1,37 @@
+{
+  "best_parameters": {
+    "RISK_FRACTION": 0.2396392418986636,
+    "ADX_MIN": 19.87411944097582,
+    "RSI_MIN": 46.99120161183846,
+    "RSI_MAX": 69.34813568774044,
+    "RVOL_BASE": 1.7741347352750596,
+    "SCORE_GATE": 5.118868463489108,
+    "MIN_SLOPE10_PCT": 0.09461146824623057,
+    "MIN_SLOPE20_PCT": 0.09790786911465858,
+    "MAX_NEAR_HIGH_PCT": -1.0011698196421341
+  },
+  "best_statistics": {
+    "initial_balance": 1000.0,
+    "final_balance": 920.3113915668232,
+    "total_return_pct": -7.968860843317679,
+    "total_trades": 201,
+    "winning_trades": 80,
+    "losing_trades": 121,
+    "win_rate_pct": 39.800995024875625,
+    "total_pnl": -79.68860843317687,
+    "avg_win": 1.9184021089466583,
+    "avg_loss": -1.9269485714785912,
+    "profit_factor": 0.6582246404922417,
+    "max_drawdown_pct": 9.85516413812184,
+    "avg_trade_duration_hours": 3.0497512437810945,
+    "best_trade_pct": 5.834700787238023,
+    "worst_trade_pct": -3.121400527612983,
+    "trend_accuracy_pct": 68.65671641791045,
+    "trend_correct_trades": 138,
+    "trend_avg_gain_pct": 0.65712629470238,
+    "trend_max_gain_pct": 0.65712629470238,
+    "sustained_trend_pct": 8.45771144278607
+  },
+  "optimization_history": [],
+  "all_results_count": 0
+}
