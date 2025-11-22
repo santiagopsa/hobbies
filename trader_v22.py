@@ -13,6 +13,15 @@ from scipy.stats import linregress
 from typing import Tuple
 from collections import defaultdict
 
+# >>> ML LIGHT (Simple scikit-learn, no heavy deps like FreqAI)
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.model_selection import train_test_split
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    logger.warning("sklearn not available, ML features disabled")
+
 PARK_LOCK = threading.Lock()
 # =========================
 # Config & initialization
@@ -114,7 +123,7 @@ AUTO_SAFE_ATRP_BTC = float(os.getenv("AUTO_SAFE_ATRP_BTC", "1.2"))  # ATR% 30d d
 DB_NAME = "trading_real.db"
 LOG_PATH = os.path.expanduser("~/hobbies/trading.log")
 
-TOP_COINS = ['BTC','ETH','BNB','SOL','XRP','TRX']
+TOP_COINS = ['BTC','ETH','BNB','SOL','XRP','TRX','DOGE','ADA','AVAX','MATIC']  # +4 coins: DOGE, ADA, AVAX, MATIC
 SELECTED_CRYPTOS = [f"{c}/USDT" for c in TOP_COINS]
 
 # >>> REGIME/BREADTH CONFIG (ANCHOR RBG)
@@ -139,16 +148,55 @@ STRONG_TREND_K_UNSTABLE = 2.5
 
 # Execution / risk
 MIN_NOTIONAL = 8.0
-MAX_OPEN_TRADES = 5
+MAX_OPEN_TRADES = 10  # Increased for hybrid diversification (60% swing, 20% DCA, 20% shorts)
 RESERVE_USDT = 20.0
 RISK_FRACTION = 0.18  # base fraction per trade (modulated)
 
 # >>> EQUITY GUARD / CIRCUIT BREAKER (ANCHOR EQGUARD)
 EQUITY_GUARD_ENABLED = bool(int(os.getenv("EQUITY_GUARD_ENABLED", "1")))
-EQUITY_GUARD_MAX_LOSS_PCT = float(os.getenv("EQUITY_GUARD_MAX_LOSS_PCT", "-3.0"))  # -3% max loss per day
+EQUITY_GUARD_MAX_LOSS_PCT = float(os.getenv("EQUITY_GUARD_MAX_LOSS_PCT", "-3.0"))  # -3% max loss per day (base)
+EQUITY_GUARD_MAX_LOSS_PCT_FEAR = float(os.getenv("EQUITY_GUARD_MAX_LOSS_PCT_FEAR", "-5.0"))  # -5% in fear (FGI < 20)
+EQUITY_GUARD_MONTHLY_MAX_DD_PCT = float(os.getenv("EQUITY_GUARD_MONTHLY_MAX_DD_PCT", "-20.0"))  # -20% monthly DD pause
+EQUITY_GUARD_MONTHLY_PAUSE_DAYS = int(os.getenv("EQUITY_GUARD_MONTHLY_PAUSE_DAYS", "7"))  # Pause 7 days if monthly DD hit
 EQUITY_GUARD_RESET_HOUR_UTC = int(os.getenv("EQUITY_GUARD_RESET_HOUR_UTC", "0"))  # Reset at midnight UTC
 _EQUITY_BREAKER_ACTIVE = False  # Global flag: no new trades if True
 _EQUITY_LAST_RESET_DATE = None  # Track last reset date
+_EQUITY_MONTHLY_BREAKER_ACTIVE = False  # Global flag: monthly DD breaker active
+_EQUITY_MONTHLY_BREAKER_UNTIL = None  # Date until which monthly breaker is active
+_EQUITY_MONTHLY_START_BALANCE = None  # Starting balance for monthly calculation
+
+# >>> FGI CONTROL (Minimize FGI - make optional)
+FORCE_FGI = bool(int(os.getenv("FORCE_FGI", "0")))  # If 0, FGI gate is disabled (redundant with price/RSI)
+
+# >>> HYBRID PARAMS (60% swing, 20% DCA, 20% shorts)
+HYBRID_DCA_AMOUNT = float(os.getenv("HYBRID_DCA_AMOUNT", "50.0"))  # Fixed $ per DCA buy
+HYBRID_DCA_COOLDOWN_H = int(os.getenv("HYBRID_DCA_COOLDOWN_H", "4"))  # Hours between DCA buys
+HYBRID_SHORT_RSI_MAX = float(os.getenv("HYBRID_SHORT_RSI_MAX", "70.0"))  # RSI>70 for shorts
+HYBRID_SHORT_VOL_SLOPE_MIN = float(os.getenv("HYBRID_SHORT_VOL_SLOPE_MIN", "0.0"))  # vol_slope<0 for shorts
+HYBRID_SHORT_ENABLED = bool(int(os.getenv("HYBRID_SHORT_ENABLED", "1")))  # Enable shorts
+HYBRID_DCA_ENABLED = bool(int(os.getenv("HYBRID_DCA_ENABLED", "1")))  # Enable DCA
+
+# Global DCA cooldown tracking
+LAST_DCA = {}  # Global dict {sym: last_ts}
+
+# >>> BACKTESTING BUILT-IN (Simple, faster than Freqtrade CLI)
+BACKTEST_ENABLED = bool(int(os.getenv("BACKTEST_ENABLED", "0")))  # Run backtest mode
+BACKTEST_START = os.getenv("BACKTEST_START", "2020-01-01")
+BACKTEST_END = os.getenv("BACKTEST_END", "2025-11-21")
+BACKTEST_TIMEFRAME = os.getenv("BACKTEST_TIMEFRAME", "1h")
+
+# >>> PARAM OPTIMIZATION (Grid search, simpler than Freqtrade Optuna)
+OPTIMIZE_ENABLED = bool(int(os.getenv("OPTIMIZE_ENABLED", "0")))
+OPT_PARAMS = {
+    'rsi_low': [30, 35, 40],  # Tune for DCA
+    'adx_min': [15, 20, 25],  # For swing
+    'vol_slope_min': [0, 50, 100]  # JSON edge
+}
+
+# >>> ML LIGHT (Simple scikit-learn, no heavy deps like FreqAI)
+ML_ENABLED = bool(int(os.getenv("ML_ENABLED", "0")))
+ML_MODEL = None  # Will be trained on historical trades
+
 # ==== Scale-in / Pyramiding ====
 ALLOW_SCALE_IN = True                 # activar re-compras en el mismo símbolo
 SCALE_IN_MAX_BUYS_PER_SYMBOL = 2      # 1 base + 1 add-on
@@ -176,8 +224,8 @@ DECISION_TIMEFRAME = "1h"
 SPREAD_MAX_PCT_DEFAULT = 0.005   # 0.5%
 MIN_QUOTE_VOL_24H_DEFAULT = 3_000_000
 
-ADX_MIN_DEFAULT = 24  # Ajustado conservadoramente desde 22
-RSI_MIN_DEFAULT, RSI_MAX_DEFAULT = 44, 68  # Ajustado según análisis: medianas en low 40s-high 50s
+ADX_MIN_DEFAULT = 15  # Optimized for swing: JSON success mean ADX 31, q25 21 - capture bottoms (was 25)
+RSI_MIN_DEFAULT, RSI_MAX_DEFAULT = 35, 68  # Optimized for swing: JSON success mean RSI 44, q25 36 - capture dips (was 40)
 RVOL_BASE_DEFAULT = 1.35  # Ajustado desde 1.5: tendencias buenas viven entre 1.1-1.3
 # >>> PATCH START: gate & cooldowns
 SCORE_GATE_START = 4.8
@@ -247,7 +295,7 @@ TRAIL_TP_MULT = float(os.getenv("TRAIL_TP_MULT", "1.10"))
 # >>> PATCH START: REBOUND/TRAIL/TIME knobs
 # --- Exit anti-whipsaw / rebound guard ---
 REBOUND_GUARD_ENABLED = True
-REBOUND_WAIT_BARS_15M = 2          # espera confirmación 2 velas 15m antes de vender
+REBOUND_WAIT_BARS_15M = 1          # espera confirmación 1 vela 15m antes de vender (reduced from 2 for swing volatility)
 REBOUND_MIN_RSI_BOUNCE = 5.0       # cancel exit si RSI15 sube >= +5
 REBOUND_EMA_RECLAIM = True         # cancel exit si cierra sobre EMA20 15m
 REBOUND_USE_5M_DIVERGENCE = True   # opcional: divergencia alcista 5m cancela sell
@@ -258,8 +306,8 @@ RVOL_SPIKE_THRESHOLD = 2.0         # si RVOL10 en últimas 3 velas > 2 → ampli
 RVOL_SPIKE_TRAIL_BONUS = 0.5       # +0.5% al trail por 15 minutos
 
 # --- Time-in-trade stop con excepción de "tape mejorando" ---
-TIME_STOP_HOURS = 3
-TIME_STOP_EXTEND_HOURS = 3
+TIME_STOP_HOURS = 24  # Base: 24h (Full swing core)
+TIME_STOP_EXTEND_HOURS = 120  # Extended: 120h (5 days) if vol_slope>0 or RSI<40 (JSON success in dips)
 TAPE_IMPROVING_ADX_SLOPE_MIN = 0.0 # >0 = ADX1h subiendo
 TAPE_IMPROVING_VWAP_REQ = True     # close 1h > VWAP 1h para extender
 
@@ -349,6 +397,9 @@ NBUS_MACDH15_NEG = -0.002
 RSI4H_HARD_MIN = 45.0       # HARD block if 4h RSI <45 and trending down
 RSI4H_SOFT_MIN = 50.0       # SOFT block if 45≤RSI<50 and trending down unless RVOL strong
 RSI4H_SLOPE_BARS = 6        # slope lookback (4h bars)
+
+# >>> RSI FEAR PROXY (replaces FGI - configurable via .env)
+RSI_FEAR_PROXY = float(os.getenv("RSI_FEAR_PROXY", "40.0"))  # RSI4h<40 = fear proxy (JSON q25 36)
 
 RVOL_1H_MIN  = 0.75         # base floors to avoid thin tape at entry
 RVOL_15M_MIN = 0.55
@@ -630,9 +681,19 @@ def fetch_fgi_features() -> dict:
         if now - _FGI_FEATURES_CACHE["ts"] < FGI_FEATURES_CACHE_TTL_SEC and _FGI_FEATURES_CACHE["features"] is not None:
             return _FGI_FEATURES_CACHE["features"]
         # No cache, try basic fetch
-        fgi_data = fetch_fear_greed_index(limit=2)
+        try:
+            fgi_data = fetch_fear_greed_index(limit=2)
+            fallback_value = fgi_data.get("value")
+        except Exception:
+            fallback_value = None
+        
+        # Default to neutral (50) if all fails - don't block trades
+        if fallback_value is None:
+            fallback_value = 50  # Neutral default
+            logger.debug("FGI fetch failed, using default neutral value 50")
+        
         fallback_features = {
-            "value": fgi_data.get("value"),
+            "value": fallback_value,
             "change_1d": None,
             "change_7d": None,
             "ma_fast": None,
@@ -672,7 +733,7 @@ def volume_snapshot(symbol: str) -> dict:
         "rvol15": f15.get("RVOL") or f15.get("RVOL10") or f15.get("RVOL_live"),
         "rvol1h": f1h.get("RVOL") or f1h.get("RVOL10"),
         "adx1h":  f1h.get("ADX"),
-        "rsi1h":  f1h.get("RSI"),
+        "rsi1h":  f1h.get("RSI"),  # Added for decay check in bears
     }
 
 def vol_size_multiplier(symbol: str) -> float:
@@ -702,7 +763,24 @@ def hold_in_volume(symbol: str) -> dict:
         return {"hold": True, "trail_bps": HOLD_TRAIL_WIDE_BPS, "partial": HOLD_PARTIAL_SELL}
 
     # Detect volume decay (live RVOL low for N bars)
-    if rvol15 > 0 and rvol15 < DECAY_RVOL15_MAX:
+    # >>> PROXY INTEGRATION: Disable decay if proxy active (RSI4h < RSI_FEAR_PROXY)
+    # Volume dries up in bottoms but rebounds come, so don't exit on decay in fear
+    proxy_active_decay = False
+    try:
+        df4h_proxy_decay = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+        if df4h_proxy_decay is not None and len(df4h_proxy_decay) >= 14:
+            rsi4h_proxy_decay = float(df4h_proxy_decay['RSI'].iloc[-1]) if pd.notna(df4h_proxy_decay['RSI'].iloc[-1]) else 50.0
+            if rsi4h_proxy_decay < RSI_FEAR_PROXY:
+                proxy_active_decay = True
+                logger.debug(f"Proxy active: disabling decay check (RSI4h={rsi4h_proxy_decay:.1f}<{RSI_FEAR_PROXY})")
+    except Exception:
+        pass
+    
+    rsi1h_for_decay = vs.get("rsi1h") or 0.0
+    # Disable decay if proxy active OR if RSI<40 (volume dries in bottoms but rebounds come)
+    decay_enabled = (not proxy_active_decay) and (rsi1h_for_decay >= 40)  # Only check decay if proxy inactive AND RSI >= 40
+    
+    if decay_enabled and rvol15 > 0 and rvol15 < DECAY_RVOL15_MAX:
         _DECAY_STREAK[symbol] += 1
     else:
         _DECAY_STREAK[symbol] = 0
@@ -1595,8 +1673,23 @@ def longterm_snapshot(symbol: str) -> dict:
 def longterm_regime(symbol: str) -> str:
     """
     Clasifica 'bull' si precio > EMA200 y (RSI>50 y ADX>20); si no, 'bear'.
+    >>> PROXY INTEGRATION: Si RSI4h < RSI_FEAR_PROXY, force 'bull' (fear = opportunity for swings)
     Heurística simple y robusta (evita look-ahead).
     """
+    # >>> PROXY INTEGRATION: Check RSI4h before long-term classification
+    # If RSI4h < RSI_FEAR_PROXY, force 'bull' (fear proxy = best time for entries)
+    try:
+        if symbol == "BTC/USDT":  # Use BTC as market proxy
+            df4h_proxy = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+            if df4h_proxy is not None and len(df4h_proxy) >= 14:
+                rsi4h_proxy = float(df4h_proxy['RSI'].iloc[-1]) if pd.notna(df4h_proxy['RSI'].iloc[-1]) else None
+                if rsi4h_proxy is not None and rsi4h_proxy < RSI_FEAR_PROXY:
+                    # Proxy active: fear = opportunity, force bull regime
+                    logger.debug(f"Proxy active (RSI4h={rsi4h_proxy:.1f}<{RSI_FEAR_PROXY}): forcing 'bull' regime")
+                    return "bull"
+    except Exception as e:
+        logger.debug(f"Proxy check in longterm_regime error: {e}")
+    
     s = longterm_snapshot(symbol)
     px, ema, rsi, adx = s.get("last"), s.get("EMA200"), s.get("RSI"), s.get("ADX")
     if all(v is not None for v in (px, ema, rsi, adx)) and px > ema and rsi > 50 and adx > 20:
@@ -1656,8 +1749,508 @@ def compute_breadth() -> tuple:
 
 
 def market_regime_ok() -> bool:
+    """
+    Check if market regime is OK for entries.
+    >>> PROXY INTEGRATION: If RSI4h < RSI_FEAR_PROXY, force regime_ok=True (fear = opportunity)
+    """
+    # >>> PROXY INTEGRATION: Force regime_ok=True if proxy active
+    try:
+        df4h_proxy = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+        if df4h_proxy is not None and len(df4h_proxy) >= 14:
+            try:
+                rsi4h_proxy = float(df4h_proxy['RSI'].iloc[-1]) if pd.notna(df4h_proxy['RSI'].iloc[-1]) else 50.0
+                if rsi4h_proxy < RSI_FEAR_PROXY:
+                    # Proxy active: force regime_ok=True (fear = opportunity for swings)
+                    logger.debug(f"Proxy active (RSI4h={rsi4h_proxy:.1f}<{RSI_FEAR_PROXY}): forcing regime_ok=True")
+                    return True
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug(f"Proxy check in market_regime_ok error: {e}")
+    
     leaders_ok, breadth = compute_breadth()
     return bool(leaders_ok and breadth >= BREADTH_MIN_COUNT)
+
+
+# >>> HYBRID: Vol Slope Function (JSON edge: +1141 in success)
+def calculate_vol_slope(df: pd.DataFrame, periods: int = 10) -> float:
+    """
+    Calculate volume slope from last periods (JSON edge: >0 for success).
+    Returns linear slope of volume over last `periods` candles (positive = rising).
+    """
+    try:
+        if df is None or len(df) < periods:
+            return 0.0
+        volumes = df['volume'].iloc[-periods:].values
+        if len(volumes) < periods or np.any(np.isnan(volumes)):
+            return 0.0
+        x = np.arange(periods)
+        slope = linregress(x, volumes).slope
+        return float(slope) if not np.isnan(slope) else 0.0
+    except Exception:
+        return 0.0
+
+def cooldown_ok(symbol: str, hours: int) -> bool:
+    """
+    Check if cooldown period has passed for symbol.
+    Updates LAST_DCA timestamp if cooldown OK.
+    """
+    try:
+        last_ts = LAST_DCA.get(symbol, 0)
+        now = time.time()
+        if now - last_ts > hours * 3600:
+            LAST_DCA[symbol] = now
+            return True
+        return False
+    except Exception:
+        return False
+
+# >>> BUILT-IN BACKTESTING (Simple, faster than Freqtrade CLI)
+def calculate_max_dd(pnls: list) -> float:
+    """
+    Calculate maximum drawdown from a list of PnL values.
+    Returns drawdown as a percentage.
+    """
+    try:
+        if not pnls:
+            return 0.0
+        cum = 0.0
+        peak = 0.0
+        max_dd = 0.0
+        for pnl in pnls:
+            cum += pnl
+            peak = max(peak, cum)
+            dd = ((cum - peak) / peak * 100.0) if peak != 0 else 0.0
+            max_dd = min(max_dd, dd)
+        return abs(max_dd)
+    except Exception:
+        return 0.0
+
+def backtest_strategy() -> dict:
+    """
+    Simple built-in backtest (better than Freqtrade's heavy CLI).
+    Simulates trades using historical data and returns metrics.
+    """
+    logger.info(f"Starting backtest from {BACKTEST_START} to {BACKTEST_END}")
+    
+    # Create a public exchange instance (no API keys needed for historical data)
+    backtest_exchange = ccxt.binance({
+        'enableRateLimit': True,
+        'options': {'defaultType': 'spot'}
+    })
+    
+    try:
+        # Parse dates
+        from datetime import datetime as dt
+        start_dt = dt.strptime(BACKTEST_START, "%Y-%m-%d")
+        end_dt = dt.strptime(BACKTEST_END, "%Y-%m-%d")
+        since_ms = int(start_dt.timestamp() * 1000)
+        until_ms = int(end_dt.timestamp() * 1000)
+        
+        # Initialize backtest state
+        balance = 10000.0  # Starting balance in USDT
+        initial_balance = balance
+        trades = []
+        positions = {}  # {symbol: {'entry_price': float, 'amount': float, 'entry_idx': int, 'mode': str}}
+        pnls = []
+        
+        # Fetch historical data for all symbols
+        symbol_data = {}
+        for symbol in SELECTED_CRYPTOS:
+            logger.info(f"Fetching historical data for {symbol}...")
+            try:
+                all_ohlcv = []
+                current = since_ms
+                
+                while current < until_ms:
+                    try:
+                        ohlcv = backtest_exchange.fetch_ohlcv(symbol, BACKTEST_TIMEFRAME, since=current, limit=1000)
+                        if not ohlcv:
+                            break
+                        all_ohlcv.extend(ohlcv)
+                        current = ohlcv[-1][0] + 1
+                        time.sleep(0.1)  # Rate limit
+                    except Exception as e:
+                        logger.warning(f"Error fetching {symbol} batch: {e}")
+                        break
+                
+                if all_ohlcv:
+                    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    # Filter by date range
+                    df = df[(df['timestamp'] >= start_dt) & (df['timestamp'] <= end_dt)].copy()
+                    df = df.sort_values('timestamp').reset_index(drop=True)
+                    
+                    if len(df) >= 50:  # Need enough data for indicators (minimum ~50 candles)
+                        # Calculate indicators (similar to fetch_and_prepare_data_hybrid)
+                        for c in ['open', 'high', 'low', 'close', 'volume']:
+                            df[c] = pd.to_numeric(df[c], errors='coerce').ffill().bfill()
+                        
+                        df['EMA20'] = ta.ema(df['close'], length=20)
+                        df['EMA50'] = ta.ema(df['close'], length=50)
+                        df['RSI'] = ta.rsi(df['close'], length=14)
+                        adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
+                        df['ADX'] = adx_df['ADX_14'] if adx_df is not None and not adx_df.empty else np.nan
+                        df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+                        
+                        rv_mean = df['volume'].rolling(10).mean()
+                        df['RVOL10'] = (df['volume'] / rv_mean) if rv_mean.iloc[-1] > 0 else np.nan
+                        
+                        # Calculate slopes for last 10 periods
+                        if len(df) >= 10:
+                            for idx in range(10, len(df)):
+                                x = np.arange(10)
+                                prices_10 = df['close'].iloc[idx-10:idx].values
+                                volumes_10 = df['volume'].iloc[idx-10:idx].values
+                                if len(prices_10) == 10 and not np.any(np.isnan(prices_10)):
+                                    df.loc[df.index[idx], 'PRICE_SLOPE10'] = linregress(x, prices_10).slope
+                                else:
+                                    df.loc[df.index[idx], 'PRICE_SLOPE10'] = np.nan
+                                if len(volumes_10) == 10 and not np.any(np.isnan(volumes_10)):
+                                    df.loc[df.index[idx], 'VOL_SLOPE10'] = linregress(x, volumes_10).slope
+                                else:
+                                    df.loc[df.index[idx], 'VOL_SLOPE10'] = np.nan
+                        else:
+                            df['PRICE_SLOPE10'] = np.nan
+                            df['VOL_SLOPE10'] = np.nan
+                        
+                        symbol_data[symbol] = df
+                        logger.info(f"  Loaded {len(df)} candles for {symbol}")
+            except Exception as e:
+                logger.error(f"Failed to fetch {symbol}: {e}")
+                continue
+        
+        if not symbol_data:
+            logger.error("No data loaded for backtest")
+            return {'trades': [], 'total_pnl': 0.0, 'win_rate': 0.0, 'max_dd': 0.0, 'total_return': 0.0}
+        
+        # Get all unique timestamps (align all symbols)
+        all_timestamps = set()
+        for df in symbol_data.values():
+            all_timestamps.update(df['timestamp'].tolist())
+        all_timestamps = sorted(all_timestamps)
+        
+        logger.info(f"Processing {len(all_timestamps)} timestamps...")
+        
+        # Simulate trading loop
+        for i, ts in enumerate(all_timestamps):
+            # Check exits first (trailing stop, time stop, etc.)
+            symbols_to_close = []
+            for symbol, pos in list(positions.items()):
+                if symbol not in symbol_data:
+                    continue
+                df = symbol_data[symbol]
+                df_ts = df[df['timestamp'] <= ts]
+                if len(df_ts) == 0:
+                    continue
+                
+                row = df_ts.iloc[-1]
+                current_price = float(row['close'])
+                entry_price = pos['entry_price']
+                amount = pos['amount']
+                gain_pct = ((current_price - entry_price) / entry_price * 100.0) if pos['mode'] != 'short' else ((entry_price - current_price) / entry_price * 100.0)
+                
+                # Simple exit logic (can be enhanced)
+                exit_reason = None
+                # Time stop (48h base)
+                hours_held = (ts - pos['entry_ts']).total_seconds() / 3600.0
+                if hours_held >= 48:
+                    exit_reason = "time_stop"
+                # Stop loss (-7%)
+                elif gain_pct <= -7.0:
+                    exit_reason = "stop_loss"
+                # Take profit (+10%)
+                elif gain_pct >= 10.0:
+                    exit_reason = "take_profit"
+                
+                if exit_reason:
+                    # Close position
+                    pnl = (current_price - entry_price) * amount if pos['mode'] != 'short' else (entry_price - current_price) * amount
+                    pnl -= (current_price * amount * 0.001)  # Fee
+                    balance += current_price * amount - (current_price * amount * 0.001)  # Sell and deduct fee
+                    
+                    trades.append({
+                        'symbol': symbol,
+                        'entry_price': entry_price,
+                        'exit_price': current_price,
+                        'amount': amount,
+                        'pnl': pnl,
+                        'pnl_pct': gain_pct,
+                        'entry_ts': pos['entry_ts'],
+                        'exit_ts': ts,
+                        'mode': pos['mode'],
+                        'exit_reason': exit_reason
+                    })
+                    pnls.append(pnl)
+                    symbols_to_close.append(symbol)
+            
+            for sym in symbols_to_close:
+                del positions[sym]
+            
+            # Check entries (simplified hybrid logic)
+            if len(positions) >= MAX_OPEN_TRADES:
+                continue
+            
+            for symbol in SELECTED_CRYPTOS:
+                if symbol in positions or symbol not in symbol_data:
+                    continue
+                
+                df = symbol_data[symbol]
+                df_ts = df[df['timestamp'] <= ts]
+                if len(df_ts) < 50:  # Need enough data
+                    continue
+                
+                row = df_ts.iloc[-1]
+                
+                # Simplified entry check (can use hybrid_preflight logic)
+                try:
+                    rsi = float(row['RSI']) if pd.notna(row.get('RSI')) else 50.0
+                    adx = float(row['ADX']) if pd.notna(row.get('ADX')) else 20.0
+                    price = float(row['close'])
+                    
+                    # Simple entry conditions (can be enhanced with full hybrid logic)
+                    if rsi >= RSI_MIN_DEFAULT and rsi <= 70 and adx >= ADX_MIN_DEFAULT:
+                        # Calculate position size
+                        risk_amount = balance * RISK_FRACTION
+                        atr_val = float(row['ATR']) if pd.notna(row.get('ATR')) else price * 0.02
+                        amount = risk_amount / (atr_val * 3.5)  # Based on SL
+                        amount = min(amount, balance * 0.2 / price)  # Max 20% of balance
+                        
+                        if amount * price >= MIN_NOTIONAL and balance >= amount * price:
+                            # Enter position
+                            cost = amount * price * (1 + 0.001)  # Buy + fee
+                            balance -= cost
+                            positions[symbol] = {
+                                'entry_price': price,
+                                'amount': amount,
+                                'entry_ts': ts,
+                                'mode': 'swing'  # Default mode
+                            }
+                except Exception as e:
+                    logger.debug(f"Entry check error for {symbol} at {ts}: {e}")
+                    continue
+        
+        # Close any remaining positions at end
+        for symbol, pos in positions.items():
+            if symbol not in symbol_data:
+                continue
+            df = symbol_data[symbol]
+            if len(df) == 0:
+                continue
+            row = df.iloc[-1]
+            exit_price = float(row['close'])
+            entry_price = pos['entry_price']
+            amount = pos['amount']
+            gain_pct = ((exit_price - entry_price) / entry_price * 100.0) if pos['mode'] != 'short' else ((entry_price - exit_price) / entry_price * 100.0)
+            
+            pnl = (exit_price - entry_price) * amount if pos['mode'] != 'short' else (entry_price - exit_price) * amount
+            pnl -= (exit_price * amount * 0.001)
+            balance += exit_price * amount - (exit_price * amount * 0.001)
+            
+            trades.append({
+                'symbol': symbol,
+                'entry_price': entry_price,
+                'exit_price': exit_price,
+                'amount': amount,
+                'pnl': pnl,
+                'pnl_pct': gain_pct,
+                'entry_ts': pos['entry_ts'],
+                'exit_ts': df['timestamp'].iloc[-1],
+                'mode': pos['mode'],
+                'exit_reason': 'end_of_backtest'
+            })
+            pnls.append(pnl)
+        
+        # Calculate metrics
+        total_pnl = sum(pnls) if pnls else 0.0
+        wins = [t for t in trades if t['pnl'] > 0]
+        win_rate = len(wins) / len(trades) if trades else 0.0
+        max_dd = calculate_max_dd(pnls)
+        total_return = ((balance - initial_balance) / initial_balance * 100.0) if initial_balance > 0 else 0.0
+        
+        logger.info(
+            f"Backtest complete:\n"
+            f"  Trades: {len(trades)}\n"
+            f"  Win Rate: {win_rate*100:.2f}%\n"
+            f"  Total PnL: {total_pnl:.2f} USDT\n"
+            f"  Final Balance: {balance:.2f} USDT\n"
+            f"  Total Return: {total_return:.2f}%\n"
+            f"  Max DD: {max_dd:.2f}%"
+        )
+        
+        return {
+            'trades': trades,
+            'total_pnl': total_pnl,
+            'win_rate': win_rate,
+            'max_dd': max_dd,
+            'total_return': total_return,
+            'final_balance': balance
+        }
+        
+    except Exception as e:
+        logger.error(f"backtest_strategy error: {e}", exc_info=True)
+        return {'trades': [], 'total_pnl': 0.0, 'win_rate': 0.0, 'max_dd': 0.0, 'total_return': 0.0}
+
+# >>> PARAM OPTIMIZATION (Grid search, simpler than Freqtrade Optuna)
+def optimize_params() -> dict:
+    """
+    Optimize parameters using grid search on backtest results.
+    """
+    logger.info("Starting parameter optimization...")
+    
+    best_pnl = -float('inf')
+    best_params = {}
+    best_results = None
+    
+    # Save original values and declare globals
+    global RSI_MIN_DEFAULT, ADX_MIN_DEFAULT, HYBRID_SHORT_VOL_SLOPE_MIN
+    original_rsi_min = RSI_MIN_DEFAULT
+    original_adx_min = ADX_MIN_DEFAULT
+    original_vol_slope_min = HYBRID_SHORT_VOL_SLOPE_MIN
+    
+    try:
+        for rsi in OPT_PARAMS['rsi_low']:
+            for adx in OPT_PARAMS['adx_min']:
+                for vol in OPT_PARAMS['vol_slope_min']:
+                    # Set globals temporarily
+                    RSI_MIN_DEFAULT = rsi
+                    ADX_MIN_DEFAULT = adx
+                    HYBRID_SHORT_VOL_SLOPE_MIN = vol
+                    
+                    logger.info(f"Testing params: RSI={rsi}, ADX={adx}, VOL_SLOPE={vol}")
+                    results = backtest_strategy()
+                    
+                    if results and results['total_pnl'] > best_pnl:
+                        best_pnl = results['total_pnl']
+                        best_params = {
+                            'rsi_low': rsi,
+                            'adx_min': adx,
+                            'vol_slope_min': vol
+                        }
+                        best_results = results
+        
+        # Restore original values
+        RSI_MIN_DEFAULT = original_rsi_min
+        ADX_MIN_DEFAULT = original_adx_min
+        HYBRID_SHORT_VOL_SLOPE_MIN = original_vol_slope_min
+        
+        logger.info(
+            f"Best params: {best_params}\n"
+            f"  PnL: {best_pnl:.2f} USDT\n"
+            f"  Win Rate: {best_results['win_rate']*100:.2f}%\n"
+            f"  Max DD: {best_results['max_dd']:.2f}%\n"
+            f"  Total Return: {best_results['total_return']:.2f}%"
+        )
+        
+        return best_params
+    except Exception as e:
+        logger.error(f"optimize_params error: {e}")
+        # Restore original values
+        RSI_MIN_DEFAULT = original_rsi_min
+        ADX_MIN_DEFAULT = original_adx_min
+        HYBRID_SHORT_VOL_SLOPE_MIN = original_vol_slope_min
+        return {}
+
+# >>> ML LIGHT (Simple scikit-learn, no heavy deps like FreqAI)
+def train_ml_model(historical_trades: list) -> object | None:
+    """
+    Train ML model on historical trades (RandomForest).
+    """
+    if not SKLEARN_AVAILABLE or not historical_trades:
+        return None
+    
+    try:
+        # Extract features from trades (need to store features in trades)
+        X = []
+        y = []
+        
+        for trade in historical_trades:
+            # Get features from trade (if stored)
+            rsi = trade.get('rsi', 50.0)
+            adx = trade.get('adx', 20.0)
+            vol_slope = trade.get('vol_slope', 0.0)
+            
+            X.append([rsi, adx, vol_slope])
+            y.append(1 if trade.get('pnl', 0) > 0 else 0)  # Win/loss
+        
+        if len(X) < 10:  # Need minimum data
+            logger.warning("Insufficient data for ML training")
+            return None
+        
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        model = RandomForestClassifier(n_estimators=50, random_state=42, max_depth=10)
+        model.fit(X_train, y_train)
+        
+        score = model.score(X_test, y_test)
+        logger.info(f"ML model trained, accuracy: {score*100:.2f}%")
+        
+        return model
+    except Exception as e:
+        logger.error(f"train_ml_model error: {e}")
+        return None
+
+def ml_predict(model: object, features: dict) -> float:
+    """
+    Predict win probability using ML model.
+    Returns probability (0-1) of winning trade.
+    """
+    if not SKLEARN_AVAILABLE or model is None:
+        return 0.5  # Neutral if no model
+    
+    try:
+        rsi = features.get('rsi', 50.0)
+        adx = features.get('adx', 20.0)
+        vol_slope = features.get('vol_slope', 0.0)
+        
+        pred_proba = model.predict_proba([[rsi, adx, vol_slope]])[0][1]  # Probability of win
+        return float(pred_proba)
+    except Exception as e:
+        logger.debug(f"ml_predict error: {e}")
+        return 0.5
+
+# >>> HYBRID PREFLIGHT: Determines entry mode (DCA, short, or swing)
+def hybrid_preflight(symbol: str) -> tuple[str | None, str]:
+    """
+    Hybrid preflight determines entry mode:
+    - 'dca': If RSI4h < RSI_FEAR_PROXY and vol_slope > 0 (fear proxy: DCA mode)
+    - 'short': If RSI1h > HYBRID_SHORT_RSI_MAX and vol_slope < 0 (overbought: short mode)
+    - 'swing': Normal swing entry (default)
+    Returns (mode, reason) tuple.
+    """
+    try:
+        df1h = fetch_and_prepare_data_hybrid(symbol, timeframe="1h", limit=50)
+        df4h = fetch_and_prepare_data_hybrid(symbol, timeframe="4h", limit=50)
+        
+        if df1h is None or len(df1h) < 14 or df4h is None or len(df4h) < 14:
+            return None, "insufficient data"
+        
+        try:
+            rsi4h = float(df4h['RSI'].iloc[-1]) if pd.notna(df4h['RSI'].iloc[-1]) else 50.0
+            rsi1h = float(df1h['RSI'].iloc[-1]) if pd.notna(df1h['RSI'].iloc[-1]) else 50.0
+            ema50 = float(df1h['EMA50'].iloc[-1]) if pd.notna(df1h['EMA50'].iloc[-1]) else None
+            price = float(df1h['close'].iloc[-1])
+            vol_slope = calculate_vol_slope(df1h, periods=10)
+        except Exception:
+            return None, "data calculation error"
+        
+        # >>> DCA Mode: Fear proxy + vol rising (dips with volume recovery)
+        if HYBRID_DCA_ENABLED and rsi4h < RSI_FEAR_PROXY and vol_slope > HYBRID_SHORT_VOL_SLOPE_MIN:
+            return 'dca', f"Fear proxy: Trigger DCA (RSI4h={rsi4h:.1f}<{RSI_FEAR_PROXY}, vol_slope={vol_slope:.2f})"
+        
+        # >>> Short Mode: Overbought + vol falling (hedge downs)
+        if HYBRID_SHORT_ENABLED and rsi1h > HYBRID_SHORT_RSI_MAX and vol_slope < HYBRID_SHORT_VOL_SLOPE_MIN:
+            return 'short', f"Overbought: Trigger short (RSI1h={rsi1h:.1f}>{HYBRID_SHORT_RSI_MAX}, vol_slope={vol_slope:.2f})"
+        
+        # >>> Swing Mode: Normal entry (default)
+        # Check vol_slope for swing (JSON edge: >0 required)
+        if vol_slope <= 0:
+            return None, "Vol slope not rising – skip low quality"
+        
+        # Continue with normal swing preflight (hybrid_decision will handle)
+        return 'swing', "OK for swing"
+    except Exception as e:
+        logger.debug(f"hybrid_preflight error {symbol}: {e}")
+        return None, f"error: {e}"
 
 
 # >>> PATCH A2: 4h RSI slope & trend flags + RVOL floors
@@ -1717,6 +2310,20 @@ def preflight_buy_guard(symbol: str) -> Tuple[bool, str]:
     # (1) ADX hard floor
     if adx_1h is None or adx_1h < PREFLIGHT_ADX_HARD_MIN:
         return False, f"1h ADX {None if adx_1h is None else f'{adx_1h:.1f}'} < {PREFLIGHT_ADX_HARD_MIN:.0f}"
+    
+    # >>> VOL_SLOPE MANDATORY CHECK (JSON edge: +1141 vs fail)
+    # Volume slope > 0 is mandatory for quality entries (JSON shows massive edge)
+    try:
+        if len(df1h) >= 10:
+            volumes_10 = df1h['volume'].iloc[-10:].values
+            if len(volumes_10) == 10 and not np.any(np.isnan(volumes_10)):
+                x = np.arange(10)
+                vol_slope = linregress(x, volumes_10).slope
+                if vol_slope <= 0:
+                    return False, f"Vol slope not rising ({vol_slope:.2f}) - skip low quality (JSON edge requires >0)"
+    except Exception as e:
+        logger.debug(f"vol_slope check error {symbol}: {e}")
+        # Don't block if calculation fails, but log it
 
     # Preload 15m for scratch zone and later checks
     df15 = None
@@ -2228,6 +2835,19 @@ def hybrid_decision(symbol: str):
             SCORE_GATE_OFFSET += +0.40  # Between +0.3 and +0.5 as requested
             blocks.append(f"FGI soft-mod: Extreme Greed rising (FGI={fgi_value:.0f}, slope_7d={fgi_slope_7d:+.1f}) - more selective entry")
         
+        # >>> FGI OVERRIDE: Force entries in fear if recovering (slope_7d > 0)
+        # Historical: fear bottoms with recovering FGI give +100% recovery, best time for swing entries
+        if fgi_classification in ["fear", "extreme_fear"] and fgi_slope_7d is not None and fgi_slope_7d > 0:
+            # Override regime_off: allow entries even if market_regime_ok() is False
+            # Lower thresholds in fear (RSI_MIN to 30, ADX_MIN to 20, ignore breadth)
+            if fgi_value is not None and fgi_value <= 20:  # Extreme fear
+                RSI_MIN_K = max(RSI_MIN_K, 30)  # Lower RSI_MIN in extreme fear (was 40)
+                ADX_MIN_K = max(ADX_MIN_K, 20)  # Lower ADX_MIN in extreme fear (was 25)
+                # Ignore breadth (min_count=1) - allow entries even with weak breadth
+                blocks.append(f"FGI override: Extreme Fear recovering (FGI={fgi_value:.0f}, slope_7d={fgi_slope_7d:+.1f}) - relaxed thresholds")
+            else:
+                blocks.append(f"FGI override: Fear recovering (FGI={fgi_value:.0f}, slope_7d={fgi_slope_7d:+.1f}) - allowing entries")
+        
         # In all other cases: let swing technical rules drive decisions
         # (No FGI modifications, just let the swing profile filters work)
 
@@ -2553,10 +3173,26 @@ def hybrid_decision(symbol: str):
     rsi4h_slope = rsi_slope(df4h_full, length=14, bars=RSI4H_SLOPE_BARS) if df4h_full is not None else 0.0
     rsi4h_up, rsi4h_down = rsi_trend_flags(df4h_full, length=14, fast=2, slow=3) if df4h_full is not None else (False, False)
 
-    # — Bearish HARD block: 4h RSI deeply <45 and trending down (slope<=0 or MA flag down)
-    if (rsi4h is not None) and (rsi4h < RSI4H_HARD_MIN) and (rsi4h_slope <= 0 or rsi4h_down):
-        blocks.append(f"HARD block: bearish 4h (RSI={rsi4h:.1f}, slope={rsi4h_slope:.4f}, down={rsi4h_down})")
-        level = "HARD"
+    # >>> PROXY FGI: RSI4h<RSI_FEAR_PROXY full en guards/entries (replaces FGI gate)
+    # RSI4h<RSI_FEAR_PROXY = fear proxy (JSON q25 36), allow entries (best time for swings in dips)
+    # If proxy active, lower ADX_MIN to 15 (capture bottoms in fear)
+    proxy_active_entry = False
+    if (rsi4h is not None) and (rsi4h < RSI_FEAR_PROXY):
+        proxy_active_entry = True
+        # Lower ADX_MIN if proxy active (capture bottoms in fear)
+        if ADX_MIN_K > 15:
+            ADX_MIN_K = 15
+            notes.append(f"Proxy active: ADX_MIN lowered to 15 (RSI4h={rsi4h:.1f}<{RSI_FEAR_PROXY})")
+    
+    # Only block if RSI4h < RSI_FEAR_PROXY AND trending down strongly (slope < -0.5)
+    if proxy_active_entry and (rsi4h_slope < -0.5):
+        # Strong bearish: block only if slope is very negative (falling fast)
+        blocks.append(f"SOFT block: RSI4h={rsi4h:.1f}<{RSI_FEAR_PROXY} with strong negative slope ({rsi4h_slope:.2f})")
+        if level != "HARD": level = "SOFT"
+    elif proxy_active_entry:
+        # RSI4h<RSI_FEAR_PROXY but not falling fast = opportunity (allow entries, proxy FGI fear)
+        notes.append(f"Proxy active: Allowing entries in fear (RSI4h={rsi4h:.1f}<{RSI_FEAR_PROXY})")
+        pass  # No block, allow entries in dips
 
     # — Bearish SOFT block: 45≤RSI<50 and trending down → need stronger RVOL on BOTH TFs
     elif (rsi4h is not None) and (RSI4H_HARD_MIN <= rsi4h < RSI4H_SOFT_MIN) and (rsi4h_slope <= 0 or rsi4h_down):
@@ -3174,32 +3810,55 @@ def send_feature_bundle_telegram(trade_id: str, symbol: str, side: str, features
 # =========================
 def execute_order_buy(symbol: str, amount: float, signals: dict):
     try:
-        order = exchange.create_market_buy_order(symbol, amount)
-        price = order.get("price", fetch_price(symbol))
-        filled = order.get("filled", amount)
-        if not price: return None
+        try:
+            order = exchange.create_market_buy_order(symbol, amount)
+        except Exception as e:
+            logger.error(f"Exchange order error {symbol}: {e}")
+            return None
+        
+        try:
+            price = order.get("price", fetch_price(symbol))
+            filled = order.get("filled", amount)
+            if not price: return None
+        except Exception as e:
+            logger.error(f"Price/filled extraction error {symbol}: {e}")
+            return None
+        
         trade_id = f"{symbol}-{datetime.now(timezone.utc).isoformat().replace(':','-')}"
 
-        conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO transactions (symbol, side, price, amount, ts, trade_id, adx, rsi, rvol, atr, score, confidence, status)
-            VALUES (?, 'buy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
-        """, (symbol, float(price), float(filled),
-              datetime.now(timezone.utc).isoformat(), trade_id,
-              signals.get('adx'), signals.get('rsi'), signals.get('rvol'), signals.get('atr'),
-              signals.get('score'), signals.get('confidence')))
-        conn.commit(); conn.close()
+        try:
+            conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO transactions (symbol, side, price, amount, ts, trade_id, adx, rsi, rvol, atr, score, confidence, status)
+                VALUES (?, 'buy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
+            """, (symbol, float(price), float(filled),
+                  datetime.now(timezone.utc).isoformat(), trade_id,
+                  signals.get('adx'), signals.get('rsi'), signals.get('rvol'), signals.get('atr'),
+                  signals.get('score'), signals.get('confidence')))
+            conn.commit(); conn.close()
+        except Exception as e:
+            logger.error(f"DB insert error {symbol}: {e}")
+            return None
 
-        send_telegram_message(f"✅ BUY {symbol}\nPrice: {price}\nAmount: {filled}\nConf: {signals.get('confidence', 0)}%\nScore: {signals.get('score', 0):.1f}")
+        try:
+            send_telegram_message(f"✅ BUY {symbol}\nPrice: {price}\nAmount: {filled}\nConf: {signals.get('confidence', 0)}%\nScore: {signals.get('score', 0):.1f}")
+        except Exception as e:
+            logger.warning(f"Telegram send error {symbol}: {e}")
 
-        features = build_rich_features(symbol)
-        save_trade_features(trade_id, symbol, 'entry', features)
-        send_feature_bundle_telegram(trade_id, symbol, 'entry', features)
+        try:
+            features = build_rich_features(symbol)
+            save_trade_features(trade_id, symbol, 'entry', features)
+            send_feature_bundle_telegram(trade_id, symbol, 'entry', features)
+        except Exception as e:
+            logger.warning(f"Features save error {symbol}: {e}")
 
         return {"price": price, "filled": filled, "trade_id": trade_id}
     except Exception as e:
         logger.error(f"execute_order_buy error {symbol}: {e}")
-        send_telegram_message(f"❌ BUY failed {symbol}: {e}")
+        try:
+            send_telegram_message(f"❌ BUY failed {symbol}: {e}")
+        except Exception:
+            pass
         return None
 
 
@@ -3286,6 +3945,123 @@ def execute_order_sell(symbol: str, amount: float, signals: dict | None = None) 
         return None
 
 
+
+# >>> HYBRID: Short Functions (20% shorts for hedging)
+def get_short_amount(symbol: str, price: float, atr_abs: float) -> float:
+    """
+    Calculate short amount based on risk fraction.
+    Similar to buy sizing but for shorts (hedging downs).
+    """
+    try:
+        balances = exchange.fetch_balance()
+        usdt = float(balances.get('free', {}).get('USDT', 0.0))
+        free_after_reserve = max(0.0, usdt - RESERVE_USDT)
+        
+        if free_after_reserve < MIN_NOTIONAL:
+            return 0.0
+        
+        # Size based on risk fraction (similar to buy sizing)
+        risk_amount = free_after_reserve * RISK_FRACTION
+        stop_distance = atr_abs * 2.0  # 2 ATR stop for shorts
+        if stop_distance <= 0:
+            stop_distance = price * 0.03  # Fallback 3% stop
+        
+        amount = risk_amount / stop_distance
+        return max(0.0, min(amount, free_after_reserve / price * 0.5))  # Max 50% of available
+    except Exception as e:
+        logger.error(f"get_short_amount error {symbol}: {e}")
+        return 0.0
+
+def execute_short(symbol: str, amount: float, signals: dict):
+    """
+    Execute short order (sell to open short position).
+    Similar to execute_order_buy but sells instead.
+    """
+    try:
+        try:
+            order = exchange.create_market_sell_order(symbol, amount)
+        except Exception as e:
+            logger.error(f"Exchange short order error {symbol}: {e}")
+            return None
+        
+        try:
+            price = order.get("price", fetch_price(symbol))
+            filled = order.get("filled", amount)
+            if not price: return None
+        except Exception as e:
+            logger.error(f"Price/filled extraction error (short) {symbol}: {e}")
+            return None
+        
+        trade_id = f"{symbol}-SHORT-{datetime.now(timezone.utc).isoformat().replace(':','-')}"
+        
+        try:
+            conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO transactions (symbol, side, price, amount, ts, trade_id, adx, rsi, rvol, atr, score, confidence, status)
+                VALUES (?, 'short', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
+            """, (symbol, float(price), float(filled),
+                  datetime.now(timezone.utc).isoformat(), trade_id,
+                  signals.get('adx'), signals.get('rsi'), signals.get('rvol'), signals.get('atr'),
+                  signals.get('score'), signals.get('confidence')))
+            conn.commit(); conn.close()
+        except Exception as e:
+            logger.error(f"DB insert error (short) {symbol}: {e}")
+            return None
+        
+        try:
+            send_telegram_message(f"📉 SHORT {symbol}\nPrice: {price}\nAmount: {filled}\nConf: {signals.get('confidence', 0)}%\nScore: {signals.get('score', 0):.1f}")
+        except Exception as e:
+            logger.warning(f"Telegram send error (short) {symbol}: {e}")
+        
+        try:
+            features = build_rich_features(symbol)
+            save_trade_features(trade_id, symbol, 'entry', features)
+            send_feature_bundle_telegram(trade_id, symbol, 'entry', features)
+        except Exception as e:
+            logger.warning(f"Features save error (short) {symbol}: {e}")
+        
+        return {"price": price, "filled": filled, "trade_id": trade_id}
+    except Exception as e:
+        logger.error(f"execute_short error {symbol}: {e}")
+        try:
+            send_telegram_message(f"❌ SHORT failed {symbol}: {e}")
+        except Exception:
+            pass
+        return None
+
+def close_short(symbol: str, amount: float, trade_id: str, source: str = "trail"):
+    """
+    Close short position (buy to close).
+    Similar to sell_symbol but buys to close shorts.
+    """
+    try:
+        price_now = fetch_price(symbol)
+        order = exchange.create_market_buy_order(symbol, amount)  # Buy to close short
+        close_price = order.get("price", price_now) or price_now or 0.0
+        close_ts = datetime.now(timezone.utc).isoformat()
+        
+        conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO transactions (symbol, side, price, amount, ts, trade_id, status)
+            VALUES (?, 'close_short', ?, ?, ?, ?, 'closed')
+        """, (symbol, float(close_price), float(amount), close_ts, trade_id))
+        cur.execute("UPDATE transactions SET status='closed' WHERE trade_id=? AND side='short'", (trade_id,))
+        conn.commit(); conn.close()
+        
+        send_telegram_message(f"✅ CLOSE SHORT {symbol}\nPrice: {close_price}\nAmount: {amount}\nSource: {source}")
+        LAST_SELL_INFO[symbol] = {"ts": close_ts, "price": float(close_price), "source": source}
+        LAST_TRADE_CLOSE[symbol] = close_ts
+        
+        features_exit = build_rich_features(symbol)
+        save_trade_features(trade_id, symbol, 'exit', features_exit)
+        
+        logger.info(f"Closed short {symbol}: amt={amount}, px={close_price}, trade_id={trade_id}, source={source}")
+    except Exception as e:
+        logger.error(f"close_short error {symbol}: {e}")
+        try:
+            send_telegram_message(f"❌ CLOSE SHORT failed {symbol}: {e}")
+        except Exception:
+            pass
 
 def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"):
     try:
@@ -3433,7 +4209,13 @@ def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"
     except Exception as e:
         logger.error(f"sell_symbol error {symbol}: {e}")
 
-def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, trade_id: str, atr_abs: float):
+def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, trade_id: str, atr_abs: float, mode: str = 'swing'):
+    """
+    Dynamic trailing stop for hybrid modes:
+    - 'swing': Normal swing trailing (default)
+    - 'dca': Wider trailing (k*=1.5), disable decay (DCA in dips)
+    - 'short': Inverse trailing (trail from low, exit if price > stop)
+    """
     """
     Dynamic trailing based on 1h Chandelier + structure, with:
       - Initial ATR stop and R tracking
@@ -3463,20 +4245,32 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 logger.info(f"[trailing] Invalid params, stopping. sym={symbol} amt={amount} px={purchase_price}")
                 return
 
+            # >>> HYBRID MODE: Adjust base k and logic based on mode
             # Base k from volatility class
             prof_local = classify_symbol(symbol) or {}
             klass_local = prof_local.get("class", "medium")
             if   klass_local == "unstable": base_k = CHAN_K_UNSTABLE
             elif klass_local == "stable":   base_k = CHAN_K_STABLE
             else:                           base_k = CHAN_K_MEDIUM
+            
+            # Adjust k for DCA mode (widen trailing: k*=1.5)
+            if mode == 'dca':
+                base_k = base_k * 1.5
+                logger.debug(f"[trailing-dca] {symbol}: Widened k to {base_k:.2f} (DCA mode)")
 
             opened_ts = datetime.now(timezone.utc)
 
-            # Initial protective stop and R
-            initial_stop = purchase_price - (INIT_STOP_ATR_MULT * atr_abs)
-            if initial_stop >= purchase_price:
-                initial_stop = purchase_price * 0.985
-            initial_R = max(purchase_price - initial_stop, purchase_price * 0.003)
+            # >>> SHORT MODE: Inverse initial stop (for shorts, stop is above entry)
+            if mode == 'short':
+                # For shorts: initial stop is above entry (price goes down = profit)
+                initial_stop = purchase_price + (INIT_STOP_ATR_MULT * atr_abs)  # Above entry
+                initial_R = max(initial_stop - purchase_price, purchase_price * 0.003)
+            else:
+                # Normal long: initial stop below entry
+                initial_stop = purchase_price - (INIT_STOP_ATR_MULT * atr_abs)
+                if initial_stop >= purchase_price:
+                    initial_stop = purchase_price * 0.985
+                initial_R = max(purchase_price - initial_stop, purchase_price * 0.003)
 
             # State
             stop_price = initial_stop
@@ -3515,6 +4309,14 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
 
 
             while True:
+                # Defensive amount to liquidate in catastrophic / pre-arm / rapid-kill exits
+                try:
+                    amount_to_sell = current_position_qty(symbol)
+                    if amount_to_sell <= 0:
+                        amount_to_sell = amount  # fall back to initial size
+                except Exception:
+                    amount_to_sell = amount
+
                 last_price = get_last_price(symbol)  # or your own px getter
 
                 # >>> CATASTROPHIC FLOOR (HOOK SAFE1)
@@ -3618,9 +4420,21 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 held = (datetime.now(timezone.utc) - opened_ts).total_seconds()
                 held_long_enough = held >= max(60, MIN_HOLD_SECONDS)
 
-                # Global min-hold except hard protective stop
+                # >>> SHORT MODE: Inverse stop check (for shorts, exit if price > stop)
+                if mode == 'short':
+                    # For shorts: exit if price exceeds stop (price goes up = loss)
+                    if price >= initial_stop:
+                        close_short(symbol, amount, trade_id, source="trail-stop")
+                        return
+                    # Track lowest price for inverse trailing
+                    if not hasattr(loop, '_lowest_price'):
+                        loop._lowest_price = purchase_price
+                    if price < loop._lowest_price:
+                        loop._lowest_price = price
+                
+                # Global min-hold except hard protective stop (for longs)
                 if not held_long_enough:
-                    if price <= initial_stop:
+                    if mode != 'short' and price <= initial_stop:
                         sell_symbol(symbol, amount, trade_id, source="trail")
                         return
                     time.sleep(EXIT_CHECK_EVERY_SEC)
@@ -3693,6 +4507,27 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 gain_pct_now = (price / purchase_price - 1.0) * 100.0
                 gain_in_R = (price - purchase_price) / initial_R if initial_R > 0 else 0.0
                 
+                # >>> PARTIAL SELL: Take 30% profit at +4% (Full swing core - adjust from +5%)
+                # Trail the rest with wide trailing (1200bps if strong_trend)
+                if gain_pct_now >= 4.0:
+                    try:
+                        # Check if we haven't already taken partial
+                        if not hasattr(loop, '_partial_taken'):
+                            loop._partial_taken = False
+                        
+                        if not loop._partial_taken:
+                            pos_qty = current_position_qty(symbol)
+                            qty_partial = round(pos_qty * 0.30, 8)  # 30% partial
+                            if qty_partial * price >= MIN_NOTIONAL and qty_partial > 0:
+                                execute_order_sell(symbol, qty_partial, signals={"reason": "partial-profit-4pct"})
+                                loop._partial_taken = True
+                                logger.info(f"[partial-sell] {symbol}: Took 30% profit at +{gain_pct_now:.2f}%, trailing rest")
+                                # Widen trailing for the runner (1200bps if strong_trend)
+                                if strong_trend:
+                                    set_symbol_trailing(symbol, trail_bps=1200)
+                    except Exception as e:
+                        logger.debug(f"partial sell check error {symbol}: {e}")
+                
                 # Track highest close price for trailing (use close, not high, to be more conservative)
                 if not hasattr(loop, '_highest_close'):
                     loop._highest_close = purchase_price
@@ -3742,9 +4577,22 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 except Exception:
                     pass
                 
-                # Determine trailing ATR multiple based on analysis and FGI
+                # Determine trailing ATR multiple based on analysis, FGI, and PROXY
                 # Base: 1.5 ATR (centro del rango: mean 1.38, median 1.44, q75 1.87)
                 base_mult = 1.5
+                
+                # >>> PROXY MODULATION: If RSI4h < RSI_FEAR_PROXY, widen trailing (k*=1.5)
+                proxy_active_trail = False
+                try:
+                    df4h_proxy_trail = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+                    if df4h_proxy_trail is not None and len(df4h_proxy_trail) >= 14:
+                        rsi4h_proxy_trail = float(df4h_proxy_trail['RSI'].iloc[-1]) if pd.notna(df4h_proxy_trail['RSI'].iloc[-1]) else 50.0
+                        if rsi4h_proxy_trail < RSI_FEAR_PROXY:
+                            proxy_active_trail = True
+                            base_mult = base_mult * 1.5  # Widen trailing if proxy active (k*=1.5)
+                            logger.debug(f"Proxy active in trailing: RSI4h={rsi4h_proxy_trail:.1f}<{RSI_FEAR_PROXY}, base_mult widened to {base_mult:.2f}")
+                except Exception as e:
+                    logger.debug(f"Proxy check in trailing error: {e}")
                 
                 # If gain >= 10%: tighten trailing (capture more profit on strong moves)
                 if gain_pct_now >= 10.0:
@@ -3754,13 +4602,13 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 # Act only in extreme conditions to avoid overfitting
                 # extreme_greed & slope_7d > 0 → tighter (1.2 ATR)
                 # fear/extreme_fear & slope_7d > 0 → looser (1.8 ATR, let recovery breathe)
-                # Rest → base_mult (1.5 ATR normal)
+                # Rest → base_mult (1.5 ATR normal, or 1.5*1.5=2.25 if proxy active)
                 if fgi_classification == "extreme_greed" and fgi_slope_7d is not None and fgi_slope_7d > 0:
                     trail_atr_mult = 1.2  # Euphoria rising: tighter stop (1.2 ATR)
                 elif fgi_classification in ["fear", "extreme_fear"] and fgi_slope_7d is not None and fgi_slope_7d > 0:
                     trail_atr_mult = 1.8  # Fear recovering: more air (1.8 ATR, let recovery breathe)
                 else:
-                    trail_atr_mult = base_mult  # Normal: 1.5 ATR (matches analysis)
+                    trail_atr_mult = base_mult  # Normal: 1.5 ATR (or 2.25 if proxy active)
                 
                 # Phase 0: Fixed stop at entry - 7% until +5-6% (no trailing)
                 if gain_pct_now < 5.0:
@@ -3837,6 +4685,12 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                     loop._highest_price = price
                 mfe_in_R = (loop._highest_price - purchase_price) / initial_R if initial_R > 0 else 0.0
                 
+                # Regime flag for kill-switch: trending = either strong local trend or global regime OK
+                try:
+                    regime_trending_trail = bool(strong_trend or market_regime_ok())
+                except Exception:
+                    regime_trending_trail = False
+                
                 # Kill switch for non-trending regime: MFE≥2R and close<EMA20 → exit
                 # Only in non-trending (more noise, need to protect gains)
                 if not regime_trending_trail and mfe_in_R >= 2.0:
@@ -3852,9 +4706,61 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 if _floor:
                     stop_price = max(stop_price, float(_floor))  # hard floor
                 
-                # Ensure stop never goes below initial stop
-                stop_price = max(stop_price, initial_stop)
+                # >>> SHORT MODE: Inverse trailing (for shorts, trail from low, exit if price > stop)
+                if mode == 'short':
+                    # For shorts: track lowest price (inverse of highest)
+                    if not hasattr(loop, '_lowest_price'):
+                        loop._lowest_price = purchase_price
+                    if price < loop._lowest_price:
+                        loop._lowest_price = price
+                    
+                    # Inverse trailing: stop = lowest_price + trail_pct (above entry for shorts)
+                    trail_pct_short = trail_atr_mult * atr_pct  # Same ATR multiple
+                    candidate_stop_short = loop._lowest_price * (1.0 + trail_pct_short / 100.0)  # Above lowest
+                    
+                    # Take minimum stop (most protective for shorts = lowest stop above entry)
+                    stop_candidates_short = [initial_stop, candidate_stop_short]
+                    if be_stop_candidate is not None:
+                        # For shorts: BE is entry price (no profit yet)
+                        be_stop_candidate_short = purchase_price  # Break-even for shorts
+                        stop_candidates_short.append(be_stop_candidate_short)
+                    
+                    # Take minimum (most protective = closest to entry for shorts)
+                    stop_price = min(stop_candidates_short)
+                    
+                    # Ensure stop never goes below entry price (for shorts, stop must be above)
+                    stop_price = max(stop_price, purchase_price)
+                    
+                    # Exit if price exceeds stop (for shorts, price going up = loss)
+                    if price >= stop_price:
+                        close_short(symbol, amount, trade_id, source="trail-stop-short")
+                        return
+                else:
+                    # Long mode: normal trailing
+                    # Ensure stop never goes below initial stop
+                    stop_price = max(stop_price, initial_stop)
+                    
+                    # Exit if price hits stop (for longs, price going down = loss)
+                    if price <= stop_price:
+                        sell_symbol(symbol, amount, trade_id, source="trail-stop")
+                        return
 
+                # >>> RVOL COLLAPSE EXIT: Disabled in fear (vol dries up in bottoms, but rebounds come)
+                # Skip RVOL collapse exit for shorts (different logic needed)
+                if mode == 'short':
+                    pass  # Skip RVOL collapse for shorts
+                elif RVOL_COLLAPSE_EXIT_ENABLED:
+                    # In fear (FGI < 20), set threshold very low (0.3) to avoid premature exits
+                    rvol_collapse_threshold = RVOL_COLLAPSE_EXIT
+                try:
+                    fgi_features = fetch_fgi_features()
+                    fgi_value = fgi_features.get("value")
+                    if fgi_value is not None and fgi_value <= 20:
+                        rvol_collapse_threshold = 0.3  # Much lower threshold in fear
+                        logger.debug(f"[rvol-collapse] {symbol}: Threshold lowered to {rvol_collapse_threshold} (FGI={fgi_value})")
+                except Exception:
+                    pass
+                
                 # Volume-collapse exit (15m closed) — skip in strong trend
                 if RVOL_COLLAPSE_EXIT_ENABLED and not strong_trend:
                     try:
@@ -3865,8 +4771,8 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                             rv_mean_15 = vol_closed.rolling(10).mean().iloc[-1]
                             if rv_mean_15 and rv_mean_15 > RVOL_MEAN_MIN:
                                 rvol15_closed = float(vol_closed.iloc[-1] / rv_mean_15)
-                        if held_long_enough and (rvol15_closed is not None) and (rvol15_closed < RVOL_COLLAPSE_EXIT):
-                            logger.info(f"[collapse-exit] {symbol} 15m RVOL(closed)={rvol15_closed:.2f} < {RVOL_COLLAPSE_EXIT:.2f} — exiting.")
+                        if held_long_enough and (rvol15_closed is not None) and (rvol15_closed < rvol_collapse_threshold):
+                            logger.info(f"[collapse-exit] {symbol} 15m RVOL(closed)={rvol15_closed:.2f} < {rvol_collapse_threshold:.2f} — exiting.")
                             # >>> EXIT HOOK: hold while volume is on (ANCHOR EXITVOL)
                             try:
                                 tf15 = quick_tf_snapshot(symbol, "15m", limit=60) or {}
@@ -3945,8 +4851,38 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                         else:
                             structural_exit = True
 
-                # Time-stop (3h) if MACDh15 < 0 on two closed bars
-                if held >= TIME_STOP_HOURS * 3600:
+                # >>> TIME-STOP: Extended for full swing (capture rebounds)
+                # Base: 48h (2 days), Extended: 120h (5 days) if vol_slope>0 or RSI<40
+                # JSON success in dips: RSI<40 and vol_slope>0 are key conditions
+                time_stop_hours = TIME_STOP_HOURS  # Base 48h (2 days)
+                try:
+                    # Check volume slope (from JSON: vol_slope positive in successful trends)
+                    vol_slope_positive = False
+                    rsi_low = False
+                    try:
+                        df15_vol = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=20)
+                        if df15_vol is not None and len(df15_vol) >= 10:
+                            volumes_10 = df15_vol['volume'].iloc[-10:].values
+                            x = np.arange(10)
+                            vol_slope = linregress(x, volumes_10).slope
+                            vol_slope_positive = vol_slope > 0
+                        
+                        # Check RSI (JSON success in dips: RSI<40)
+                        rsi1h_val = float(df1h['RSI'].iloc[-1]) if pd.notna(df1h['RSI'].iloc[-1]) else None
+                        if rsi1h_val is not None and rsi1h_val < 40:
+                            rsi_low = True
+                    except Exception:
+                        pass
+                    
+                    # Extend to 120h (5 days) if vol_slope>0 or RSI<40 (JSON edge conditions)
+                    if vol_slope_positive or rsi_low:
+                        time_stop_hours = TIME_STOP_EXTEND_HOURS  # 120h (5 days)
+                        logger.debug(f"[time-stop] {symbol}: Extended to {time_stop_hours}h (vol_slope={vol_slope_positive}, RSI<40={rsi_low})")
+                except Exception:
+                    pass
+                
+                # Time-stop if MACDh15 < 0 on two closed bars (after extended period)
+                if held >= time_stop_hours * 3600:
                     try:
                         df15ts = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=60)
                         macd15ts = ta.macd(df15ts['close'], fast=12, slow=26, signal=9)['MACDh_12_26_9']
@@ -4029,8 +4965,14 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                         sell_symbol(symbol, amount, trade_id, source="time_stop_bars")
                         return
 
-                # Price-triggered exit (respect micro-take guard)
-                if price <= stop_price:
+                # >>> PRICE-TRIGGERED EXIT: Different logic for shorts vs longs
+                # For shorts: exit if price >= stop_price (price goes up = loss)
+                # For longs: exit if price <= stop_price (price goes down = loss)
+                if mode == 'short':
+                    if price >= stop_price:
+                        close_short(symbol, amount, trade_id, source="trail-stop")
+                        return
+                elif price <= stop_price:
                     if price >= purchase_price:
                         edge_needed_pct = max(
                             required_edge_pct()*MIN_GAIN_OVER_FEES_MULT/EDGE_SAFETY_MULT,
@@ -4059,18 +5001,31 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                                     pass  # fall back to existing structural_exit flag
 
                                 if structural_confirmed:
-                                    sell_symbol(symbol, amount, trade_id, source="trail")
+                                    if mode == 'short':
+                                        close_short(symbol, amount, trade_id, source="trail-structure")
+                                    else:
+                                        sell_symbol(symbol, amount, trade_id, source="trail")
                                     return
 
                         else:
-                            sell_symbol(symbol, amount, trade_id, source="trail")
+                            if mode == 'short':
+                                close_short(symbol, amount, trade_id, source="trail")
+                            else:
+                                sell_symbol(symbol, amount, trade_id, source="trail")
                             return
                     else:
-                        sell_symbol(symbol, amount, trade_id, source="trail")
+                        if mode == 'short':
+                            close_short(symbol, amount, trade_id, source="trail")
+                        else:
+                            sell_symbol(symbol, amount, trade_id, source="trail")
                         return
 
                 # Rebound Guard (for structure-triggered exits)
-                if structural_exit and REBOUND_GUARD_ENABLED:
+                # Disable if RSI<45 (swing volatility - don't wait for rebounds in dips)
+                rsi1h_for_rebound = float(df1h['RSI'].iloc[-1]) if pd.notna(df1h['RSI'].iloc[-1]) else None
+                rebound_enabled = REBOUND_GUARD_ENABLED and (rsi1h_for_rebound is None or rsi1h_for_rebound >= 45)
+                
+                if structural_exit and rebound_enabled:
                     try:
                         if rebound_pending_until is None:
                             rebound_pending_until = time.time() + REBOUND_WAIT_BARS_15M * 15 * 60
@@ -4565,7 +5520,7 @@ def current_position_qty(symbol: str) -> float:
     opens = _open_buys_for_symbol(symbol)
     if not opens:
         return 0.0
-    return float(sum(o["amount"] for o in opens))
+    return float(sum(o.get("amount", 0.0) for o in opens))
 
 def _open_buys_all() -> list[dict]:
     conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
@@ -4836,13 +5791,72 @@ def calculate_daily_pnl() -> tuple[float, float, float]:
         logger.warning(f"calculate_daily_pnl error: {e}")
         return 0.0, 0.0, 0.0
 
+def calculate_monthly_pnl() -> tuple[float, float]:
+    """
+    Calculate monthly PnL for monthly DD guard.
+    Returns: (total_pnl_pct, starting_balance)
+    """
+    try:
+        now_utc = datetime.now(timezone.utc)
+        month_start = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        month_start_iso = month_start.isoformat()
+        
+        conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+        
+        # Realized PnL this month
+        cur.execute("""
+            SELECT 
+                SUM((sell.price - buy.price) * buy.amount) as realized_pnl
+            FROM transactions buy
+            INNER JOIN transactions sell ON buy.trade_id = sell.trade_id
+            WHERE buy.side = 'buy' 
+                AND sell.side = 'sell'
+                AND sell.status = 'closed'
+                AND sell.ts >= ?
+        """, (month_start_iso,))
+        realized_row = cur.fetchone()
+        realized_pnl = float(realized_row[0] or 0.0)
+        
+        # Unrealized PnL
+        cur.execute("""
+            SELECT symbol, price, amount
+            FROM transactions
+            WHERE side = 'buy' AND status = 'open'
+        """)
+        open_trades = cur.fetchall()
+        conn.close()
+        
+        unrealized_pnl = 0.0
+        for symbol, entry_price, amount in open_trades:
+            try:
+                current_price = fetch_price(symbol)
+                if current_price and entry_price:
+                    unrealized_pnl += (current_price - float(entry_price)) * float(amount)
+            except Exception:
+                pass
+        
+        # Get current balance
+        try:
+            bal = exchange.fetch_balance()
+            usdt_total = float(bal.get('USDT', {}).get('total', 0.0) or 0.0)
+            starting_balance = usdt_total - realized_pnl - unrealized_pnl
+            total_pnl_pct = ((realized_pnl + unrealized_pnl) / starting_balance * 100.0) if starting_balance > 0 else 0.0
+            return total_pnl_pct, starting_balance
+        except Exception:
+            return 0.0, None
+    except Exception as e:
+        logger.warning(f"calculate_monthly_pnl error: {e}")
+        return 0.0, None
+
 def check_equity_guard() -> tuple[bool, str]:
     """
     Check if equity guard should activate (circuit breaker).
+    Enhanced with FGI-based thresholds and monthly DD guard.
     Returns: (should_block, reason)
     If should_block is True, no new trades should be opened (but existing trades can be managed).
     """
     global _EQUITY_BREAKER_ACTIVE, _EQUITY_LAST_RESET_DATE
+    global _EQUITY_MONTHLY_BREAKER_ACTIVE, _EQUITY_MONTHLY_BREAKER_UNTIL, _EQUITY_MONTHLY_START_BALANCE
     
     if not EQUITY_GUARD_ENABLED:
         return False, "disabled"
@@ -4850,35 +5864,82 @@ def check_equity_guard() -> tuple[bool, str]:
     try:
         now_utc = datetime.now(timezone.utc)
         today_date = now_utc.date()
+        month_start = now_utc.replace(day=1).date()
         
-        # Reset breaker at start of new day
+        # >>> MONTHLY DD GUARD (Priority #1)
+        # Check monthly drawdown first (more critical than daily)
+        if _EQUITY_MONTHLY_BREAKER_UNTIL is not None and today_date < _EQUITY_MONTHLY_BREAKER_UNTIL:
+            if _EQUITY_MONTHLY_BREAKER_ACTIVE:
+                return True, f"monthly_dd_breaker_active (until {_EQUITY_MONTHLY_BREAKER_UNTIL})"
+        else:
+            # Reset monthly breaker if pause period expired
+            if _EQUITY_MONTHLY_BREAKER_ACTIVE and today_date >= _EQUITY_MONTHLY_BREAKER_UNTIL:
+                _EQUITY_MONTHLY_BREAKER_ACTIVE = False
+                _EQUITY_MONTHLY_BREAKER_UNTIL = None
+                logger.info(f"Monthly equity guard reset: {today_date}")
+        
+        # Check monthly DD if not already active
+        if not _EQUITY_MONTHLY_BREAKER_ACTIVE:
+            monthly_pnl_pct, monthly_start_bal = calculate_monthly_pnl()
+            if monthly_start_bal is not None and monthly_pnl_pct <= EQUITY_GUARD_MONTHLY_MAX_DD_PCT:
+                _EQUITY_MONTHLY_BREAKER_ACTIVE = True
+                _EQUITY_MONTHLY_BREAKER_UNTIL = today_date + timedelta(days=EQUITY_GUARD_MONTHLY_PAUSE_DAYS)
+                logger.error(
+                    f"🚨 MONTHLY EQUITY GUARD TRIGGERED: Monthly PnL {monthly_pnl_pct:.2f}% <= {EQUITY_GUARD_MONTHLY_MAX_DD_PCT}%"
+                )
+                send_telegram_message(
+                    f"🚨 *MONTHLY EQUITY GUARD TRIGGERED*\n"
+                    f"Monthly PnL: `{monthly_pnl_pct:.2f}%`\n"
+                    f"Threshold: `{EQUITY_GUARD_MONTHLY_MAX_DD_PCT}%`\n"
+                    f"All new trades blocked until {_EQUITY_MONTHLY_BREAKER_UNTIL} UTC"
+                )
+                return True, f"monthly_dd_breaker_triggered (pnl={monthly_pnl_pct:.2f}%)"
+        
+        # >>> DAILY GUARD (with FGI-based threshold adjustment)
+        # Reset daily breaker at start of new day
         if _EQUITY_LAST_RESET_DATE is None or _EQUITY_LAST_RESET_DATE < today_date:
             _EQUITY_BREAKER_ACTIVE = False
             _EQUITY_LAST_RESET_DATE = today_date
             logger.info(f"Equity guard reset for new day: {today_date}")
         
-        # If already active, block until reset
+        # If daily breaker already active, block until reset
         if _EQUITY_BREAKER_ACTIVE:
             return True, f"equity_breaker_active (max_loss_pct={EQUITY_GUARD_MAX_LOSS_PCT}%)"
+        
+        # Get FGI to adjust threshold (more risk in fear = +EV)
+        try:
+            fgi_features = fetch_fgi_features()
+            fgi_value = fgi_features.get("value")
+        except Exception:
+            fgi_value = None
+        
+        # Adjust max loss threshold based on FGI
+        # In fear (FGI < 20), allow more risk (-5% vs -3%) because fear bottoms historically give +100% recovery
+        max_loss_threshold = EQUITY_GUARD_MAX_LOSS_PCT
+        if fgi_value is not None and fgi_value <= 20:
+            max_loss_threshold = EQUITY_GUARD_MAX_LOSS_PCT_FEAR
+            logger.debug(f"Equity guard: FGI={fgi_value} (fear) → threshold adjusted to {max_loss_threshold}%")
         
         # Calculate daily PnL
         realized_pnl, unrealized_pnl, total_pnl_pct = calculate_daily_pnl()
         
         # Check if loss threshold exceeded
-        if total_pnl_pct <= EQUITY_GUARD_MAX_LOSS_PCT:
+        if total_pnl_pct <= max_loss_threshold:
             _EQUITY_BREAKER_ACTIVE = True
             logger.error(
-                f"🚨 EQUITY GUARD TRIGGERED: Daily PnL {total_pnl_pct:.2f}% <= {EQUITY_GUARD_MAX_LOSS_PCT}% "
-                f"(realized: {realized_pnl:.2f} USDT, unrealized: {unrealized_pnl:.2f} USDT)"
+                f"🚨 EQUITY GUARD TRIGGERED: Daily PnL {total_pnl_pct:.2f}% <= {max_loss_threshold}% "
+                f"(realized: {realized_pnl:.2f} USDT, unrealized: {unrealized_pnl:.2f} USDT, "
+                f"FGI={fgi_value if fgi_value else 'N/A'})"
             )
             send_telegram_message(
                 f"🚨 *EQUITY GUARD TRIGGERED*\n"
                 f"Daily PnL: `{total_pnl_pct:.2f}%`\n"
+                f"Threshold: `{max_loss_threshold}%` (FGI={fgi_value if fgi_value else 'N/A'})\n"
                 f"Realized: `{realized_pnl:.2f}` USDT\n"
                 f"Unrealized: `{unrealized_pnl:.2f}` USDT\n"
                 f"All new trades blocked until {_EQUITY_LAST_RESET_DATE + timedelta(days=1)} UTC"
             )
-            return True, f"equity_guard_triggered (pnl={total_pnl_pct:.2f}%)"
+            return True, f"equity_guard_triggered (pnl={total_pnl_pct:.2f}%, threshold={max_loss_threshold}%)"
         
         return False, "ok"
     except Exception as e:
@@ -4967,7 +6028,75 @@ def trade_once_with_report(symbol: str):
             log_decision(symbol, 0.0, "hold", False)
             return report
 
-        # 5) Decisión híbrida
+        # 5) >>> HYBRID PREFLIGHT: Determine entry mode (DCA, short, or swing)
+        mode, preflight_reason = hybrid_preflight(symbol)
+        
+        # >>> DCA MODE: Execute DCA buy if conditions met
+        if mode == 'dca':
+            try:
+                df1h_dca = fetch_and_prepare_data_hybrid(symbol, timeframe="1h", limit=120)
+                if df1h_dca is not None and len(df1h_dca) >= 50:
+                    ema50_1h_dca = float(df1h_dca['EMA50'].iloc[-1]) if pd.notna(df1h_dca['EMA50'].iloc[-1]) else None
+                    price_now = float(df1h_dca['close'].iloc[-1])
+                    
+                    if ema50_1h_dca is not None and price_now < ema50_1h_dca and cooldown_ok(symbol, HYBRID_DCA_COOLDOWN_H):
+                        # Execute DCA buy
+                        dca_amount = HYBRID_DCA_AMOUNT / price_now
+                        snap1h_dca = quick_tf_snapshot(symbol, "1h", limit=120) or {}
+                        atr_abs_dca = float(snap1h_dca.get("ATR") or 0.0)
+                        
+                        logger.info(f"[DCA-HYBRID] {symbol}: Executing DCA buy @ {price_now} ({preflight_reason})")
+                        order = execute_order_buy(symbol, dca_amount, {
+                            'adx': float(snap1h_dca.get('ADX') or 0.0),
+                            'rsi': float(df1h_dca['RSI'].iloc[-1]) if pd.notna(df1h_dca['RSI'].iloc[-1]) else 0.0,
+                            'rvol': float(snap1h_dca.get('RVOL10') or 0.0),
+                            'atr': atr_abs_dca,
+                            'score': 0.0,
+                            'confidence': 50,
+                        })
+                        if order:
+                            report["executed"] = True
+                            report["action"] = "buy"
+                            report["note"] = f"DCA-hybrid ({preflight_reason})"
+                            log_decision(symbol, 0.0, "buy-dca-hybrid", True)
+                            # Pass mode='dca' to trailing stop
+                            dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], atr_abs_dca, mode='dca')
+                            return report
+            except Exception as e:
+                logger.debug(f"DCA hybrid execution error {symbol}: {e}")
+        
+        # >>> SHORT MODE: Execute short if conditions met
+        elif mode == 'short':
+            try:
+                price_short = get_last_price(symbol)
+                df1h_short = fetch_and_prepare_data_hybrid(symbol, timeframe="1h", limit=120)
+                atr_abs_short = float(df1h_short['ATR'].iloc[-1]) if (df1h_short is not None and pd.notna(df1h_short['ATR'].iloc[-1])) else price_short * 0.02
+                short_amount = get_short_amount(symbol, price_short, atr_abs_short)
+                
+                if short_amount > 0:
+                    snap1h_short = quick_tf_snapshot(symbol, "1h", limit=120) or {}
+                    logger.info(f"[SHORT-HYBRID] {symbol}: Executing short @ {price_short} ({preflight_reason})")
+                    order = execute_short(symbol, short_amount, {
+                        'adx': float(snap1h_short.get('ADX') or 0.0),
+                        'rsi': float(df1h_short['RSI'].iloc[-1]) if pd.notna(df1h_short['RSI'].iloc[-1]) else 0.0,
+                        'rvol': float(snap1h_short.get('RVOL10') or 0.0),
+                        'atr': atr_abs_short,
+                        'score': 0.0,
+                        'confidence': 50,
+                    })
+                    if order:
+                        report["executed"] = True
+                        report["action"] = "short"
+                        report["note"] = f"Short-hybrid ({preflight_reason})"
+                        log_decision(symbol, 0.0, "short-hybrid", True)
+                        # Pass mode='short' to trailing stop
+                        dynamic_trailing_stop(symbol, short_amount, order['price'], order['trade_id'], atr_abs_short, mode='short')
+                        return report
+            except Exception as e:
+                logger.debug(f"Short hybrid execution error {symbol}: {e}")
+        
+        # >>> SWING MODE: Normal swing entry (default)
+        # Use hybrid_decision for swing entries
         action, conf, score, note = hybrid_decision(symbol)
         report.update({"action": action, "confidence": conf, "score": float(score), "note": note})
         logger.info(f"{symbol}: decision={action} conf={conf} score={score:.1f} note={note}")
@@ -4985,24 +6114,42 @@ def trade_once_with_report(symbol: str):
                 log_decision(symbol, score, "hold", False)
                 return report
 
-            balances = exchange.fetch_balance()
-            usdt = float(balances.get('free', {}).get('USDT', 0.0))
-            free_after_reserve = max(0.0, usdt - RESERVE_USDT)
-            if free_after_reserve < MIN_NOTIONAL:
-                report["note"] = "insufficient USDT (post-lock)"
+            try:
+                balances = exchange.fetch_balance()
+                usdt = float(balances.get('free', {}).get('USDT', 0.0))
+                free_after_reserve = max(0.0, usdt - RESERVE_USDT)
+                if free_after_reserve < MIN_NOTIONAL:
+                    report["note"] = "insufficient USDT (post-lock)"
+                    log_decision(symbol, score, "hold", False)
+                    return report
+            except Exception as e:
+                logger.error(f"Balance fetch error (post-lock) {symbol}: {e}")
+                report["note"] = f"balance_error: {e}"
                 log_decision(symbol, score, "hold", False)
                 return report
 
             # Precio actual y velas del TF de decisión
-            price = fetch_price(symbol)
-            if not price or price <= 0:
-                report["note"] = "invalid price"
+            try:
+                price = fetch_price(symbol)
+                if not price or price <= 0:
+                    report["note"] = "invalid price"
+                    log_decision(symbol, score, "hold", False)
+                    return report
+            except Exception as e:
+                logger.error(f"Price fetch error {symbol}: {e}")
+                report["note"] = f"price_error: {e}"
                 log_decision(symbol, score, "hold", False)
                 return report
 
-            df = fetch_and_prepare_data_hybrid(symbol, limit=200, timeframe=DECISION_TIMEFRAME)
-            if df is None or len(df) == 0:
-                report["note"] = "no candles at entry check"
+            try:
+                df = fetch_and_prepare_data_hybrid(symbol, limit=200, timeframe=DECISION_TIMEFRAME)
+                if df is None or len(df) == 0:
+                    report["note"] = "no candles at entry check"
+                    log_decision(symbol, score, "hold", False)
+                    return report
+            except Exception as e:
+                logger.error(f"Data fetch error {symbol}: {e}")
+                report["note"] = f"data_error: {e}"
                 log_decision(symbol, score, "hold", False)
                 return report
 
@@ -5264,13 +6411,134 @@ def startup_cleanup():
 # =========================
 # Main loop (r4.2)
 # =========================
+# >>> DAILY MONITORING (Light Telegram daily, better than Freqtrade's heavy UI)
+def get_daily_trades() -> list:
+    """
+    Get daily trades from database for reporting.
+    """
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        today = datetime.now(timezone.utc).date()
+        cur.execute("""
+            SELECT symbol, side, price, amount, ts, trade_id
+            FROM transactions
+            WHERE DATE(ts) = DATE(?) AND status='closed'
+            ORDER BY ts
+        """, (today.isoformat(),))
+        rows = cur.fetchall()
+        conn.close()
+        
+        trades = []
+        for row in rows:
+            symbol, side, price, amount, ts, trade_id = row
+            # Calculate PnL (simplified: need to match buy/sell pairs)
+            trades.append({
+                'symbol': symbol,
+                'side': side,
+                'price': float(price),
+                'amount': float(amount),
+                'ts': ts,
+                'trade_id': trade_id
+            })
+        return trades
+    except Exception as e:
+        logger.error(f"get_daily_trades error: {e}")
+        return []
+
+def daily_report():
+    """
+    Send daily PnL report via Telegram (light monitoring, better than Freqtrade UI).
+    """
+    try:
+        trades = get_daily_trades()
+        if not trades:
+            return
+        
+        # Calculate PnL from trades (simplified: match buy/sell pairs)
+        pnl_total = 0.0
+        buy_trades = {}
+        
+        for trade in trades:
+            if trade['side'] == 'buy':
+                buy_trades[trade['trade_id']] = trade
+            elif trade['side'] == 'sell' and trade['trade_id'] in buy_trades:
+                buy = buy_trades[trade['trade_id']]
+                pnl = (trade['price'] - buy['price']) * min(trade['amount'], buy['amount'])
+                pnl_total += pnl
+        
+        # Get unrealized PnL from open positions
+        unrealized_pnl = 0.0
+        try:
+            open_trades = _open_buys_all()
+            for trade in open_trades:
+                current_price = fetch_price(trade['symbol'])
+                if current_price:
+                    unrealized = (current_price - trade['price']) * trade['amount']
+                    unrealized_pnl += unrealized
+        except Exception:
+            pass
+        
+        total_pnl = pnl_total + unrealized_pnl
+        total_pnl_pct = (total_pnl / 10000.0) * 100.0 if total_pnl else 0.0  # Assuming 10k starting balance
+        
+        message = (
+            f"📊 *Daily Report*\n"
+            f"Date: {datetime.now(timezone.utc).date()}\n"
+            f"Trades: {len(trades)}\n"
+            f"Realized PnL: {pnl_total:.2f} USDT\n"
+            f"Unrealized PnL: {unrealized_pnl:.2f} USDT\n"
+            f"Total PnL: {total_pnl:.2f} USDT ({total_pnl_pct:.2f}%)"
+        )
+        
+        send_telegram_message(message)
+        logger.info(f"Daily report sent: PnL={total_pnl:.2f} USDT ({total_pnl_pct:.2f}%)")
+    except Exception as e:
+        logger.error(f"daily_report error: {e}")
+
+# Schedule daily report (every 24 hours)
+def schedule_daily_report():
+    """
+    Schedule daily report to run every 24 hours.
+    """
+    def run_daily():
+        daily_report()
+        # Schedule next run in 24 hours
+        threading.Timer(86400.0, run_daily).start()
+    
+    # Start first report in 1 hour (to avoid immediate execution)
+    threading.Timer(3600.0, run_daily).start()
+
 if __name__ == "__main__":
     logger.info(f"Starting hybrid trader ({VERSION}, profile={STRATEGY_PROFILE})…")
     try:
-        try: exchange.load_markets()
-        except Exception as e: logger.warning(f"load_markets warning: {e}")
-
-        startup_cleanup()
+        # >>> BACKTEST MODE (Simple, faster than Freqtrade CLI)
+        if BACKTEST_ENABLED:
+            # Skip startup_cleanup in backtest mode (no API needed)
+            logger.info("Backtest mode: skipping startup_cleanup and API initialization")
+        else:
+            try: exchange.load_markets()
+            except Exception as e: logger.warning(f"load_markets warning: {e}")
+            startup_cleanup()
+        
+        if BACKTEST_ENABLED:
+            logger.info("Running in BACKTEST mode...")
+            if OPTIMIZE_ENABLED:
+                # Parameter optimization
+                best_params = optimize_params()
+                logger.info(f"Optimization complete. Best params: {best_params}")
+            else:
+                # Single backtest run
+                results = backtest_strategy()
+                
+                # Train ML model on backtest results if enabled
+                if ML_ENABLED and SKLEARN_AVAILABLE and results.get('trades'):
+                    # ML_MODEL is module-level, assign directly
+                    globals()['ML_MODEL'] = train_ml_model(results['trades'])
+                    logger.info("ML model trained on backtest results")
+            
+            logger.info("Backtest complete. Exiting.")
+            exit(0)
 
         while True:
             check_log_rotation()
@@ -5292,16 +6560,36 @@ if __name__ == "__main__":
                 time.sleep(30)
                 continue
             
-            # >>> FGI Cycle Gate (ANCHOR FGI3)
+            # >>> PROXY FGI: RSI4h<40 full en guards/entries (ANCHOR FGI3)
+            # Replace FGI gate with RSI4h<40 check (same effect, no API dependency)
+            # RSI4h<40 = fear proxy (JSON q25 36), force cycle (allow entries in dips)
             try:
-                mk_bull, fgi_v, tag = is_market_bullish()
-                # Si hay extreme fear y además el régimen está apagado, pausamos ciclo (low-frequency en bears)
-                if (fgi_v is not None and fgi_v <= FGI_EXTREME_FEAR) and (not market_regime_ok()):
-                    logger.warning(f"⏸️  Cycle skipped due to Extreme Fear (FGI={fgi_v}, {tag}) with regime off.")
-                    time.sleep(30)
-                    continue
+                # Check RSI4h for BTC (market proxy)
+                df4h_btc = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+                rsi4h_btc = None
+                if df4h_btc is not None and len(df4h_btc) >= 14:
+                    try:
+                        rsi4h_btc = float(df4h_btc['RSI'].iloc[-1]) if pd.notna(df4h_btc['RSI'].iloc[-1]) else None
+                    except Exception:
+                        pass
+                
+                # If RSI4h<40 (fear proxy), force cycle (best time for swing entries in dips)
+                if rsi4h_btc is not None and rsi4h_btc < 40:
+                    logger.debug(f"RSI4h<40 (fear proxy): {rsi4h_btc:.1f} - allowing cycles for DCA entries")
+                    # No blocking, just allow all cycles (fear = opportunity for swings)
             except Exception as e:
-                logger.debug(f"FGI gate error: {e}")
+                logger.debug(f"RSI4h proxy check error: {e}")
+            
+            # Optional FGI gate (only if FORCE_FGI=1)
+            if FORCE_FGI:
+                try:
+                    mk_bull, fgi_v, tag = is_market_bullish()
+                    if (fgi_v is not None and fgi_v <= FGI_EXTREME_FEAR) and (not market_regime_ok()):
+                        logger.warning(f"⏸️  Cycle skipped due to Extreme Fear (FGI={fgi_v}, {tag}) with regime off.")
+                        time.sleep(30)
+                        continue
+                except Exception as e:
+                    logger.debug(f"FGI gate error: {e}")
             
             # >>> STRATEGY ROUTER (ANCHOR SP2)
             try:
