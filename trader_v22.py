@@ -2806,6 +2806,7 @@ def hybrid_decision(symbol: str):
 
     blocks = []
     level = "NONE"  # NONE | SOFT | HARD
+    notes = []  # Initialize notes early (used before scoring section)
 
     # >>> FGI as simple market regime layer (ANCHOR FGI1)
     # Simple FGI-based market mode: only adjust position size and stops in extreme conditions
@@ -3493,7 +3494,7 @@ def hybrid_decision(symbol: str):
 
         # ===== scoring =====
     score = 0.0
-    notes = []
+    # notes already initialized at the beginning of function
 
     # Overbought + MACDh soft score penalty (no hard block)
     if (
