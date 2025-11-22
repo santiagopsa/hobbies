@@ -20,7 +20,7 @@ try:
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
-    logger.warning("sklearn not available, ML features disabled")
+    # Note: logger not yet defined, will log later after logger initialization
 
 PARK_LOCK = threading.Lock()
 # =========================
@@ -435,9 +435,16 @@ file_handler = logging.handlers.TimedRotatingFileHandler(
     LOG_PATH, when="midnight", interval=1, backupCount=14, utc=True
 )
 fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-file_handler.setFormatter(fmt); logger.addHandler(file_handler)
-console = logging.StreamHandler(); console.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-console.setFormatter(fmt); logger.addHandler(console)
+file_handler.setFormatter(fmt)
+logger.addHandler(file_handler)
+console = logging.StreamHandler()
+console.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+console.setFormatter(fmt)
+logger.addHandler(console)
+
+# Log sklearn availability after logger is initialized
+if not SKLEARN_AVAILABLE:
+    logger.warning("sklearn not available, ML features disabled")
 
 def check_log_rotation(max_size_mb=1):
     try:
