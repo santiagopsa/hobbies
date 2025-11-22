@@ -2316,7 +2316,8 @@ def preflight_buy_guard(symbol: str) -> Tuple[bool, str]:
 
     # (1) ADX hard floor
     if adx_1h is None or adx_1h < PREFLIGHT_ADX_HARD_MIN:
-        return False, f"1h ADX {None if adx_1h is None else f'{adx_1h:.1f}'} < {PREFLIGHT_ADX_HARD_MIN:.0f}"
+        adx_str = "None" if adx_1h is None else f"{adx_1h:.1f}"
+        return False, f"1h ADX {adx_str} < {PREFLIGHT_ADX_HARD_MIN:.0f}"
     
     # >>> VOL_SLOPE MANDATORY CHECK (JSON edge: +1141 vs fail)
     # Volume slope > 0 is mandatory for quality entries (JSON shows massive edge)
@@ -2353,7 +2354,8 @@ def preflight_buy_guard(symbol: str) -> Tuple[bool, str]:
 
     # (3) RVOL 1h floor
     if rvol1h is None or rvol1h < PREFLIGHT_RVOL1H_MIN:
-        return False, f"1h RVOL {None if rvol1h is None else f'{rvol1h:.2f}'} < {PREFLIGHT_RVOL1H_MIN:.2f}"
+        rvol_str = "None" if rvol1h is None else f"{rvol1h:.2f}"
+        return False, f"1h RVOL {rvol_str} < {PREFLIGHT_RVOL1H_MIN:.2f}"
 
     # ===== Extra adjustments / timing filters =====
     # Ensure df15 is available
@@ -3118,12 +3120,14 @@ def hybrid_decision(symbol: str):
     
     # volume_ratio > 0.7
     if volume_ratio is None or volume_ratio <= 0.7:
-        blocks.append(f"HARD block: volume_ratio too low ({volume_ratio:.2f if volume_ratio else 'None'}, need >0.7)")
+        vol_ratio_str = f"{volume_ratio:.2f}" if volume_ratio is not None else "None"
+        blocks.append(f"HARD block: volume_ratio too low ({vol_ratio_str}, need >0.7)")
         level = "HARD"
     
     # volume_slope10 > 0 (volume trending up)
     if volume_slope10 is None or volume_slope10 <= 0:
-        blocks.append(f"HARD block: volume_slope10 not positive ({volume_slope10:.2f if volume_slope10 else 'None'}, need >0)")
+        vol_slope_str = f"{volume_slope10:.2f}" if volume_slope10 is not None else "None"
+        blocks.append(f"HARD block: volume_slope10 not positive ({vol_slope_str}, need >0)")
         level = "HARD"
 
 
