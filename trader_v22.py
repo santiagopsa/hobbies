@@ -176,6 +176,12 @@ HYBRID_SHORT_VOL_SLOPE_MIN = float(os.getenv("HYBRID_SHORT_VOL_SLOPE_MIN", "0.0"
 HYBRID_SHORT_ENABLED = bool(int(os.getenv("HYBRID_SHORT_ENABLED", "1")))  # Enable shorts
 HYBRID_DCA_ENABLED = bool(int(os.getenv("HYBRID_DCA_ENABLED", "1")))  # Enable DCA
 
+# >>> SHORT RISK CONTROLS (For testing with controlled risk)
+MAX_OPEN_SHORTS = int(os.getenv("MAX_OPEN_SHORTS", "3"))  # Max 3 shorts simultaneously (lower risk)
+SHORT_RISK_FRACTION = float(os.getenv("SHORT_RISK_FRACTION", "0.09"))  # 9% per short (50% of normal 18%)
+SHORT_STOP_ATR_MULT = float(os.getenv("SHORT_STOP_ATR_MULT", "1.5"))  # 1.5 ATR stop (tighter than 2 ATR)
+SHORT_MAX_POSITION_SIZE_PCT = float(os.getenv("SHORT_MAX_POSITION_SIZE_PCT", "0.30"))  # Max 30% of available (was 50%)
+
 # Global DCA cooldown tracking
 LAST_DCA = {}  # Global dict {sym: last_ts}
 
@@ -4044,8 +4050,8 @@ def execute_order_sell(symbol: str, amount: float, signals: dict | None = None) 
 # >>> HYBRID: Short Functions (20% shorts for hedging)
 def get_short_amount(symbol: str, price: float, atr_abs: float) -> float:
     """
-    Calculate short amount based on risk fraction.
-    Similar to buy sizing but for shorts (hedging downs).
+    Calculate short amount based on risk fraction (CONTROLLED for testing).
+    Uses reduced risk fraction and tighter stops for safety.
     """
     try:
         balances = exchange.fetch_balance()
@@ -4055,26 +4061,66 @@ def get_short_amount(symbol: str, price: float, atr_abs: float) -> float:
         if free_after_reserve < MIN_NOTIONAL:
             return 0.0
         
-        # Size based on risk fraction (similar to buy sizing)
-        risk_amount = free_after_reserve * RISK_FRACTION
-        stop_distance = atr_abs * 2.0  # 2 ATR stop for shorts
+        # >>> CONTROLLED RISK: Use reduced risk fraction for shorts (50% of normal)
+        risk_amount = free_after_reserve * SHORT_RISK_FRACTION  # 9% instead of 18%
+        stop_distance = atr_abs * SHORT_STOP_ATR_MULT  # 1.5 ATR (tighter stop)
         if stop_distance <= 0:
-            stop_distance = price * 0.03  # Fallback 3% stop
+            stop_distance = price * 0.025  # Fallback 2.5% stop (tighter)
         
         amount = risk_amount / stop_distance
-        return max(0.0, min(amount, free_after_reserve / price * 0.5))  # Max 50% of available
+        # >>> CONTROLLED RISK: Max 30% of available (reduced from 50%)
+        return max(0.0, min(amount, free_after_reserve / price * SHORT_MAX_POSITION_SIZE_PCT))
     except Exception as e:
         logger.error(f"get_short_amount error {symbol}: {e}")
         return 0.0
 
+def get_open_shorts_count() -> int:
+    """
+    Count currently open short positions.
+    """
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM transactions WHERE side='short' AND status='open'")
+        count = cur.fetchone()[0]
+        conn.close()
+        return count
+    except Exception:
+        return 0
+
 def execute_short(symbol: str, amount: float, signals: dict):
     """
     Execute short order (sell to open short position).
-    Similar to execute_order_buy but sells instead.
+    ⚠️ IMPORTANT: In SPOT trading, this requires having the asset first.
+    For real shorts (without having asset), you need margin/futures trading.
     """
     try:
+        # >>> RISK CONTROL: Verify balance for spot shorts (need asset first)
+        base_currency = symbol.split('/')[0]
         try:
-            order = exchange.create_market_sell_order(symbol, amount)
+            balances = exchange.fetch_balance()
+            base_balance = float(balances.get('free', {}).get(base_currency, 0.0))
+            
+            # In spot trading, shorts require having the asset first
+            if base_balance < amount * 1.001:  # Need 0.1% extra for fees
+                logger.warning(f"[SHORT-RISK] {symbol}: Insufficient {base_currency} balance for spot short. "
+                             f"Need {amount:.8f}, have {base_balance:.8f}. "
+                             f"Spot shorts require having the asset first. "
+                             f"For real shorts (without asset), enable margin/futures trading.")
+                return None
+        except Exception as e:
+            logger.warning(f"[SHORT-RISK] {symbol}: Balance check failed: {e}")
+            # Continue anyway, but log the risk
+        
+        try:
+            # Prepare amount for exchange filters
+            step, min_qty, min_notional = _bn_filters(symbol)
+            amount_adj, reason = _prepare_sell_amount(symbol, amount, fetch_price(symbol))
+            if amount_adj <= 0:
+                logger.warning(f"[SHORT-RISK] {symbol}: Amount filtered: {reason}")
+                return None
+            
+            order = exchange.create_market_sell_order(symbol, amount_adj)
         except Exception as e:
             logger.error(f"Exchange short order error {symbol}: {e}")
             return None
@@ -4357,9 +4403,11 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
 
             # >>> SHORT MODE: Inverse initial stop (for shorts, stop is above entry)
             if mode == 'short':
-                # For shorts: initial stop is above entry (price goes down = profit)
-                initial_stop = purchase_price + (INIT_STOP_ATR_MULT * atr_abs)  # Above entry
+                # >>> CONTROLLED RISK: Tighter stop for shorts (1.5 ATR instead of 2 ATR)
+                stop_atr_mult = SHORT_STOP_ATR_MULT if SHORT_STOP_ATR_MULT > 0 else 1.5
+                initial_stop = purchase_price + (stop_atr_mult * atr_abs)  # Above entry (tighter)
                 initial_R = max(initial_stop - purchase_price, purchase_price * 0.003)
+                logger.info(f"[SHORT-TRAIL] {symbol}: Initial stop at +{stop_atr_mult:.1f}ATR ({initial_stop:.4f}, entry={purchase_price:.4f})")
             else:
                 # Normal long: initial stop below entry
                 initial_stop = purchase_price - (INIT_STOP_ATR_MULT * atr_abs)
@@ -4416,12 +4464,23 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
 
                 # >>> CATASTROPHIC FLOOR (HOOK SAFE1)
                 try:
-                    dd_bps = int(round((1.0 - (last_price / entry_price)) * 10000))
-                    if dd_bps >= cata_dd_bps:
-                        logger.warning(f"[cata] {symbol} max DD {dd_bps}bps >= {cata_dd_bps}bps — force exit")
-                        sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="catastrophic")
-                        time.sleep(EXIT_CHECK_EVERY_SEC)
-                        continue
+                    if mode == 'short':
+                        # For shorts: calculate loss as (price - entry) / entry (inverse)
+                        # Catastrophic if price goes up significantly (loss for shorts)
+                        price_increase_pct = ((last_price / entry_price) - 1.0) * 100.0
+                        if price_increase_pct >= (abs(cata_dd_bps) / 100.0):  # e.g., +3.5% = catastrophic for shorts
+                            logger.warning(f"[cata-short] {symbol} price increase {price_increase_pct:.2f}% >= {abs(cata_dd_bps)/100.0:.2f}% — force exit")
+                            close_short(symbol, amount_to_sell, trade_id=trade_id, source="catastrophic-short")
+                            time.sleep(EXIT_CHECK_EVERY_SEC)
+                            continue
+                    else:
+                        # For longs: normal catastrophic stop (price goes down)
+                        dd_bps = int(round((1.0 - (last_price / entry_price)) * 10000))
+                        if dd_bps >= cata_dd_bps:
+                            logger.warning(f"[cata] {symbol} max DD {dd_bps}bps >= {cata_dd_bps}bps — force exit")
+                            sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="catastrophic")
+                            time.sleep(EXIT_CHECK_EVERY_SEC)
+                            continue
                 except Exception as e:
                     logger.warning(f"[cata] check failed {symbol}: {e}")
 
@@ -4429,22 +4488,48 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 try:
                     if PREARM_ENABLE and not trail_armed:
                         minutes_open = (time.time() - opened_at_ts) / 60.0
-                        floor_by_loss = entry_price * (1.0 - PREARM_MAX_LOSS_BPS * 0.0001)
-                        floor_by_atr  = entry_price * (1.0 - max(0.0, atr_pct) * PREARM_ATR_MULT * 0.01)
-                        cand_floor = max(floor_by_loss, floor_by_atr)   # tighter of the two
-                        prearm_floor = cand_floor if prearm_floor is None else max(prearm_floor, cand_floor)
+                        
+                        if mode == 'short':
+                            # For shorts: prearm ceiling (price going up = loss)
+                            ceiling_by_loss = entry_price * (1.0 + PREARM_MAX_LOSS_BPS * 0.0001)  # Above entry
+                            ceiling_by_atr = entry_price * (1.0 + max(0.0, atr_pct) * PREARM_ATR_MULT * 0.01)  # Above entry
+                            cand_ceiling = min(ceiling_by_loss, ceiling_by_atr)  # tighter (lower) of the two
+                            if not hasattr(loop, '_prearm_ceiling'):
+                                loop._prearm_ceiling = cand_ceiling
+                            loop._prearm_ceiling = min(loop._prearm_ceiling, cand_ceiling)  # Tightest (lowest) ceiling
+                            prearm_ceiling = loop._prearm_ceiling
 
-                        if last_price <= prearm_floor:
-                            logger.info(f"[prearm-stop] {symbol} hit {prearm_floor:.4f} (entry={entry_price:.4f}) — exit before arming")
-                            sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="prearm-stop")
-                            time.sleep(EXIT_CHECK_EVERY_SEC)
-                            continue
+                            if last_price >= prearm_ceiling:
+                                logger.info(f"[prearm-stop-short] {symbol} hit {prearm_ceiling:.4f} (entry={entry_price:.4f}) — exit before arming")
+                                close_short(symbol, amount_to_sell, trade_id=trade_id, source="prearm-stop-short")
+                                time.sleep(EXIT_CHECK_EVERY_SEC)
+                                continue
+                            
+                            if minutes_open >= ARM_TIME_MAX_MIN:
+                                trail_armed = True
+                                logger.info(f"[prearm-arm-short] {symbol} auto-armed after {minutes_open:.1f}m; ceiling={prearm_ceiling:.4f}")
+                                # Set ceiling for trailing (inverse of floor for longs)
+                                if hasattr(loop, '_prearm_ceiling'):
+                                    # For shorts: ceiling = max price, stop below it
+                                    pass  # Will be handled in trailing logic
+                        else:
+                            # For longs: normal prearm floor (price going down = loss)
+                            floor_by_loss = entry_price * (1.0 - PREARM_MAX_LOSS_BPS * 0.0001)
+                            floor_by_atr  = entry_price * (1.0 - max(0.0, atr_pct) * PREARM_ATR_MULT * 0.01)
+                            cand_floor = max(floor_by_loss, floor_by_atr)   # tighter of the two
+                            prearm_floor = cand_floor if prearm_floor is None else max(prearm_floor, cand_floor)
 
-                        if minutes_open >= ARM_TIME_MAX_MIN:
-                            trail_armed = True
-                            # seed your trail manager with an absolute floor clamp
-                            set_symbol_trailing(symbol, trail_bps=None, absolute_floor=prearm_floor)  # implement clamp inside
-                            logger.info(f"[prearm-arm] {symbol} auto-armed after {minutes_open:.1f}m; floor={prearm_floor:.4f}")
+                            if last_price <= prearm_floor:
+                                logger.info(f"[prearm-stop] {symbol} hit {prearm_floor:.4f} (entry={entry_price:.4f}) — exit before arming")
+                                sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="prearm-stop")
+                                time.sleep(EXIT_CHECK_EVERY_SEC)
+                                continue
+
+                            if minutes_open >= ARM_TIME_MAX_MIN:
+                                trail_armed = True
+                                # seed your trail manager with an absolute floor clamp
+                                set_symbol_trailing(symbol, trail_bps=None, absolute_floor=prearm_floor)  # implement clamp inside
+                                logger.info(f"[prearm-arm] {symbol} auto-armed after {minutes_open:.1f}m; floor={prearm_floor:.4f}")
                 except Exception as e:
                     logger.warning(f"[prearm] check failed {symbol}: {e}")
 
@@ -6140,7 +6225,7 @@ def trade_once_with_report(symbol: str):
                         snap1h_dca = quick_tf_snapshot(symbol, "1h", limit=120) or {}
                         atr_abs_dca = float(snap1h_dca.get("ATR") or 0.0)
                         
-                        logger.info(f"[DCA-HYBRID] {symbol}: Executing DCA buy @ {price_now} ({preflight_reason})")
+                        logger.info(f"[DCA-HYBRID] {symbol}: Executing DCA buy @ {price_now} (amount={HYBRID_DCA_AMOUNT} USDT) - {preflight_reason}")
                         order = execute_order_buy(symbol, dca_amount, {
                             'adx': float(snap1h_dca.get('ADX') or 0.0),
                             'rsi': float(df1h_dca['RSI'].iloc[-1]) if pd.notna(df1h_dca['RSI'].iloc[-1]) else 0.0,
@@ -6160,9 +6245,37 @@ def trade_once_with_report(symbol: str):
             except Exception as e:
                 logger.debug(f"DCA hybrid execution error {symbol}: {e}")
         
-        # >>> SHORT MODE: Execute short if conditions met
+        # >>> SHORT MODE: Execute short if conditions met (WITH RISK CONTROLS)
         elif mode == 'short':
+            # >>> RISK CONTROL: Check max open shorts limit
+            open_shorts = get_open_shorts_count()
+            if open_shorts >= MAX_OPEN_SHORTS:
+                report["note"] = f"max open shorts ({open_shorts}/{MAX_OPEN_SHORTS})"
+                log_decision(symbol, 0.0, "hold", False)
+                return report
+            
             try:
+                # >>> RISK CONTROL: Verify exchange supports shorts (spot may not support)
+                try:
+                    # Check if we can actually short (spot doesn't support real shorts without margin)
+                    # For testing: try a small order first or verify balance
+                    balances = exchange.fetch_balance()
+                    base_currency = symbol.split('/')[0]
+                    base_balance = float(balances.get('free', {}).get(base_currency, 0.0))
+                    
+                    # In spot trading, shorts require having the asset first
+                    # For testing purposes, we'll log a warning but allow if balance is available
+                    if base_balance < 0.001:  # Almost no balance
+                        logger.warning(f"[SHORT-RISK] {symbol}: No {base_currency} balance for spot short - may require margin/futures")
+                        report["note"] = f"insufficient {base_currency} balance for spot short"
+                        log_decision(symbol, 0.0, "hold", False)
+                        return report
+                except Exception as e:
+                    logger.warning(f"[SHORT-RISK] {symbol}: Balance check failed: {e}")
+                    report["note"] = f"short balance check failed: {e}"
+                    log_decision(symbol, 0.0, "hold", False)
+                    return report
+                
                 price_short = get_last_price(symbol)
                 df1h_short = fetch_and_prepare_data_hybrid(symbol, timeframe="1h", limit=120)
                 atr_abs_short = float(df1h_short['ATR'].iloc[-1]) if (df1h_short is not None and pd.notna(df1h_short['ATR'].iloc[-1])) else price_short * 0.02
@@ -6170,7 +6283,7 @@ def trade_once_with_report(symbol: str):
                 
                 if short_amount > 0:
                     snap1h_short = quick_tf_snapshot(symbol, "1h", limit=120) or {}
-                    logger.info(f"[SHORT-HYBRID] {symbol}: Executing short @ {price_short} ({preflight_reason})")
+                    logger.info(f"[SHORT-HYBRID] {symbol}: Executing short @ {price_short} (risk={SHORT_RISK_FRACTION*100:.1f}%, stop={SHORT_STOP_ATR_MULT}ATR) - {preflight_reason}")
                     order = execute_short(symbol, short_amount, {
                         'adx': float(snap1h_short.get('ADX') or 0.0),
                         'rsi': float(df1h_short['RSI'].iloc[-1]) if pd.notna(df1h_short['RSI'].iloc[-1]) else 0.0,
@@ -6182,11 +6295,13 @@ def trade_once_with_report(symbol: str):
                     if order:
                         report["executed"] = True
                         report["action"] = "short"
-                        report["note"] = f"Short-hybrid ({preflight_reason})"
+                        report["note"] = f"Short-hybrid ({preflight_reason}, risk={SHORT_RISK_FRACTION*100:.1f}%)"
                         log_decision(symbol, 0.0, "short-hybrid", True)
                         # Pass mode='short' to trailing stop
                         dynamic_trailing_stop(symbol, short_amount, order['price'], order['trade_id'], atr_abs_short, mode='short')
                         return report
+                else:
+                    report["note"] = f"short amount too small (risk={SHORT_RISK_FRACTION*100:.1f}%)"
             except Exception as e:
                 logger.debug(f"Short hybrid execution error {symbol}: {e}")
         
