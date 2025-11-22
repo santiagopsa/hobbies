@@ -153,3 +153,4 @@ python optimize_backtest.py --start 2024-01-01 --end 2024-12-31
 - No confiar ciegamente en los resultados
 
 
+

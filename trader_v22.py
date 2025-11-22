@@ -1,7 +1,7 @@
 
 
 # =========================
-# trader_vX.py -- ver variable VERSION
+# trader_v22.py -- ver variable VERSION
 # =========================
 from __future__ import annotations
 from pathlib import Path
@@ -23,7 +23,7 @@ load_dotenv()
 # >>> STRATEGY PROFILE (ANCHOR SP0)
 # Selector de estrategia
 
-VERSION = "v21.1"
+VERSION = "v22"
 PARK_IN_MOMENTUM = bool(int(os.getenv("PARK_IN_MOMENTUM", "0")))
 
 STRATEGY_PROFILES = {"USDT_MOMENTUM", "BTC_PARK", "AUTO_HYBRID"}
@@ -142,6 +142,13 @@ MIN_NOTIONAL = 8.0
 MAX_OPEN_TRADES = 5
 RESERVE_USDT = 20.0
 RISK_FRACTION = 0.18  # base fraction per trade (modulated)
+
+# >>> EQUITY GUARD / CIRCUIT BREAKER (ANCHOR EQGUARD)
+EQUITY_GUARD_ENABLED = bool(int(os.getenv("EQUITY_GUARD_ENABLED", "1")))
+EQUITY_GUARD_MAX_LOSS_PCT = float(os.getenv("EQUITY_GUARD_MAX_LOSS_PCT", "-3.0"))  # -3% max loss per day
+EQUITY_GUARD_RESET_HOUR_UTC = int(os.getenv("EQUITY_GUARD_RESET_HOUR_UTC", "0"))  # Reset at midnight UTC
+_EQUITY_BREAKER_ACTIVE = False  # Global flag: no new trades if True
+_EQUITY_LAST_RESET_DATE = None  # Track last reset date
 # ==== Scale-in / Pyramiding ====
 ALLOW_SCALE_IN = True                 # activar re-compras en el mismo símbolo
 SCALE_IN_MAX_BUYS_PER_SYMBOL = 2      # 1 base + 1 add-on
@@ -365,6 +372,10 @@ FGI_EXTREME_GREED = 75
 
 _FGI_CACHE = {"ts": 0, "value": None, "prev": None}
 
+# >>> FGI FEATURES CACHE (for limit=10) (ANCHOR FGICACHE)
+FGI_FEATURES_CACHE_TTL_SEC = 3600  # 1 hour (cache for limit=10 features)
+_FGI_FEATURES_CACHE = {"ts": 0, "features": None}
+
 # Logger
 logger = logging.getLogger("hybrid_trader")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -541,8 +552,16 @@ def fetch_fgi_features() -> dict:
     """
     Fetch FGI historical data and calculate derived features for swing trading.
     Returns features: value, change_1d, change_7d, ma_fast, ma_slow, slope_7d
+    
+    Uses cache to avoid hitting API every 30s (cache TTL = 1 hour).
     """
     try:
+        # Check cache first (for limit=10 features)
+        now = time.time()
+        if now - _FGI_FEATURES_CACHE["ts"] < FGI_FEATURES_CACHE_TTL_SEC and _FGI_FEATURES_CACHE["features"] is not None:
+            return _FGI_FEATURES_CACHE["features"]
+        
+        # Cache expired or missing, fetch fresh data
         # Fetch last 10 days of FGI data (enough for 7-day slope and EMAs)
         fgi_data = fetch_fear_greed_index(limit=10)
         history = fgi_data.get("history", [])
@@ -593,7 +612,7 @@ def fetch_fgi_features() -> dict:
             except Exception:
                 pass
         
-        return {
+        features = {
             "value": fgi_value,
             "change_1d": fgi_change_1d,
             "change_7d": fgi_change_7d,
@@ -601,11 +620,18 @@ def fetch_fgi_features() -> dict:
             "ma_slow": fgi_ma_slow,
             "slope_7d": fgi_slope_7d,
         }
+        
+        # Update cache
+        _FGI_FEATURES_CACHE.update({"ts": now, "features": features})
+        return features
     except Exception as e:
         logger.warning(f"fetch_fgi_features error: {e}")
-        # Fallback to basic FGI
+        # Fallback to basic FGI (cached if available)
+        if now - _FGI_FEATURES_CACHE["ts"] < FGI_FEATURES_CACHE_TTL_SEC and _FGI_FEATURES_CACHE["features"] is not None:
+            return _FGI_FEATURES_CACHE["features"]
+        # No cache, try basic fetch
         fgi_data = fetch_fear_greed_index(limit=2)
-        return {
+        fallback_features = {
             "value": fgi_data.get("value"),
             "change_1d": None,
             "change_7d": None,
@@ -613,6 +639,9 @@ def fetch_fgi_features() -> dict:
             "ma_slow": None,
             "slope_7d": None,
         }
+        # Cache fallback too
+        _FGI_FEATURES_CACHE.update({"ts": now, "features": fallback_features})
+        return fallback_features
 
 def is_market_bullish() -> tuple[bool, int|None, str]:
     """
@@ -622,7 +651,7 @@ def is_market_bullish() -> tuple[bool, int|None, str]:
     f = fetch_fear_greed_index()
     v, p = f.get("value"), f.get("prev")
     if v is None:
-        return (True, None, "no-fgi")  # falla segura
+        return (False, None, "no-fgi")  # fail-closed: if we can't get FGI, block entry
     if v >= FGI_GREED:
         return (True, v, "greed")
     if v >= 50 and (p is not None) and v > p:
@@ -843,7 +872,7 @@ def is_calm_safe_env() -> tuple[bool, str]:
     try:
         reg_ok = market_regime_ok()
     except Exception:
-        reg_ok = True  # fail-open
+        reg_ok = False  # fail-closed: if we can't verify regime, block entry
 
     mk_bull, fgi_v, tag = is_market_bullish()
     if not (reg_ok and mk_bull and (fgi_v is not None and fgi_v >= AUTO_SAFE_FGI)):
@@ -2162,29 +2191,45 @@ def hybrid_decision(symbol: str):
     blocks = []
     level = "NONE"  # NONE | SOFT | HARD
 
-    # >>> F&G + Downtrend modulation (ANCHOR FGI1)
+    # >>> FGI as simple market regime layer (ANCHOR FGI1)
+    # Simple FGI-based market mode: only adjust position size and stops in extreme conditions
     try:
         mk_bull, fgi_v, fgi_tag = is_market_bullish()
         down, down_sev, down_note = is_downtrend(symbol)
-
-        # Global (F&G): aflojar en greed, apretar en fear
-        if fgi_v is not None:
-            if fgi_v >= FGI_EXTREME_GREED:
-                ADX_MIN_K = max(ADX_MIN_K - 2, 15)
-                RVOL_BASE_K = max(0.9, RVOL_BASE_K * 0.9)
-                SCORE_GATE_OFFSET += -0.25
-            elif fgi_v >= FGI_GREED:
-                ADX_MIN_K = max(ADX_MIN_K - 1, 16)
-                RVOL_BASE_K = max(1.0, RVOL_BASE_K * 0.95)
-                SCORE_GATE_OFFSET += -0.15
-            elif fgi_v <= FGI_EXTREME_FEAR:
-                ADX_MIN_K = max(ADX_MIN_K + 3, ADX_MIN_K)  # endurece
-                RVOL_BASE_K = max(1.1, RVOL_BASE_K * 1.10)
-                SCORE_GATE_OFFSET += +0.35
-            elif fgi_v <= FGI_FEAR:
-                ADX_MIN_K = max(ADX_MIN_K + 1, ADX_MIN_K)
-                RVOL_BASE_K = max(1.05, RVOL_BASE_K * 1.05)
-                SCORE_GATE_OFFSET += +0.20
+        
+        # Fetch FGI features for swing trading
+        fgi_features = fetch_fgi_features()
+        fgi_classification = None
+        fgi_change_7d = fgi_features.get("change_7d")
+        fgi_value = fgi_features.get("value")
+        
+        # Get FGI classification from features
+        if fgi_value is not None:
+            if fgi_value >= FGI_EXTREME_GREED:
+                fgi_classification = "extreme_greed"
+            elif fgi_value >= FGI_GREED:
+                fgi_classification = "greed"
+            elif fgi_value <= FGI_EXTREME_FEAR:
+                fgi_classification = "extreme_fear"
+            elif fgi_value <= FGI_FEAR:
+                fgi_classification = "fear"
+            else:
+                fgi_classification = "neutral"
+        
+        # >>> FGI as soft modifier (only in extremes)
+        # Act only in extreme conditions to avoid overfitting
+        # Entry: only adjust SCORE_GATE (don't block, just be more selective)
+        # Trailing: handled separately in dynamic_trailing_stop()
+        fgi_slope_7d = fgi_features.get("slope_7d")
+        
+        # Extreme Greed + rising: be more selective (soft modifier, don't block)
+        if fgi_classification == "extreme_greed" and fgi_slope_7d is not None and fgi_slope_7d > 0:
+            # Soft modifier: raise gate by +0.3 to +0.5 (be more selective, don't block)
+            SCORE_GATE_OFFSET += +0.40  # Between +0.3 and +0.5 as requested
+            blocks.append(f"FGI soft-mod: Extreme Greed rising (FGI={fgi_value:.0f}, slope_7d={fgi_slope_7d:+.1f}) - more selective entry")
+        
+        # In all other cases: let swing technical rules drive decisions
+        # (No FGI modifications, just let the swing profile filters work)
 
         # Local (downtrend por símbolo): apretar gates y re-entry
         if down:
@@ -2200,6 +2245,8 @@ def hybrid_decision(symbol: str):
 
         note_parts = []
         if fgi_v is not None: note_parts.append(f"FGI={fgi_v}({fgi_tag})")
+        if fgi_value is not None and fgi_slope_7d is not None:
+            note_parts.append(f"FGI_slope={fgi_slope_7d:.1f}")
         if down: note_parts.append(f"downtrend({down_sev:.2f})")
         if note_parts:
             blocks.append("mod:" + ",".join(note_parts))
@@ -2382,84 +2429,74 @@ def hybrid_decision(symbol: str):
     regime_trending = (trending_up_flag == 1 and price_slope_lookback > 0)
     regime_non_trending = (trending_up_flag == 0 or price_slope_lookback <= 0)
     
-    # Global filters (apply to both modes)
-    # ADX: minimum floor ~18 to avoid chop
-    if adx is not None:
-        if adx < 18.0:
-            blocks.append(f"HARD block: ADX<18 ({adx:.1f}) - avoid total chop")
-            level = "HARD"
+    # >>> SWING PROFILE ENTRY (from swing_analysis.json optimal_ranges)
+    # Swing trading filters based on quantitive analysis
+    rsi = float(row['RSI']) if pd.notna(row['RSI']) else None
+    price_near_high_pct = float(row.get('PRICE_NEAR_HIGH_PCT', -10.0) or -10.0)
     
-    # RVOL10: avoid dead zones and extreme blow-offs
-    if rvol_1h is not None:
-        if rvol_1h < 0.6:
-            blocks.append(f"HARD block: RVOL10 too low ({rvol_1h:.2f} < 0.6) - dead zone")
-            level = "HARD"
-        elif rvol_1h > 2.4:
-            blocks.append(f"HARD block: RVOL10 too high ({rvol_1h:.2f} > 2.4) - likely blow-off")
-            level = "HARD"
-    
-    # Mode A: Trend continuation (regime_trending)
-    # Activate only if: trending_up_flag==1, ema20>ema50, close>ema20, RSI 47-64, ADX 20-45
-    mode_a_active = False
-    mode_b_active = False
-    
-    if regime_trending:
-        ema20_1h = float(row['EMA20']) if pd.notna(row['EMA20']) else None
-        ema50_1h = float(row['EMA50']) if pd.notna(row['EMA50']) else None
-        close_1h = float(row['close'])
+    # Calculate volume_ratio and volume_slope10 for swing profile
+    volume_ratio = None
+    volume_slope10 = None
+    try:
+        if len(df) >= 20:
+            # volume_ratio: current volume / 20-period average
+            volumes_20 = df['volume'].iloc[-20:].values
+            if len(volumes_20) == 20:
+                volume_20_avg = np.mean(volumes_20[~np.isnan(volumes_20)])
+                current_volume = df['volume'].iloc[-1]
+                if volume_20_avg > 0 and not np.isnan(current_volume):
+                    volume_ratio = float(current_volume / volume_20_avg)
         
-        mode_a_active = (
-            trending_up_flag == 1 and
-            ema20_1h is not None and ema50_1h is not None and ema20_1h > ema50_1h and
-            close_1h > ema20_1h
-        )
-        
-        if mode_a_active:
-            # RSI between 47-64 for trending mode
-            rsi = float(row['RSI']) if pd.notna(row['RSI']) else None
-            if rsi is not None:
-                if rsi < 47.0 or rsi > 64.0:
-                    blocks.append(f"HARD block: Mode A (trending) RSI out of range ({rsi:.1f}, need 47-64)")
-                    level = "HARD"
-            
-            # ADX between 20-45 for trending mode
-            if adx is not None:
-                if adx < 20.0 or adx > 45.0:
-                    blocks.append(f"HARD block: Mode A (trending) ADX out of range ({adx:.1f}, need 20-45)")
-                    level = "HARD"
+        if len(df) >= 10:
+            # volume_slope10: slope of volume over last 10 periods
+            x10 = np.arange(10)
+            volumes_10 = df['volume'].iloc[-10:].values
+            if len(volumes_10) == 10 and not np.any(np.isnan(volumes_10)):
+                volume_slope10 = float(linregress(x10, volumes_10).slope)
+    except Exception:
+        pass
     
-    # Mode B: Pullback (regime_non_trending)
-    # Activate if: trending_up_flag==0, avg_RSI>45, RSI current < avg_RSI, RSI 30-50, price_near_high -3% to -9%
-    if regime_non_trending:
-        rsi = float(row['RSI']) if pd.notna(row['RSI']) else None
-        price_near_high_pct = float(row.get('PRICE_NEAR_HIGH_PCT', -10.0) or -10.0)
-        
-        mode_b_active = (
-            trending_up_flag == 0 and
-            avg_rsi_lookback is not None and avg_rsi_lookback > 45.0 and
-            rsi is not None and rsi < avg_rsi_lookback
-        )
-        
-        if mode_b_active:
-            # RSI between 30-50 for pullback mode
-            if rsi is not None:
-                if rsi < 30.0 or rsi > 50.0:
-                    blocks.append(f"HARD block: Mode B (pullback) RSI out of range ({rsi:.1f}, need 30-50)")
-                    level = "HARD"
-            
-            # price_near_high between -3% and -9% (discount, not free fall)
-            if price_near_high_pct < -9.0 or price_near_high_pct > -3.0:
-                blocks.append(f"HARD block: Mode B (pullback) price_near_high out of range ({price_near_high_pct:.2f}%, need -9% to -3%)")
-                level = "HARD"
+    # Swing Profile Filters (from optimal_ranges analysis)
+    # ADX ∈ [20, 55]
+    if adx is None:
+        blocks.append("HARD block: ADX is None")
+        level = "HARD"
+    elif adx < 20.0 or adx > 55.0:
+        blocks.append(f"HARD block: ADX out of swing range ({adx:.1f}, need 20-55)")
+        level = "HARD"
     
-    # If neither mode is active, block entry
-    if not mode_a_active and not mode_b_active:
-        if regime_trending:
-            blocks.append("HARD block: Mode A (trending) requires trending_up_flag=1, EMA20>EMA50, close>EMA20")
-        elif regime_non_trending:
-            blocks.append("HARD block: Mode B (pullback) requires trending_up_flag=0, avg_RSI>45, RSI<avg_RSI")
-        else:
-            blocks.append("HARD block: Cannot determine regime (trending/non-trending)")
+    # RSI ∈ [25, 55]
+    if rsi is None:
+        blocks.append("HARD block: RSI is None")
+        level = "HARD"
+    elif rsi < 25.0 or rsi > 55.0:
+        blocks.append(f"HARD block: RSI out of swing range ({rsi:.1f}, need 25-55)")
+        level = "HARD"
+    
+    # RVOL10 ∈ [0.63, 2.5]
+    if rvol_1h is None:
+        blocks.append("HARD block: RVOL10 is None")
+        level = "HARD"
+    elif rvol_1h < 0.63 or rvol_1h > 2.5:
+        blocks.append(f"HARD block: RVOL10 out of swing range ({rvol_1h:.2f}, need 0.63-2.5)")
+        level = "HARD"
+    
+    # price_near_high_pct ∈ [-14.5%, -1%]
+    if price_near_high_pct is None or np.isnan(price_near_high_pct):
+        blocks.append("HARD block: price_near_high_pct is None")
+        level = "HARD"
+    elif price_near_high_pct < -14.5 or price_near_high_pct > -1.0:
+        blocks.append(f"HARD block: price_near_high_pct out of swing range ({price_near_high_pct:.2f}%, need -14.5% to -1%)")
+        level = "HARD"
+    
+    # volume_ratio > 0.7
+    if volume_ratio is None or volume_ratio <= 0.7:
+        blocks.append(f"HARD block: volume_ratio too low ({volume_ratio:.2f if volume_ratio else 'None'}, need >0.7)")
+        level = "HARD"
+    
+    # volume_slope10 > 0 (volume trending up)
+    if volume_slope10 is None or volume_slope10 <= 0:
+        blocks.append(f"HARD block: volume_slope10 not positive ({volume_slope10:.2f if volume_slope10 else 'None'}, need >0)")
         level = "HARD"
 
 
@@ -3281,6 +3318,53 @@ def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"
         features_exit = build_rich_features(symbol)
         save_trade_features(trade_id, symbol, 'exit', features_exit)
 
+        # >>> IMPROVED EXIT LOGGING: Calculate R-multiple and trade duration
+        exit_reason = source  # exit_reason is the source parameter
+        r_multiple = None
+        trade_duration_sec = None
+        trade_duration_hours = None
+        
+        try:
+            # Get entry data to calculate R-multiple and duration
+            conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+            cur.execute("""
+                SELECT price, amount, ts, atr
+                FROM transactions
+                WHERE trade_id=? AND side='buy' LIMIT 1
+            """, (trade_id,))
+            buy_row = cur.fetchone()
+            conn.close()
+            
+            if buy_row:
+                entry_price, entry_amount, entry_ts, atr_entry = buy_row
+                entry_price = float(entry_price)
+                entry_amount = float(entry_amount)
+                atr_entry = float(atr_entry) if atr_entry else None
+                
+                # Calculate trade duration
+                try:
+                    entry_dt = datetime.fromisoformat(str(entry_ts).replace("Z", "+00:00"))
+                    exit_dt = datetime.fromisoformat(str(sell_ts).replace("Z", "+00:00"))
+                    trade_duration_sec = int((exit_dt - entry_dt).total_seconds())
+                    trade_duration_hours = trade_duration_sec / 3600.0
+                except Exception:
+                    pass
+                
+                # Calculate R-multiple
+                if atr_entry and atr_entry > 0:
+                    # Initial R = initial stop distance (INIT_STOP_ATR_MULT * ATR)
+                    try:
+                        # Use the constant defined at module level (default 1.4, can be overridden by ENV)
+                        init_stop_atr_mult = float(os.getenv("INIT_STOP_ATR_MULT", str(INIT_STOP_ATR_MULT)))
+                        initial_R = init_stop_atr_mult * atr_entry
+                        if initial_R > 0:
+                            pnl_usdt = (sell_price - entry_price) * entry_amount
+                            r_multiple = pnl_usdt / (initial_R * entry_amount) if (initial_R * entry_amount) > 0 else None
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.debug(f"Error calculating R-multiple/duration for {symbol}: {e}")
+
         # EXIT FEATURES
         try:
             gen = features_exit.get("general", {})
@@ -3292,6 +3376,9 @@ def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"
             exit_summary = (
                 f"📤 *EXIT FEATURES* {symbol}\n"
                 f"Trade: `{trade_id}`  |  Price: `{_fmt(sell_price)}`  Amount: `{_fmt(amount)}`\n"
+                f"Exit Reason: `{exit_reason}`  |  "
+                f"{f'R-multiple: `{r_multiple:.2f}R`  |  ' if r_multiple is not None else ''}"
+                f"{f'Duration: `{trade_duration_hours:.1f}h` ({trade_duration_sec//60}m)' if trade_duration_sec is not None else ''}\n"
                 f"—\n"
                 f"*Market*\n"
                 f"Last:`{_fmt(gen.get('last'))}`  24hQVol:`{abbr(gen.get('quote_volume_24h'))}`  "
@@ -3329,7 +3416,10 @@ def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"
             )
 
             logger.info(
-                f"[exit-features] {symbol} trade={trade_id} | "
+                f"[exit] {symbol} trade={trade_id} | "
+                f"exit_reason={exit_reason} | "
+                f"{f'R-multiple={r_multiple:.2f}R | ' if r_multiple is not None else ''}"
+                f"{f'duration={trade_duration_hours:.1f}h ({trade_duration_sec//60}m) | ' if trade_duration_sec is not None else ''}"
                 f"1h RSI={_fmt(tf1h.get('rsi'))} ADX={_fmt(tf1h.get('adx'))} RVOL10={_fmt(tf1h.get('rvol10'))} "
                 f"| 15m RSI={_fmt(tf15.get('rsi'))} MACDh={_fmt(tf15.get('macd_hist'))} "
                 f"| spread={_fmt((ob.get('spread_pct') or 0)*100, pct=True)} imb={_fmt(ob.get('imbalance'))}"
@@ -3593,48 +3683,148 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 # Replace held_long_enough
                 held_long_enough = held >= max(60, effective_min_hold)
 
-                # >>> SIMPLIFIED TRAILING: Based on R-multiples only (price + ATR, no indicators)
-                # Analysis shows: MFE ~6%, MAE ~0.1-0.2% for good trends, worst MAE ~-3%
-                # Trailing should be pure price + ATR + R-multiples, not based on indicators
-                gain = price - purchase_price
+                # >>> SWING TRAILING STOP: 3-phase system based on quantitative swing analysis
+                # Analysis shows: trail_atr_multiple mean ≈ 1.38, median ≈ 1.44, q75 ≈ 1.87
+                # Phase 0: Fixed stop at -7% until +5-6% (no trailing to avoid noise)
+                # Phase 1: Break-even at +5% (protect capital - worst MAE of winners ≈ -4.7%)
+                # Phase 2: Trailing dynamic with ATR at +8% (let swing run - base 1.5 ATR)
+                # >>> HYBRID EXIT MODE: Integrates CHAN + Donchian + BE_R_MULT when EXIT_MODE == "hybrid"
+                
                 gain_pct_now = (price / purchase_price - 1.0) * 100.0
-                gain_in_R = gain / initial_R if initial_R > 0 else 0.0
+                gain_in_R = (price - purchase_price) / initial_R if initial_R > 0 else 0.0
                 
-                # Detect regime for trailing aggressiveness
-                regime_trending_trail = strong_trend  # Use strong_trend as proxy for regime_trending
+                # Track highest close price for trailing (use close, not high, to be more conservative)
+                if not hasattr(loop, '_highest_close'):
+                    loop._highest_close = purchase_price
+                if close1h > loop._highest_close:
+                    loop._highest_close = close1h
                 
-                # Trailing activation and stop levels based on R-multiples
-                # 0-1R: stop stays at -1R (no trail yet)
-                # 1-2R: move to BE or +0.2R (~+0.6%)
-                # 2-3.5R: stop minimum at +1R (+3%)
-                # >3.5R: switch to Chandelier ATR (k=3 for trending, k=2 for non-trending)
+                # Calculate ATR% for trailing distance (use close1h, not current price)
+                atr1h_abs = float(df1h['ATR'].iloc[-1]) if pd.notna(df1h['ATR'].iloc[-1]) else atr_abs
+                atr_pct = (atr1h_abs / close1h * 100.0) if close1h > 0 and atr1h_abs > 0 else 2.15  # Default 2.15% (mean from analysis)
                 
-                if gain_in_R < 1.0:
-                    # 0-1R: stop stays at initial stop (-1R)
-                    trail_armed = False
-                    stop_price = initial_stop
-                elif gain_in_R < 2.0:
-                    # 1-2R: move to BE or +0.2R
-                    trail_armed = True
-                    be_stop = purchase_price * (1.0 + required_edge_pct()/100.0)
-                    stop_at_02R = purchase_price + 0.2 * initial_R
-                    stop_price = max(initial_stop, be_stop, stop_at_02R)
-                elif gain_in_R < 3.5:
-                    # 2-3.5R: stop minimum at +1R
-                    trail_armed = True
-                    stop_at_1R = purchase_price + 1.0 * initial_R
-                    stop_price = max(initial_stop, stop_at_1R)
+                # >>> HYBRID EXIT: Calculate Chandelier stop and Donchian lower when EXIT_MODE == "hybrid"
+                chandelier_stop = None
+                donchian_lower_val = None
+                if EXIT_MODE == "hybrid":
+                    # Chandelier stop (CHAN)
+                    chandelier_stop = chandelier_stop_long(df1h, atr_len=CHAN_ATR_LEN, hh_len=CHAN_LEN_HIGH, k=base_k)
+                    
+                    # Donchian lower (already calculated above for structural_exit, but store for stop calculation)
+                    donchian_lower_val = donchian_lower(df1h, length=DONCHIAN_LEN_EXIT)
+                
+                # >>> BREAK-EVEN: Move stop to BE when trade reaches BE_R_MULT (1.3R)
+                be_stop_candidate = None
+                if gain_in_R >= BE_R_MULT:
+                    # Move stop to break-even (entry + fees)
+                    be_stop_candidate = purchase_price * (1.0 + required_edge_pct() / 100.0)
+                
+                # Get FGI features for trailing modulation
+                fgi_classification = None
+                fgi_change_7d = None
+                fgi_slope_7d = None
+                try:
+                    fgi_features = fetch_fgi_features()
+                    fgi_value = fgi_features.get("value")
+                    fgi_change_7d = fgi_features.get("change_7d")
+                    fgi_slope_7d = fgi_features.get("slope_7d")
+                    if fgi_value is not None:
+                        if fgi_value >= FGI_EXTREME_GREED:
+                            fgi_classification = "extreme_greed"
+                        elif fgi_value >= FGI_GREED:
+                            fgi_classification = "greed"
+                        elif fgi_value <= FGI_EXTREME_FEAR:
+                            fgi_classification = "extreme_fear"
+                        elif fgi_value <= FGI_FEAR:
+                            fgi_classification = "fear"
+                        else:
+                            fgi_classification = "neutral"
+                except Exception:
+                    pass
+                
+                # Determine trailing ATR multiple based on analysis and FGI
+                # Base: 1.5 ATR (centro del rango: mean 1.38, median 1.44, q75 1.87)
+                base_mult = 1.5
+                
+                # If gain >= 10%: tighten trailing (capture more profit on strong moves)
+                if gain_pct_now >= 10.0:
+                    base_mult = 1.2  # Tighter when already past target
+                
+                # >>> FGI modulation (only in extremes with slope)
+                # Act only in extreme conditions to avoid overfitting
+                # extreme_greed & slope_7d > 0 → tighter (1.2 ATR)
+                # fear/extreme_fear & slope_7d > 0 → looser (1.8 ATR, let recovery breathe)
+                # Rest → base_mult (1.5 ATR normal)
+                if fgi_classification == "extreme_greed" and fgi_slope_7d is not None and fgi_slope_7d > 0:
+                    trail_atr_mult = 1.2  # Euphoria rising: tighter stop (1.2 ATR)
+                elif fgi_classification in ["fear", "extreme_fear"] and fgi_slope_7d is not None and fgi_slope_7d > 0:
+                    trail_atr_mult = 1.8  # Fear recovering: more air (1.8 ATR, let recovery breathe)
                 else:
-                    # >3.5R: switch to Chandelier ATR
+                    trail_atr_mult = base_mult  # Normal: 1.5 ATR (matches analysis)
+                
+                # Phase 0: Fixed stop at entry - 7% until +5-6% (no trailing)
+                if gain_pct_now < 5.0:
+                    # Keep fixed stop at entry - 7% (≈3.5 ATR)
+                    stop_price = purchase_price * 0.93  # entry - 7%
+                    trail_armed = False
+                    
+                    # >>> HYBRID: Use CHAN stop if available and more protective
+                    if EXIT_MODE == "hybrid" and chandelier_stop is not None:
+                        stop_price = max(stop_price, chandelier_stop)
+                
+                # Phase 1: Break-even at +5% (protect capital)
+                # Analysis shows: worst MAE of winners ≈ -4.7%, so +5% gives enough margin
+                elif gain_pct_now < 8.0:
+                    # Move stop to break-even (or +0.5% if preferred)
+                    be_stop = purchase_price  # Break-even (or use * 1.005 for +0.5%)
+                    stop_price = max(initial_stop, be_stop)
+                    
+                    # >>> HYBRID: Use BE_R_MULT break-even if trade reached 1.3R
+                    if be_stop_candidate is not None:
+                        stop_price = max(stop_price, be_stop_candidate)
+                    
+                    # >>> HYBRID: Use CHAN stop if available and more protective
+                    if EXIT_MODE == "hybrid" and chandelier_stop is not None:
+                        stop_price = max(stop_price, chandelier_stop)
+                    
                     trail_armed = True
-                    # k = 3 for trending, k = 2 for non-trending
-                    k_for_trail = 3.0 if regime_trending_trail else 2.0
-                    c_stop = chandelier_stop_long(df1h, atr_len=CHAN_ATR_LEN, hh_len=CHAN_LEN_HIGH, k=k_for_trail)
-                    stop_at_1R = purchase_price + 1.0 * initial_R
-                    if c_stop is not None:
-                        stop_price = max(initial_stop, stop_at_1R, c_stop)
-                    else:
-                        stop_price = max(initial_stop, stop_at_1R)
+                
+                # Phase 2: Trailing dynamic with ATR at +8% (let swing run)
+                # Analysis shows: 75% of winners never retrace >3.1% from peak (≈1.5 ATR)
+                else:
+                    # Activate trailing based on ATR (using highest_close, not highest_high)
+                    trail_armed = True
+                    
+                    # Calculate trailing distance as percentage
+                    trail_pct = trail_atr_mult * atr_pct  # e.g., 1.5 * 2.15% = 3.225%
+                    
+                    # Candidate stop: highest_close - trail_pct
+                    candidate_sl = loop._highest_close * (1.0 - trail_pct / 100.0)
+                    
+                    # >>> HYBRID: Integrate CHAN + Donchian + BE in stop calculation
+                    stop_candidates = [initial_stop, candidate_sl]
+                    
+                    # Add BE stop if trade reached 1.3R
+                    if be_stop_candidate is not None:
+                        stop_candidates.append(be_stop_candidate)
+                    
+                    # Add Chandelier stop if available (CHAN)
+                    if EXIT_MODE == "hybrid" and chandelier_stop is not None:
+                        stop_candidates.append(chandelier_stop)
+                    
+                    # Add Donchian lower as additional reference (structure-based)
+                    if EXIT_MODE == "hybrid" and donchian_lower_val is not None:
+                        # Use Donchian lower as a floor reference (don't go below structure)
+                        stop_candidates.append(donchian_lower_val)
+                    
+                    # Take the maximum (most protective) stop
+                    stop_price = max(stop_candidates)
+                    
+                    # Ensure stop never goes below break-even once we're in trailing phase
+                    be_floor = purchase_price  # Break-even floor
+                    if be_stop_candidate is not None:
+                        be_floor = max(be_floor, be_stop_candidate)
+                    stop_price = max(stop_price, be_floor)
 
                 # >>> SIMPLIFIED TRAILING: R-multiples only (no indicator-based adjustments)
                 # Analysis shows: best exits are pure price + ATR, not based on RSI/ADX/RVOL/slopes
@@ -4367,6 +4557,16 @@ def _open_buys_for_symbol(symbol: str) -> list[dict]:
                     "amount": float(amt), "ts": ts, "confidence": int(conf or 0)})
     return out
 
+def current_position_qty(symbol: str) -> float:
+    """
+    Devuelve la cantidad total (sumada) de la posición abierta en ese símbolo,
+    basada en la tabla 'transactions'.
+    """
+    opens = _open_buys_for_symbol(symbol)
+    if not opens:
+        return 0.0
+    return float(sum(o["amount"] for o in opens))
+
 def _open_buys_all() -> list[dict]:
     conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
     cur.execute("""SELECT id, trade_id, symbol, price, amount, ts, confidence
@@ -4571,6 +4771,121 @@ def get_open_trades_count() -> int:
     cnt = cur.fetchone()[0]; conn.close()
     return int(cnt)
 
+# >>> EQUITY GUARD / CIRCUIT BREAKER FUNCTIONS (ANCHOR EQGUARD)
+def calculate_daily_pnl() -> tuple[float, float, float]:
+    """
+    Calculate daily PnL (realized + unrealized) for equity guard.
+    Returns: (realized_pnl, unrealized_pnl, total_pnl_pct)
+    """
+    try:
+        now_utc = datetime.now(timezone.utc)
+        today_start = now_utc.replace(hour=EQUITY_GUARD_RESET_HOUR_UTC, minute=0, second=0, microsecond=0)
+        if now_utc.hour < EQUITY_GUARD_RESET_HOUR_UTC:
+            today_start -= timedelta(days=1)
+        today_start_iso = today_start.isoformat()
+        
+        # Get starting balance at day start (from balance snapshot or calculate from trades)
+        conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+        
+        # Realized PnL: sum of closed trades today
+        cur.execute("""
+            SELECT 
+                SUM((sell.price - buy.price) * buy.amount) as realized_pnl
+            FROM transactions buy
+            INNER JOIN transactions sell ON buy.trade_id = sell.trade_id
+            WHERE buy.side = 'buy' 
+                AND sell.side = 'sell'
+                AND sell.status = 'closed'
+                AND sell.ts >= ?
+        """, (today_start_iso,))
+        realized_row = cur.fetchone()
+        realized_pnl = float(realized_row[0] or 0.0)
+        
+        # Unrealized PnL: open positions current value - entry value
+        cur.execute("""
+            SELECT symbol, price, amount, ts, trade_id
+            FROM transactions
+            WHERE side = 'buy' AND status = 'open'
+        """)
+        open_trades = cur.fetchall()
+        conn.close()
+        
+        unrealized_pnl = 0.0
+        for symbol, entry_price, amount, entry_ts, trade_id in open_trades:
+            try:
+                current_price = fetch_price(symbol)
+                if current_price and entry_price:
+                    unrealized_pnl += (current_price - float(entry_price)) * float(amount)
+            except Exception:
+                pass  # Skip if can't fetch price
+        
+        # Get current balance for PnL%
+        try:
+            bal = exchange.fetch_balance()
+            usdt_total = float(bal.get('USDT', {}).get('total', 0.0) or 0.0)
+            
+            # Estimate starting balance (current - today's realized - today's unrealized)
+            # This is approximate; for precise tracking, maintain daily balance snapshots
+            starting_balance = usdt_total - realized_pnl - unrealized_pnl
+            total_pnl_pct = ((realized_pnl + unrealized_pnl) / starting_balance * 100.0) if starting_balance > 0 else 0.0
+        except Exception:
+            total_pnl_pct = 0.0
+        
+        return realized_pnl, unrealized_pnl, total_pnl_pct
+    except Exception as e:
+        logger.warning(f"calculate_daily_pnl error: {e}")
+        return 0.0, 0.0, 0.0
+
+def check_equity_guard() -> tuple[bool, str]:
+    """
+    Check if equity guard should activate (circuit breaker).
+    Returns: (should_block, reason)
+    If should_block is True, no new trades should be opened (but existing trades can be managed).
+    """
+    global _EQUITY_BREAKER_ACTIVE, _EQUITY_LAST_RESET_DATE
+    
+    if not EQUITY_GUARD_ENABLED:
+        return False, "disabled"
+    
+    try:
+        now_utc = datetime.now(timezone.utc)
+        today_date = now_utc.date()
+        
+        # Reset breaker at start of new day
+        if _EQUITY_LAST_RESET_DATE is None or _EQUITY_LAST_RESET_DATE < today_date:
+            _EQUITY_BREAKER_ACTIVE = False
+            _EQUITY_LAST_RESET_DATE = today_date
+            logger.info(f"Equity guard reset for new day: {today_date}")
+        
+        # If already active, block until reset
+        if _EQUITY_BREAKER_ACTIVE:
+            return True, f"equity_breaker_active (max_loss_pct={EQUITY_GUARD_MAX_LOSS_PCT}%)"
+        
+        # Calculate daily PnL
+        realized_pnl, unrealized_pnl, total_pnl_pct = calculate_daily_pnl()
+        
+        # Check if loss threshold exceeded
+        if total_pnl_pct <= EQUITY_GUARD_MAX_LOSS_PCT:
+            _EQUITY_BREAKER_ACTIVE = True
+            logger.error(
+                f"🚨 EQUITY GUARD TRIGGERED: Daily PnL {total_pnl_pct:.2f}% <= {EQUITY_GUARD_MAX_LOSS_PCT}% "
+                f"(realized: {realized_pnl:.2f} USDT, unrealized: {unrealized_pnl:.2f} USDT)"
+            )
+            send_telegram_message(
+                f"🚨 *EQUITY GUARD TRIGGERED*\n"
+                f"Daily PnL: `{total_pnl_pct:.2f}%`\n"
+                f"Realized: `{realized_pnl:.2f}` USDT\n"
+                f"Unrealized: `{unrealized_pnl:.2f}` USDT\n"
+                f"All new trades blocked until {_EQUITY_LAST_RESET_DATE + timedelta(days=1)} UTC"
+            )
+            return True, f"equity_guard_triggered (pnl={total_pnl_pct:.2f}%)"
+        
+        return False, "ok"
+    except Exception as e:
+        logger.error(f"check_equity_guard error: {e}")
+        # Fail-closed: if we can't check equity, block entry
+        return True, f"equity_guard_error: {e}"
+
 def trade_once_with_report(symbol: str):
     """
     Ejecuta un ciclo de decisión para un símbolo y, si corresponde, compra con
@@ -4617,7 +4932,16 @@ def trade_once_with_report(symbol: str):
             return report
 
 
-        # 2) Chequeo de utilización de portafolio
+        # 2) >>> EQUITY GUARD / CIRCUIT BREAKER (ANCHOR EQGUARD)
+        # Check if equity guard should block new entries
+        equity_block, equity_reason = check_equity_guard()
+        if equity_block:
+            report["note"] = f"equity_guard: {equity_reason}"
+            logger.warning(f"{symbol}: {report['note']}")
+            log_decision(symbol, 0.0, "hold", False)
+            return report
+
+        # 3) Chequeo de utilización de portafolio
         util, total, free, used = portfolio_utilization()
         if util > PORTFOLIO_MAX_UTIL:
             report["note"] = f"portfolio util {util:.2f} > max"
@@ -4625,7 +4949,7 @@ def trade_once_with_report(symbol: str):
             log_decision(symbol, 0.0, "hold", False)
             return report
 
-        # 3) Límite de operaciones abiertas
+        # 4) Límite de operaciones abiertas
         open_trades = get_open_trades_count()
         if open_trades >= MAX_OPEN_TRADES:
             report["note"] = "max open trades"
@@ -4959,6 +5283,14 @@ if __name__ == "__main__":
                 logger.warning(f"park_to_btc_if_needed error: {e}")
 
             cycle_decisions = []
+            
+            # >>> EQUITY GUARD / CIRCUIT BREAKER (ANCHOR EQGUARD)
+            # Check equity guard before scanning symbols
+            equity_block, equity_reason = check_equity_guard()
+            if equity_block:
+                logger.warning(f"⏸️  Cycle skipped due to equity guard: {equity_reason}")
+                time.sleep(30)
+                continue
             
             # >>> FGI Cycle Gate (ANCHOR FGI3)
             try:
