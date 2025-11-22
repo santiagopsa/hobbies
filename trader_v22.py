@@ -224,6 +224,12 @@ DECISION_TIMEFRAME = "1h"
 SPREAD_MAX_PCT_DEFAULT = 0.005   # 0.5%
 MIN_QUOTE_VOL_24H_DEFAULT = 3_000_000
 
+# >>> OPTIMIZED PARAMS (from backtest 2024-11-01 to 2024-11-05)
+# Best params found: {'rsi_low': 40, 'adx_min': 20, 'vol_slope_min': 0}
+# To test with optimized params, uncomment these lines:
+# ADX_MIN_DEFAULT = 20  # Optimized value
+# RSI_MIN_DEFAULT, RSI_MAX_DEFAULT = 40, 68  # Optimized value
+
 ADX_MIN_DEFAULT = 15  # Optimized for swing: JSON success mean ADX 31, q25 21 - capture bottoms (was 25)
 RSI_MIN_DEFAULT, RSI_MAX_DEFAULT = 35, 68  # Optimized for swing: JSON success mean RSI 44, q25 36 - capture dips (was 40)
 RVOL_BASE_DEFAULT = 1.35  # Ajustado desde 1.5: tendencias buenas viven entre 1.1-1.3
@@ -1972,9 +1978,16 @@ def backtest_strategy() -> dict:
                 
                 if exit_reason:
                     # Close position
-                    pnl = (current_price - entry_price) * amount if pos['mode'] != 'short' else (entry_price - current_price) * amount
-                    pnl -= (current_price * amount * 0.001)  # Fee
-                    balance += current_price * amount - (current_price * amount * 0.001)  # Sell and deduct fee
+                    if pos['mode'] == 'short':
+                        # Short: pay back crypto, receive USDT
+                        pnl = (entry_price - current_price) * amount  # Profit if price went down
+                        pnl -= (current_price * amount * 0.001)  # Fee on close
+                        balance -= current_price * amount * (1 + 0.001)  # Pay back crypto + fee
+                    else:
+                        # Long/DCA: sell crypto, receive USDT
+                        pnl = (current_price - entry_price) * amount  # Profit if price went up
+                        pnl -= (current_price * amount * 0.001)  # Fee on sell
+                        balance += current_price * amount * (1 - 0.001)  # Receive USDT - fee
                     
                     trades.append({
                         'symbol': symbol,
@@ -2009,29 +2022,70 @@ def backtest_strategy() -> dict:
                 
                 row = df_ts.iloc[-1]
                 
-                # Simplified entry check (can use hybrid_preflight logic)
+                # Enhanced entry check with hybrid logic (swing/dca/short)
                 try:
                     rsi = float(row['RSI']) if pd.notna(row.get('RSI')) else 50.0
                     adx = float(row['ADX']) if pd.notna(row.get('ADX')) else 20.0
                     price = float(row['close'])
+                    vol_slope = float(row.get('VOL_SLOPE10', 0)) if pd.notna(row.get('VOL_SLOPE10')) else 0.0
                     
-                    # Simple entry conditions (can be enhanced with full hybrid logic)
-                    if rsi >= RSI_MIN_DEFAULT and rsi <= 70 and adx >= ADX_MIN_DEFAULT:
+                    # Get 4h RSI for DCA/short logic (simplified: use 1h RSI as proxy if 4h not available)
+                    rsi4h = rsi  # Simplified: use 1h RSI as proxy
+                    if len(df_ts) >= 4:  # Try to get 4h equivalent
+                        try:
+                            # Get RSI from 4 candles ago (approximate 4h)
+                            if len(df_ts) >= 4:
+                                rsi4h = float(df_ts['RSI'].iloc[-4]) if pd.notna(df_ts['RSI'].iloc[-4]) else rsi
+                        except:
+                            pass
+                    
+                    mode = None
+                    # >>> DCA Mode: Fear proxy + vol rising
+                    if HYBRID_DCA_ENABLED and rsi4h < RSI_FEAR_PROXY and vol_slope > HYBRID_SHORT_VOL_SLOPE_MIN:
+                        mode = 'dca'
+                    # >>> Short Mode: Overbought + vol falling
+                    elif HYBRID_SHORT_ENABLED and rsi > HYBRID_SHORT_RSI_MAX and vol_slope < HYBRID_SHORT_VOL_SLOPE_MIN:
+                        mode = 'short'
+                    # >>> Swing Mode: Normal entry
+                    else:
+                        # Use optimized params if provided via environment
+                        rsi_min = float(os.getenv("BACKTEST_RSI_MIN", str(RSI_MIN_DEFAULT)))
+                        adx_min = float(os.getenv("BACKTEST_ADX_MIN", str(ADX_MIN_DEFAULT)))
+                        if rsi >= rsi_min and rsi <= 70 and adx >= adx_min and vol_slope > 0:
+                            mode = 'swing'
+                    
+                    if mode:
                         # Calculate position size
                         risk_amount = balance * RISK_FRACTION
                         atr_val = float(row['ATR']) if pd.notna(row.get('ATR')) else price * 0.02
-                        amount = risk_amount / (atr_val * 3.5)  # Based on SL
-                        amount = min(amount, balance * 0.2 / price)  # Max 20% of balance
+                        
+                        if mode == 'dca':
+                            # DCA: Fixed amount
+                            amount = (HYBRID_DCA_AMOUNT / price) if price > 0 else 0
+                        elif mode == 'short':
+                            # Short: Based on risk
+                            amount = risk_amount / (atr_val * 3.5)  # Based on SL
+                            amount = min(amount, balance * 0.2 / price)  # Max 20% of balance
+                        else:  # swing
+                            # Swing: Based on risk
+                            amount = risk_amount / (atr_val * 3.5)  # Based on SL
+                            amount = min(amount, balance * 0.2 / price)  # Max 20% of balance
                         
                         if amount * price >= MIN_NOTIONAL and balance >= amount * price:
                             # Enter position
-                            cost = amount * price * (1 + 0.001)  # Buy + fee
-                            balance -= cost
+                            if mode == 'short':
+                                # Short: receive USDT, owe crypto
+                                balance += amount * price * (1 - 0.001)  # Short: receive funds, pay fee
+                            else:
+                                # Long/DCA: pay USDT, receive crypto
+                                cost = amount * price * (1 + 0.001)  # Buy + fee
+                                balance -= cost
+                            
                             positions[symbol] = {
                                 'entry_price': price,
                                 'amount': amount,
                                 'entry_ts': ts,
-                                'mode': 'swing'  # Default mode
+                                'mode': mode
                             }
                 except Exception as e:
                     logger.debug(f"Entry check error for {symbol} at {ts}: {e}")
@@ -2050,9 +2104,16 @@ def backtest_strategy() -> dict:
             amount = pos['amount']
             gain_pct = ((exit_price - entry_price) / entry_price * 100.0) if pos['mode'] != 'short' else ((entry_price - exit_price) / entry_price * 100.0)
             
-            pnl = (exit_price - entry_price) * amount if pos['mode'] != 'short' else (entry_price - exit_price) * amount
-            pnl -= (exit_price * amount * 0.001)
-            balance += exit_price * amount - (exit_price * amount * 0.001)
+            if pos['mode'] == 'short':
+                # Short: pay back crypto, receive USDT
+                pnl = (entry_price - exit_price) * amount  # Profit if price went down
+                pnl -= (exit_price * amount * 0.001)  # Fee on close
+                balance -= exit_price * amount * (1 + 0.001)  # Pay back crypto + fee
+            else:
+                # Long/DCA: sell crypto, receive USDT
+                pnl = (exit_price - entry_price) * amount  # Profit if price went up
+                pnl -= (exit_price * amount * 0.001)  # Fee on sell
+                balance += exit_price * amount * (1 - 0.001)  # Receive USDT - fee
             
             trades.append({
                 'symbol': symbol,
@@ -2075,14 +2136,31 @@ def backtest_strategy() -> dict:
         max_dd = calculate_max_dd(pnls)
         total_return = ((balance - initial_balance) / initial_balance * 100.0) if initial_balance > 0 else 0.0
         
+        # Statistics by mode
+        swing_trades = [t for t in trades if t.get('mode') == 'swing']
+        dca_trades = [t for t in trades if t.get('mode') == 'dca']
+        short_trades = [t for t in trades if t.get('mode') == 'short']
+        
+        swing_pnl = sum(t['pnl'] for t in swing_trades) if swing_trades else 0.0
+        dca_pnl = sum(t['pnl'] for t in dca_trades) if dca_trades else 0.0
+        short_pnl = sum(t['pnl'] for t in short_trades) if short_trades else 0.0
+        
+        swing_wr = (len([t for t in swing_trades if t['pnl'] > 0]) / len(swing_trades) * 100.0) if swing_trades else 0.0
+        dca_wr = (len([t for t in dca_trades if t['pnl'] > 0]) / len(dca_trades) * 100.0) if dca_trades else 0.0
+        short_wr = (len([t for t in short_trades if t['pnl'] > 0]) / len(short_trades) * 100.0) if short_trades else 0.0
+        
         logger.info(
             f"Backtest complete:\n"
-            f"  Trades: {len(trades)}\n"
+            f"  Total Trades: {len(trades)}\n"
             f"  Win Rate: {win_rate*100:.2f}%\n"
             f"  Total PnL: {total_pnl:.2f} USDT\n"
             f"  Final Balance: {balance:.2f} USDT\n"
             f"  Total Return: {total_return:.2f}%\n"
-            f"  Max DD: {max_dd:.2f}%"
+            f"  Max DD: {max_dd:.2f}%\n"
+            f"  --- By Mode ---\n"
+            f"  Swing: {len(swing_trades)} trades, PnL: {swing_pnl:.2f} USDT, WR: {swing_wr:.2f}%\n"
+            f"  DCA: {len(dca_trades)} trades, PnL: {dca_pnl:.2f} USDT, WR: {dca_wr:.2f}%\n"
+            f"  Short: {len(short_trades)} trades, PnL: {short_pnl:.2f} USDT, WR: {short_wr:.2f}%"
         )
         
         return {
@@ -2141,13 +2219,18 @@ def optimize_params() -> dict:
         ADX_MIN_DEFAULT = original_adx_min
         HYBRID_SHORT_VOL_SLOPE_MIN = original_vol_slope_min
         
-        logger.info(
-            f"Best params: {best_params}\n"
-            f"  PnL: {best_pnl:.2f} USDT\n"
-            f"  Win Rate: {best_results['win_rate']*100:.2f}%\n"
-            f"  Max DD: {best_results['max_dd']:.2f}%\n"
-            f"  Total Return: {best_results['total_return']:.2f}%"
-        )
+        if best_results:
+            logger.info(
+                f"Best params: {best_params}\n"
+                f"  PnL: {best_pnl:.2f} USDT\n"
+                f"  Win Rate: {best_results['win_rate']*100:.2f}%\n"
+                f"  Max DD: {best_results['max_dd']:.2f}%\n"
+                f"  Total Return: {best_results['total_return']:.2f}%\n"
+                f"  Final Balance: {best_results.get('final_balance', 0):.2f} USDT\n"
+                f"  Total Trades: {len(best_results.get('trades', []))}"
+            )
+        else:
+            logger.warning("No best results found")
         
         return best_params
     except Exception as e:
@@ -6539,6 +6622,7 @@ if __name__ == "__main__":
                 # Parameter optimization
                 best_params = optimize_params()
                 logger.info(f"Optimization complete. Best params: {best_params}")
+                # Note: Detailed metrics (PnL, Win Rate, etc.) are logged by optimize_params()
             else:
                 # Single backtest run
                 results = backtest_strategy()
