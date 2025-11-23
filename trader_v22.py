@@ -4399,6 +4399,32 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 logger.info(f"[trailing] Invalid params, stopping. sym={symbol} amt={amount} px={purchase_price}")
                 return
 
+            # >>> SAFETY: Define entry_price from purchase_price, with DB fallback
+            entry_price = purchase_price  # Use passed parameter as primary source
+            
+            # Fallback: Fetch from DB if purchase_price is invalid or None
+            if not entry_price or entry_price <= 0:
+                try:
+                    conn = sqlite3.connect(DB_NAME)
+                    cur = conn.cursor()
+                    # Try to get entry price from open buy transaction
+                    cur.execute("""
+                        SELECT price FROM transactions 
+                        WHERE trade_id=? AND side IN ('buy', 'short') AND status='open' 
+                        ORDER BY ts DESC LIMIT 1
+                    """, (trade_id,))
+                    row = cur.fetchone()
+                    if row:
+                        entry_price = float(row[0])
+                    conn.close()
+                except Exception as e:
+                    logger.warning(f"[trailing] Could not fetch entry_price from DB for {symbol} trade_id={trade_id}: {e}")
+            
+            # Final safety check: if still no entry_price, skip monitoring
+            if not entry_price or entry_price <= 0:
+                logger.warning(f"[trailing] No valid entry_price for {symbol} trade_id={trade_id} - skipping monitoring")
+                return
+
             # >>> HYBRID MODE: Adjust base k and logic based on mode
             # Base k from volatility class
             prof_local = classify_symbol(symbol) or {}
@@ -4465,6 +4491,11 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
 
 
             while True:
+                # Check if trade is still open before processing
+                if trade_is_closed():
+                    logger.info(f"[trailing] Trade {trade_id} for {symbol} is closed - stopping monitoring")
+                    break
+                
                 # Defensive amount to liquidate in catastrophic / pre-arm / rapid-kill exits
                 try:
                     amount_to_sell = current_position_qty(symbol)
@@ -4472,6 +4503,12 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                         amount_to_sell = amount  # fall back to initial size
                 except Exception:
                     amount_to_sell = amount
+
+                # Safety check: Verify entry_price is still valid
+                if not entry_price or entry_price <= 0:
+                    logger.debug(f"[trailing] No entry_price for {symbol} trade_id={trade_id} - skipping check")
+                    time.sleep(EXIT_CHECK_EVERY_SEC)
+                    continue
 
                 last_price = get_last_price(symbol)  # or your own px getter
 
@@ -4496,6 +4533,23 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                             continue
                 except Exception as e:
                     logger.warning(f"[cata] check failed {symbol}: {e}")
+                    # If entry_price was the issue, try to fetch it from DB
+                    if "entry_price" in str(e) or "not defined" in str(e).lower():
+                        try:
+                            conn = sqlite3.connect(DB_NAME)
+                            cur = conn.cursor()
+                            cur.execute("""
+                                SELECT price FROM transactions 
+                                WHERE trade_id=? AND side IN ('buy', 'short') AND status='open' 
+                                ORDER BY ts DESC LIMIT 1
+                            """, (trade_id,))
+                            row = cur.fetchone()
+                            if row:
+                                entry_price = float(row[0])
+                                logger.debug(f"[trailing] Recovered entry_price={entry_price} from DB for {symbol}")
+                            conn.close()
+                        except Exception:
+                            pass
 
                 # >>> PRE-ARM FLOOR (HOOK SAFE2)
                 try:
@@ -4545,6 +4599,23 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                                 logger.info(f"[prearm-arm] {symbol} auto-armed after {minutes_open:.1f}m; floor={prearm_floor:.4f}")
                 except Exception as e:
                     logger.warning(f"[prearm] check failed {symbol}: {e}")
+                    # If entry_price was the issue, try to fetch it from DB
+                    if "entry_price" in str(e) or "not defined" in str(e).lower():
+                        try:
+                            conn = sqlite3.connect(DB_NAME)
+                            cur = conn.cursor()
+                            cur.execute("""
+                                SELECT price FROM transactions 
+                                WHERE trade_id=? AND side IN ('buy', 'short') AND status='open' 
+                                ORDER BY ts DESC LIMIT 1
+                            """, (trade_id,))
+                            row = cur.fetchone()
+                            if row:
+                                entry_price = float(row[0])
+                                logger.debug(f"[trailing] Recovered entry_price={entry_price} from DB for {symbol}")
+                            conn.close()
+                        except Exception:
+                            pass
 
                 # >>> RAPID DETERIORATION KILL (HOOK SAFE3)
                 try:
@@ -6175,6 +6246,8 @@ def trade_once_with_report(symbol: str):
                                 report["note"] = "scale-in"
                                 log_decision(symbol, 0.0, "buy-scale-in", True)
                                 logger.info(f"{symbol}: SCALE-IN @ {order['price']} ({amt} units)")
+                                # Small delay to ensure DB commit is synced before starting trailing
+                                time.sleep(0.5)
                                 dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], atr_abs)
                                 return report
                 except Exception as _e:
@@ -6252,6 +6325,8 @@ def trade_once_with_report(symbol: str):
                             report["action"] = "buy"
                             report["note"] = f"DCA-hybrid ({preflight_reason})"
                             log_decision(symbol, 0.0, "buy-dca-hybrid", True)
+                            # Small delay to ensure DB commit is synced before starting trailing
+                            time.sleep(0.5)
                             # Pass mode='dca' to trailing stop
                             dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], atr_abs_dca, mode='dca')
                             return report
@@ -6310,6 +6385,8 @@ def trade_once_with_report(symbol: str):
                         report["action"] = "short"
                         report["note"] = f"Short-hybrid ({preflight_reason}, risk={SHORT_RISK_FRACTION*100:.1f}%)"
                         log_decision(symbol, 0.0, "short-hybrid", True)
+                        # Small delay to ensure DB commit is synced before starting trailing
+                        time.sleep(0.5)
                         # Pass mode='short' to trailing stop
                         dynamic_trailing_stop(symbol, short_amount, order['price'], order['trade_id'], atr_abs_short, mode='short')
                         return report
@@ -6468,6 +6545,8 @@ def trade_once_with_report(symbol: str):
                 report["executed"] = True
                 log_decision(symbol, score, "buy", True)
                 logger.info(f"{symbol}: BUY @ {order['price']} (conf {conf}%) — {note}")
+                # Small delay to ensure DB commit is synced before starting trailing
+                time.sleep(0.5)
                 dynamic_trailing_stop(symbol, order['filled'], order['price'], order['trade_id'], atr_abs)
             else:
                 log_decision(symbol, score, "buy", False)
