@@ -242,8 +242,9 @@ RSI_MIN_DEFAULT, RSI_MAX_DEFAULT = float(os.getenv("RSI_MIN_DEFAULT", "40")), 68
 RVOL_BASE_DEFAULT = 1.35  # Ajustado desde 1.5: tendencias buenas viven entre 1.1-1.3
 # >>> PATCH START: gate & cooldowns
 SCORE_GATE_START = float(os.getenv("SCORE_GATE_START", "5.5"))  # Increased from 4.8
-SCORE_GATE_MAX = 5.8
-SCORE_GATE_HARD_MIN = int(os.getenv("SCORE_GATE_HARD_MIN", "6"))  # Increased from 5 - only elite entries
+SCORE_GATE_MIN = float(os.getenv("SCORE_GATE_MIN", "5.2"))  # Minimum gate (allows learning to lower it)
+SCORE_GATE_MAX = float(os.getenv("SCORE_GATE_MAX", "6.2"))  # Maximum gate
+SCORE_GATE_HARD_MIN = int(os.getenv("SCORE_GATE_HARD_MIN", "6"))  # DEPRECATED: use SCORE_GATE_MIN instead
 
 # re-entry/cooldowns
 COOLDOWN_AFTER_COLLAPSE_MIN = 60   # minutes — after a volume-collapse exit
@@ -343,7 +344,7 @@ RVOL_SPIKE_K_BONUS = float(os.getenv("RVOL_SPIKE_K_BONUS", "0.6"))   # Increased
 RVOL_K_BONUS_MINUTES = 15
 
 # Break-even cuando el trade alcanza X R
-BE_R_MULT = 1.3            # go BE at 1.0R to reduce scratches (ajustar después del backtest si es necesario)
+BE_R_MULT = float(os.getenv("BE_R_MULT", "1.6"))  # go BE at 1.6R (increased from 1.3 to give more room for swings)
 
 # Dead-tape hard block
 DEAD_TAPE_RVOL10_HARD = 0.20
@@ -357,8 +358,8 @@ TIER2_K_TIGHTEN = 0.5      # reducción extra de k
 DONCHIAN_LEN_EXIT = 20     # N-bar low para salida de tendencia si se pierde estructura
 
 # Time-stop por barras del TF 1h
-TIME_STOP_BARS_1H = 3     # si en 3 velas 1h no progresa (o no cumple mejora), salir
-TIME_STOP_EXTEND_BARS = 6  # prórroga si "tape mejorando" (ADX↑ y close>VWAP)
+TIME_STOP_BARS_1H = int(os.getenv("TIME_STOP_BARS_1H", "8"))  # ~8h base (increased from 3 for swing trading)
+TIME_STOP_EXTEND_BARS = int(os.getenv("TIME_STOP_EXTEND_BARS", "24"))  # hasta 1 día si tape mejora (increased from 6)
 # >>> CHAN PATCH CONFIG END
 
 
@@ -2653,15 +2654,13 @@ def get_score_gate():
     conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
     cur.execute("SELECT score_gate FROM controller WHERE id=1")
     row = cur.fetchone(); conn.close()
-    if not row or row[0] is None:
-        return SCORE_GATE_START
-    return max(float(row[0]), SCORE_GATE_HARD_MIN)
+    g = SCORE_GATE_START if not row or row[0] is None else float(row[0])
+    return max(min(g, SCORE_GATE_MAX), SCORE_GATE_MIN)  # Clamp: ensure g is in [MIN, MAX]
 
 def set_score_gate(new_gate: float):
-    ng = clamp(float(new_gate), SCORE_GATE_HARD_MIN, SCORE_GATE_MAX)
-    ng = max(ng, SCORE_GATE_HARD_MIN)
+    ng = max(min(float(new_gate), SCORE_GATE_MAX), SCORE_GATE_MIN)  # Clamp: ensure in [MIN, MAX]
     conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
-    cur.execute("UPDATE controller SET score_gate=?, updated_at=? WHERE id=1",
+    cur.execute("REPLACE INTO controller (id, score_gate, updated_at) VALUES (1, ?, ?)",
                 (ng, datetime.now(timezone.utc).isoformat()))
     conn.commit(); conn.close()
     return ng
@@ -5375,30 +5374,49 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                     except Exception:
                         tape_improving = False
                     if not tape_improving or n_bars >= TIME_STOP_EXTEND_BARS:
-                        # >>> EXIT HOOK: hold while volume is on (ANCHOR EXITVOL)
-                        try:
-                            tf15 = quick_tf_snapshot(symbol, "15m", limit=60) or {}
-                            tf1h = quick_tf_snapshot(symbol, "1h",  limit=60) or {}
+                        # >>> MEJORADO: Sólo matamos si el trade no despegó o es claramente perdedor
+                        # Si vamos claramente en verde, no usamos time-stop, dejamos que el trailing mande
+                        gain_pct = (price / purchase_price - 1.0) * 100.0
+                        if gain_pct < -0.5:
+                            logger.info(f"[time-stop] {symbol}: Exiting loss (gain={gain_pct:.2f}%, bars={n_bars})")
+                            sell_symbol(symbol, amount, trade_id, source="time_stop_bars_loss")
+                            return
+                        if -0.3 <= gain_pct <= 0.5:
+                            logger.info(f"[time-stop] {symbol}: Exiting scratch (gain={gain_pct:.2f}%, bars={n_bars})")
+                            # >>> EXIT HOOK: hold while volume is on (ANCHOR EXITVOL) - solo para scratches
+                            try:
+                                tf15 = quick_tf_snapshot(symbol, "15m", limit=60) or {}
+                                tf1h = quick_tf_snapshot(symbol, "1h",  limit=60) or {}
 
-                            rvol15_closed = (tf15.get("RVOL10_closed")
-                                            or tf15.get("rvol10_closed")
-                                            or tf15.get("rvol10"))
-                            macdh15 = tf15.get("MACD_HIST") or tf15.get("macd_hist")
-                            adx1h   = tf1h.get("ADX") or tf1h.get("adx")
+                                rvol15_closed = (tf15.get("RVOL10_closed")
+                                                or tf15.get("rvol10_closed")
+                                                or tf15.get("rvol10"))
+                                macdh15 = tf15.get("MACD_HIST") or tf15.get("macd_hist")
+                                adx1h   = tf1h.get("ADX") or tf1h.get("adx")
 
-                            RVOL_HOLD_MIN = float(os.getenv("RVOL_HOLD_MIN", "1.30"))
-                            ADX_TREND_MIN = float(os.getenv("ADX_TREND_MIN", "28"))
-                            MACDH15_MIN   = float(os.getenv("MACDH15_MIN", "0"))
+                                RVOL_HOLD_MIN = float(os.getenv("RVOL_HOLD_MIN", "1.30"))
+                                ADX_TREND_MIN = float(os.getenv("ADX_TREND_MIN", "28"))
+                                MACDH15_MIN   = float(os.getenv("MACDH15_MIN", "0"))
 
-                            if (rvol15_closed and rvol15_closed >= RVOL_HOLD_MIN) and \
-                            (adx1h and adx1h >= ADX_TREND_MIN) and \
-                            (macdh15 is not None and macdh15 > MACDH15_MIN):
-                                logger.info(f"[exit-hold] {symbol}: strong 15m RVOL / 1h trend; deferring sell (reason=time-stop)")
-                                return
-                        except Exception as _e:
-                            logger.warning(f"[exit-hold] check failed {symbol}: {_e}")
-
-                        # >>> EXIT HOLD-IN-VOLUME (HOOK EXITVOL)
+                                if (rvol15_closed and rvol15_closed >= RVOL_HOLD_MIN) and \
+                                (adx1h and adx1h >= ADX_TREND_MIN) and \
+                                (macdh15 is not None and macdh15 > MACDH15_MIN):
+                                    logger.info(f"[exit-hold] {symbol}: strong 15m RVOL / 1h trend; deferring sell (reason=time-stop)")
+                                    return
+                            except Exception as _e:
+                                logger.warning(f"[exit-hold] check failed {symbol}: {_e}")
+                            
+                            sell_symbol(symbol, amount, trade_id, source="time_stop_bars_scratch")
+                            return
+                        
+                        # Si vamos ya claramente en verde (>0.5%), no usamos time-stop
+                        logger.debug(f"[time-stop] {symbol}: Skipping time-stop (gain={gain_pct:.2f}% > 0.5%, bars={n_bars})")
+                        # No hacer nada aquí - dejar que el trailing maneje trades que van bien
+                        # El código continúa sin hacer return, así que el trade sigue vivo
+                        continue  # Skip the rest of time-stop logic for trades doing well
+                        
+                        # >>> EXIT HOLD-IN-VOLUME (HOOK EXITVOL) - solo para trades con gain <= 0.5%
+                        # (Este bloque ya no se ejecuta para trades con gain > 0.5% debido al continue arriba)
                         try:
                             tf15 = quick_tf_snapshot(symbol, "15m", limit=60) or {}
                             tf1h = quick_tf_snapshot(symbol, "1h",  limit=60) or {}

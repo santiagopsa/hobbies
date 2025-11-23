@@ -259,7 +259,17 @@ class BacktestEngine:
         """Check if we can open a new trade"""
         if symbol in self.open_trades:
             return False  # Already have position
-        if len(self.open_trades) >= MAX_OPEN_TRADES:
+        
+        # >>> DYNAMIC MAX_OPEN_TRADES: Increase to 15 if breadth > 4 (momentum in market)
+        max_trades_dynamic = MAX_OPEN_TRADES
+        try:
+            _, breadth_count = trader.compute_breadth()
+            if breadth_count > 4:  # Momentum in market
+                max_trades_dynamic = 15  # More diversification in good markets
+        except Exception:
+            pass
+        
+        if len(self.open_trades) >= max_trades_dynamic:
             return False
         return True
     
@@ -274,7 +284,24 @@ class BacktestEngine:
             return None
         
         # Calculate position size
-        risk_amount = available * RISK_FRACTION
+        # >>> DYNAMIC RISK: Increase in fear dips (RSI4h<35, FGI>10), reduce in extreme fear (FGI<=10)
+        dynamic_risk_frac = RISK_FRACTION
+        try:
+            # Get RSI4h for BTC and FGI
+            df4h_btc = trader.fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+            rsi4h_btc = float(df4h_btc['RSI'].iloc[-1]) if df4h_btc is not None and len(df4h_btc) > 0 and pd.notna(df4h_btc['RSI'].iloc[-1]) else None
+            fgi_features = trader.fetch_fgi_features()
+            fgi_v = fgi_features.get("value") if fgi_features else None
+            
+            if rsi4h_btc is not None and fgi_v is not None:
+                if rsi4h_btc < 35 and fgi_v > 10:  # Fear but not extreme
+                    dynamic_risk_frac = RISK_FRACTION * 1.5  # 27% for aggressive dips
+                elif fgi_v <= 10:  # Extreme bad, halve
+                    dynamic_risk_frac = RISK_FRACTION * 0.5
+        except Exception:
+            pass  # Fallback to base RISK_FRACTION
+        
+        risk_amount = available * dynamic_risk_frac
         position_value = min(risk_amount, available * 0.95)  # Use 95% of available
         
         # Account for fees
@@ -496,10 +523,13 @@ class BacktestEngine:
             except Exception:
                 pass
         
-        # Bar-based time-stop
+        # Bar-based time-stop (mejorado: no matar trades que van bien)
         try:
             n_bars = trader.count_closed_bars_since(df1h, trade.entry_time)
             if n_bars is not None and n_bars >= trader.TIME_STOP_BARS_1H:
+                # Calculate current gain
+                gain_pct = (current_price / trade.entry_price - 1.0) * 100.0
+                
                 # Check if tape is improving
                 try:
                     adx_series = ta.adx(df1h['high'], df1h['low'], df1h['close'], length=14)['ADX_14']
@@ -511,25 +541,54 @@ class BacktestEngine:
                     tape_improving = (adx_slope is not None and adx_slope >= trader.TAPE_IMPROVING_ADX_SLOPE_MIN) and vwap_ok
                     
                     if not tape_improving or n_bars >= trader.TIME_STOP_EXTEND_BARS:
-                        return True, "time_stop_bars"
+                        # >>> MEJORADO: Sólo matamos si el trade no despegó o es claramente perdedor
+                        # Si vamos claramente en verde, no usamos time-stop, dejamos que el trailing mande
+                        if gain_pct < -0.5:
+                            return True, "time_stop_bars_loss"      # perdedora lenta
+                        if -0.3 <= gain_pct <= 0.5:
+                            return True, "time_stop_bars_scratch"    # scratch cerca de flat
+                        # Si vamos ya claramente en verde (>0.5%), no usamos time-stop
                 except Exception:
-                    if n_bars >= trader.TIME_STOP_EXTEND_BARS:
-                        return True, "time_stop_bars"
+                    # Fallback: solo matar si claramente perdedor
+                    if gain_pct < -0.5:
+                        return True, "time_stop_bars_loss"
+                    if n_bars >= trader.TIME_STOP_EXTEND_BARS and gain_pct <= 0.5:
+                        return True, "time_stop_bars_scratch"
         except Exception:
             pass
         
         return False, ""
     
-    def update_equity(self, current_time: datetime):
-        """Update equity curve"""
-        open_value = sum(trade.amount * trade.highest_price for trade in self.open_trades.values())
+    def update_equity(self, current_time: datetime, price_map: Dict[str, float] = None):
+        """
+        Update equity curve
+        price_map: {symbol: current_price} al timestamp actual
+        """
+        open_value = 0.0
+        for trade in self.open_trades.values():
+            if price_map and trade.symbol in price_map:
+                cur_price = price_map[trade.symbol]
+            else:
+                # Fallback to entry price if no current price available
+                cur_price = trade.entry_price
+            open_value += trade.amount * cur_price
+        
         equity = self.balance + open_value
+        
+        # Ensure current_time is timezone-aware
+        if isinstance(current_time, pd.Timestamp):
+            if current_time.tz is None:
+                current_time = current_time.tz_localize('UTC')
+            current_time = current_time.to_pydatetime()
+        elif current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=timezone.utc)
+        
         self.equity_curve.append((current_time, equity))
         
         # Update drawdown
         if equity > self.peak_equity:
             self.peak_equity = equity
-        drawdown = (self.peak_equity - equity) / self.peak_equity * 100.0
+        drawdown = (self.peak_equity - equity) / self.peak_equity * 100.0 if self.peak_equity > 0 else 0.0
         if drawdown > self.max_drawdown:
             self.max_drawdown = drawdown
     
@@ -685,6 +744,34 @@ def get_buy_signal_from_data(symbol: str, df: pd.DataFrame, current_price: float
             RSI_MIN_K, RSI_MAX_K = RSI_MIN, RSI_MAX
             ADX_MIN_K = ADX_MIN
             RVOL_BASE_K = RVOL_BASE
+        
+        # >>> PROXY FGI: RSI4h<RSI_FEAR_PROXY adjustments (fear proxy = best time for entries)
+        try:
+            df4h = trader.fetch_and_prepare_data_hybrid(symbol, timeframe="4h", limit=50)
+            rsi4h = float(df4h['RSI'].iloc[-1]) if df4h is not None and len(df4h) > 0 and pd.notna(df4h['RSI'].iloc[-1]) else None
+            
+            if rsi4h is not None and rsi4h < trader.RSI_FEAR_PROXY:
+                # Calculate vol_slope for ADX_MIN override
+                vol_slope_fear = None
+                try:
+                    vol_slope_fear = trader.calculate_vol_slope(df, periods=10) if df is not None and len(df) >= 10 else None
+                except Exception:
+                    pass
+                
+                # >>> RELAJA ADX_MIN EN FEAR: Lower to 15 when RSI4h<35 and vol_slope>0, but keep 20 if vol_slope<0
+                if vol_slope_fear is not None and vol_slope_fear > 0:
+                    if ADX_MIN_K > 15:
+                        ADX_MIN_K = 15  # Allow weaker trends in dips with positive vol
+                else:
+                    # Keep ADX_MIN at 20 if vol_slope<0 (avoid bad markets)
+                    if ADX_MIN_K < 20:
+                        ADX_MIN_K = 20
+                
+                # >>> OVERRIDE RSI RANGE EN FEAR: Allow RSI up to 65 in fear (overbought OK in dip market)
+                if RSI_MAX_K < 65:
+                    RSI_MAX_K = 65  # Allow mild overbought in dips
+        except Exception:
+            pass  # Fallback to normal thresholds
         
         row = df.iloc[-1]
         
@@ -1140,8 +1227,13 @@ def run_backtest(symbols: List[str] = None, start_date: str = None, end_date: st
                     # Silently skip errors
                     pass
             
-            # Update equity curve
-            engine.update_equity(timestamp)
+            # Update equity curve (con precios actuales)
+            price_map = {
+                sym: float(df.loc[timestamp]['close']) 
+                for sym, df in symbol_data.items() 
+                if timestamp in df.index
+            }
+            engine.update_equity(timestamp, price_map)
         
         print("\n" + "=" * 80)
         print("BACKTEST COMPLETE")
