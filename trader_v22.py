@@ -174,7 +174,7 @@ HYBRID_DCA_COOLDOWN_H = int(os.getenv("HYBRID_DCA_COOLDOWN_H", "4"))  # Hours be
 HYBRID_SHORT_RSI_MAX = float(os.getenv("HYBRID_SHORT_RSI_MAX", "75.0"))  # Increased from 70.0 - short only when more overbought
 HYBRID_SHORT_VOL_SLOPE_MIN = float(os.getenv("HYBRID_SHORT_VOL_SLOPE_MIN", "-0.5"))  # Changed from 0.0 to -0.5 - require clear vol decay
 HYBRID_SHORT_ENABLED = bool(int(os.getenv("HYBRID_SHORT_ENABLED", "0")))  # Disabled by default until fixed (was 1)
-HYBRID_DCA_ENABLED = bool(int(os.getenv("HYBRID_DCA_ENABLED", "0")))  # Disabled by default for testing - forces only strong swings (score >=6)
+HYBRID_DCA_ENABLED = bool(int(os.getenv("HYBRID_DCA_ENABLED", "0")))  # Enable DCA buys in fear (RSI4h<35). Set to 1 in .env to activate
 
 # >>> SHORT RISK CONTROLS (For testing with controlled risk)
 MAX_OPEN_SHORTS = int(os.getenv("MAX_OPEN_SHORTS", "1"))  # Lowered from 3 to 1 for testing
