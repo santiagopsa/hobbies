@@ -148,7 +148,7 @@ STRONG_TREND_K_UNSTABLE = 2.5
 
 # Execution / risk
 MIN_NOTIONAL = 8.0
-MAX_OPEN_TRADES = 10  # Increased for hybrid diversification (60% swing, 20% DCA, 20% shorts)
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "10"))  # Max parallel trades (configurable via .env)
 RESERVE_USDT = 20.0
 RISK_FRACTION = 0.18  # base fraction per trade (modulated)
 
@@ -174,7 +174,7 @@ HYBRID_DCA_COOLDOWN_H = int(os.getenv("HYBRID_DCA_COOLDOWN_H", "4"))  # Hours be
 HYBRID_SHORT_RSI_MAX = float(os.getenv("HYBRID_SHORT_RSI_MAX", "75.0"))  # Increased from 70.0 - short only when more overbought
 HYBRID_SHORT_VOL_SLOPE_MIN = float(os.getenv("HYBRID_SHORT_VOL_SLOPE_MIN", "-0.5"))  # Changed from 0.0 to -0.5 - require clear vol decay
 HYBRID_SHORT_ENABLED = bool(int(os.getenv("HYBRID_SHORT_ENABLED", "0")))  # Disabled by default until fixed (was 1)
-HYBRID_DCA_ENABLED = bool(int(os.getenv("HYBRID_DCA_ENABLED", "1")))  # Enable DCA
+HYBRID_DCA_ENABLED = bool(int(os.getenv("HYBRID_DCA_ENABLED", "0")))  # Disabled by default for testing - forces only strong swings (score >=6)
 
 # >>> SHORT RISK CONTROLS (For testing with controlled risk)
 MAX_OPEN_SHORTS = int(os.getenv("MAX_OPEN_SHORTS", "1"))  # Lowered from 3 to 1 for testing
@@ -279,7 +279,7 @@ EDGE_SAFETY_MULT = float(os.getenv("EDGE_SAFETY_MULT", "1.3"))
 
 # >>> PATCH: ENTRY EDGE / QUALITY / COOLDOWNS (ANCHOR EDGE1)
 ENTRY_EDGE_MULT = float(os.getenv("ENTRY_EDGE_MULT", "2.0"))         # x required_edge_pct for entry
-RVOL15_ENTRY_MIN = float(os.getenv("RVOL15_ENTRY_MIN", "1.5"))       # Increased from 1.3 - only enter with live volume
+RVOL15_ENTRY_MIN = float(os.getenv("RVOL15_ENTRY_MIN", "1.8"))       # Increased from 1.5 - blocks thin tape buys
 RVOL15_BREAKOUT_MIN = float(os.getenv("RVOL15_BREAKOUT_MIN", "1.5")) # closed RVOL needed when 4h trend is weak (<20)
 
 QUICK_LOSS_COOLDOWN_MIN = int(os.getenv("QUICK_LOSS_COOLDOWN_MIN", "30"))  # re-entry ban after quick small loss
@@ -412,7 +412,7 @@ RSI4H_SOFT_MIN = 50.0       # SOFT block if 45≤RSI<50 and trending down unless
 RSI4H_SLOPE_BARS = 6        # slope lookback (4h bars)
 
 # >>> RSI FEAR PROXY (replaces FGI - configurable via .env)
-RSI_FEAR_PROXY = float(os.getenv("RSI_FEAR_PROXY", "40.0"))  # RSI4h<40 = fear proxy (JSON q25 36)
+RSI_FEAR_PROXY = float(os.getenv("RSI_FEAR_PROXY", "35.0"))  # RSI4h<35 = fear proxy (lowered from 40 - only DCA in deeper dips)
 
 RVOL_1H_MIN  = 0.75         # base floors to avoid thin tape at entry
 RVOL_15M_MIN = 0.55
@@ -2332,9 +2332,19 @@ def hybrid_preflight(symbol: str) -> tuple[str | None, str]:
         except Exception:
             return None, "data calculation error"
         
-        # >>> DCA Mode: Fear proxy + vol rising (dips with volume recovery)
+        # >>> DCA Mode: Fear proxy + vol rising (dips with volume recovery) + RVOL15 check
         if HYBRID_DCA_ENABLED and rsi4h < RSI_FEAR_PROXY and vol_slope > HYBRID_SHORT_VOL_SLOPE_MIN:
-            return 'dca', f"Fear proxy: Trigger DCA (RSI4h={rsi4h:.1f}<{RSI_FEAR_PROXY}, vol_slope={vol_slope:.2f})"
+            # Check RVOL15 before allowing DCA (skip DCA if volume too thin)
+            try:
+                df15 = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=50)
+                rvol15_closed = rvol10_closed(df15) if df15 is not None and len(df15) >= 10 else None
+                if rvol15_closed is None or rvol15_closed < RVOL15_ENTRY_MIN:
+                    return None, f"DCA blocked: RVOL15_closed={rvol15_closed:.2f} < {RVOL15_ENTRY_MIN} (thin tape)"
+            except Exception as e:
+                logger.debug(f"RVOL15 check error for DCA {symbol}: {e}")
+                return None, f"DCA blocked: RVOL15 check failed"
+            
+            return 'dca', f"Fear proxy: Trigger DCA (RSI4h={rsi4h:.1f}<{RSI_FEAR_PROXY}, vol_slope={vol_slope:.2f}, RVOL15={rvol15_closed:.2f})"
         
         # >>> Short Mode: Overbought + vol falling (hedge downs)
         if HYBRID_SHORT_ENABLED and rsi1h > HYBRID_SHORT_RSI_MAX and vol_slope < HYBRID_SHORT_VOL_SLOPE_MIN:
@@ -4218,21 +4228,110 @@ def close_short(symbol: str, amount: float, trade_id: str, source: str = "trail"
             pass
 
 def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"):
+    """
+    Sell symbol with improved balance checking and retry logic.
+    Handles insufficient funds by:
+    1. Fetching real balance from exchange
+    2. Adjusting amount to available balance (with fee margin)
+    3. Retrying with reduced amount if initial attempt fails
+    """
     try:
+        # >>> STEP 1: Get real balance from exchange before selling
+        base_currency = symbol.split('/')[0]
+        try:
+            balances = exchange.fetch_balance()
+            free_base = float(balances.get('free', {}).get(base_currency, 0.0) or 0.0)
+            
+            # Adjust amount to available balance (leave 0.5% margin for fees/precision)
+            if free_base > 0:
+                amount = min(amount, free_base * 0.995)
+                logger.debug(f"[sell] {symbol}: Adjusted amount to available balance: {amount:.8f} (free={free_base:.8f})")
+            else:
+                logger.warning(f"[sell] {symbol}: No free balance available (free={free_base:.8f})")
+                return
+        except Exception as e:
+            logger.warning(f"[sell] {symbol}: Balance check failed, using requested amount: {e}")
+        
+        # >>> STEP 2: Prepare amount with Binance filters
         price_now = fetch_price(symbol)
-        order = exchange.create_market_sell_order(symbol, amount)
+        if not price_now or price_now <= 0:
+            logger.error(f"[sell] {symbol}: Invalid price: {price_now}")
+            return
+        
+        step, min_qty, min_notional = _bn_filters(symbol)
+        amount_adj, reason = _prepare_sell_amount(symbol, amount, price_now)
+        
+        if amount_adj <= 0:
+            logger.warning(f"[sell] {symbol}: Amount filtered out: {reason} (requested={amount:.8f}, price={price_now:.8f})")
+            # Check if it's dust (below min_notional)
+            if min_notional and (amount * price_now) < min_notional:
+                logger.info(f"[sell] {symbol}: Skipping dust amount (notional={amount * price_now:.2f} < {min_notional:.2f})")
+            return
+        
+        # >>> STEP 3: Attempt sell with retry logic
+        order = None
+        retry_count = 0
+        max_retries = 2
+        
+        while retry_count <= max_retries and order is None:
+            try:
+                order = exchange.create_market_sell_order(symbol, amount_adj)
+                logger.info(f"[sell] {symbol}: Successfully sold {amount_adj:.8f} @ {price_now:.8f} (source={source})")
+                break
+            except ccxt.InsufficientFunds as e:
+                retry_count += 1
+                if retry_count <= max_retries:
+                    # Reduce amount by 1% for retry (account for fees/precision)
+                    amount_adj = amount_adj * 0.99
+                    amount_adj, reason = _prepare_sell_amount(symbol, amount_adj, price_now)
+                    if amount_adj <= 0:
+                        logger.warning(f"[sell] {symbol}: Retry amount too small after reduction: {reason}")
+                        return
+                    logger.debug(f"[sell] {symbol}: Retry {retry_count}/{max_retries} with reduced amount: {amount_adj:.8f}")
+                else:
+                    logger.error(f"[sell] {symbol}: Insufficient funds after {max_retries} retries. Requested={amount:.8f}, final={amount_adj:.8f}, free={free_base:.8f}")
+                    # Try one more time with actual free balance
+                    try:
+                        balances = exchange.fetch_balance()
+                        free_base_retry = float(balances.get('free', {}).get(base_currency, 0.0) or 0.0)
+                        if free_base_retry > 0:
+                            amount_adj = free_base_retry * 0.99  # Leave 1% margin
+                            amount_adj, reason = _prepare_sell_amount(symbol, amount_adj, price_now)
+                            if amount_adj > 0:
+                                order = exchange.create_market_sell_order(symbol, amount_adj)
+                                logger.info(f"[sell] {symbol}: Successfully sold with actual balance: {amount_adj:.8f}")
+                            else:
+                                logger.warning(f"[sell] {symbol}: Final retry amount too small: {reason}")
+                                return
+                        else:
+                            logger.error(f"[sell] {symbol}: No balance available for final retry")
+                            return
+                    except Exception as e2:
+                        logger.error(f"[sell] {symbol}: Final retry failed: {e2}")
+                        return
+            except Exception as e:
+                logger.error(f"[sell] {symbol}: Exchange order error: {e}")
+                return
+        
+        if order is None:
+            logger.error(f"[sell] {symbol}: Failed to create sell order after all retries")
+            return
+        
         sell_price = order.get("price", price_now) or price_now or 0.0
         sell_ts = datetime.now(timezone.utc).isoformat()
 
+        # Use the actual amount that was sold (amount_adj), not the requested amount
+        sold_amount = float(order.get("filled", amount_adj) or amount_adj)
+        
         conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
         cur.execute("""
             INSERT INTO transactions (symbol, side, price, amount, ts, trade_id, status)
             VALUES (?, 'sell', ?, ?, ?, ?, 'closed')
-        """, (symbol, float(sell_price), float(amount), sell_ts, trade_id))
+        """, (symbol, float(sell_price), sold_amount, sell_ts, trade_id))
         cur.execute("UPDATE transactions SET status='closed' WHERE trade_id=? AND side='buy'", (trade_id,))
         conn.commit(); conn.close()
 
-        send_telegram_message(f"✅ SELL {symbol}\nPrice: {sell_price}\nAmount: {amount}")
+        send_telegram_message(f"✅ SELL {symbol}\nPrice: {sell_price}\nAmount: {sold_amount}")
         info = {"ts": sell_ts, "price": float(sell_price), "source": source}
         if source == "collapse":
             until = datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_AFTER_COLLAPSE_MIN)
@@ -4359,7 +4458,7 @@ def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"
 
         analyze_and_learn(trade_id, sell_price, learn_enabled=(source != "startup"))
 
-        logger.info(f"Sold {symbol} @ {sell_price} (trade {trade_id})")
+        logger.info(f"Sold {symbol}: {sold_amount:.8f} @ {sell_price} (trade {trade_id}, source={source})")
     except Exception as e:
         logger.error(f"sell_symbol error {symbol}: {e}")
 
@@ -6305,6 +6404,14 @@ def trade_once_with_report(symbol: str):
                     ema50_1h_dca = float(df1h_dca['EMA50'].iloc[-1]) if pd.notna(df1h_dca['EMA50'].iloc[-1]) else None
                     price_now = float(df1h_dca['close'].iloc[-1])
                     
+                    # >>> DCA GUARD: Check RVOL15 before executing DCA buy
+                    df15_dca = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=50)
+                    rvol15_closed_dca = rvol10_closed(df15_dca) if df15_dca is not None and len(df15_dca) >= 10 else None
+                    if rvol15_closed_dca is None or rvol15_closed_dca < RVOL15_ENTRY_MIN:
+                        logger.debug(f"[DCA-GUARD] {symbol}: Skipping DCA - RVOL15_closed={rvol15_closed_dca:.2f} < {RVOL15_ENTRY_MIN}")
+                        report["note"] = f"DCA blocked: RVOL15={rvol15_closed_dca:.2f} < {RVOL15_ENTRY_MIN}"
+                        return report
+                    
                     if ema50_1h_dca is not None and price_now < ema50_1h_dca and cooldown_ok(symbol, HYBRID_DCA_COOLDOWN_H):
                         # Execute DCA buy
                         dca_amount = HYBRID_DCA_AMOUNT / price_now
@@ -6876,9 +6983,9 @@ if __name__ == "__main__":
                     except Exception:
                         pass
                 
-                # If RSI4h<40 (fear proxy), force cycle (best time for swing entries in dips)
-                if rsi4h_btc is not None and rsi4h_btc < 40:
-                    logger.debug(f"RSI4h<40 (fear proxy): {rsi4h_btc:.1f} - allowing cycles for DCA entries")
+                # If RSI4h<35 (fear proxy), force cycle (best time for swing entries in deeper dips)
+                if rsi4h_btc is not None and rsi4h_btc < 35:
+                    logger.debug(f"RSI4h<35 (fear proxy): {rsi4h_btc:.1f} - allowing cycles for DCA entries")
                     # No blocking, just allow all cycles (fear = opportunity for swings)
             except Exception as e:
                 logger.debug(f"RSI4h proxy check error: {e}")
