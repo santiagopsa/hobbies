@@ -174,7 +174,7 @@ HYBRID_DCA_COOLDOWN_H = int(os.getenv("HYBRID_DCA_COOLDOWN_H", "4"))  # Hours be
 HYBRID_SHORT_RSI_MAX = float(os.getenv("HYBRID_SHORT_RSI_MAX", "75.0"))  # Increased from 70.0 - short only when more overbought
 HYBRID_SHORT_VOL_SLOPE_MIN = float(os.getenv("HYBRID_SHORT_VOL_SLOPE_MIN", "-0.5"))  # Changed from 0.0 to -0.5 - require clear vol decay
 HYBRID_SHORT_ENABLED = bool(int(os.getenv("HYBRID_SHORT_ENABLED", "0")))  # Disabled by default until fixed (was 1)
-HYBRID_DCA_ENABLED = bool(int(os.getenv("HYBRID_DCA_ENABLED", "0")))  # Enable DCA buys in fear (RSI4h<35). Set to 1 in .env to activate
+HYBRID_DCA_ENABLED = bool(int(os.getenv("HYBRID_DCA_ENABLED", "1")))  # Enable DCA buys in fear (RSI4h<35). Default enabled
 
 # >>> SHORT RISK CONTROLS (For testing with controlled risk)
 MAX_OPEN_SHORTS = int(os.getenv("MAX_OPEN_SHORTS", "1"))  # Lowered from 3 to 1 for testing
@@ -279,7 +279,7 @@ EDGE_SAFETY_MULT = float(os.getenv("EDGE_SAFETY_MULT", "1.3"))
 
 # >>> PATCH: ENTRY EDGE / QUALITY / COOLDOWNS (ANCHOR EDGE1)
 ENTRY_EDGE_MULT = float(os.getenv("ENTRY_EDGE_MULT", "2.0"))         # x required_edge_pct for entry
-RVOL15_ENTRY_MIN = float(os.getenv("RVOL15_ENTRY_MIN", "1.8"))       # Increased from 1.5 - blocks thin tape buys
+RVOL15_ENTRY_MIN = float(os.getenv("RVOL15_ENTRY_MIN", "1.0"))       # Lowered from 1.8 to 1.0 - less restrictive for entries
 RVOL15_BREAKOUT_MIN = float(os.getenv("RVOL15_BREAKOUT_MIN", "1.5")) # closed RVOL needed when 4h trend is weak (<20)
 
 QUICK_LOSS_COOLDOWN_MIN = int(os.getenv("QUICK_LOSS_COOLDOWN_MIN", "30"))  # re-entry ban after quick small loss
@@ -2017,7 +2017,16 @@ def backtest_strategy() -> dict:
                 del positions[sym]
             
             # Check entries (simplified hybrid logic)
-            if len(positions) >= MAX_OPEN_TRADES:
+            # >>> DYNAMIC MAX_OPEN_TRADES: Increase to 15 if breadth > 4 (momentum in market)
+            max_trades_dynamic = MAX_OPEN_TRADES
+            try:
+                _, breadth_count = compute_breadth()
+                if breadth_count > 4:  # Momentum in market
+                    max_trades_dynamic = 15  # More diversification in good markets
+            except Exception:
+                pass
+            
+            if len(positions) >= max_trades_dynamic:
                 continue
             
             for symbol in SELECTED_CRYPTOS:
@@ -2065,12 +2074,37 @@ def backtest_strategy() -> dict:
                     
                     if mode:
                         # Calculate position size
-                        risk_amount = balance * RISK_FRACTION
+                        # >>> DYNAMIC RISK: Increase in fear dips (RSI4h<35, FGI>10), reduce in extreme fear (FGI<=10)
+                        dynamic_risk_frac = RISK_FRACTION
+                        try:
+                            # Get RSI4h for BTC and FGI
+                            df4h_btc = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+                            rsi4h_btc = float(df4h_btc['RSI'].iloc[-1]) if df4h_btc is not None and len(df4h_btc) > 0 and pd.notna(df4h_btc['RSI'].iloc[-1]) else None
+                            fgi_features = fetch_fgi_features()
+                            fgi_v = fgi_features.get("value") if fgi_features else None
+                            
+                            if rsi4h_btc is not None and fgi_v is not None:
+                                if rsi4h_btc < 35 and fgi_v > 10:  # Fear but not extreme
+                                    dynamic_risk_frac = RISK_FRACTION * 1.5  # 27% for aggressive dips
+                                elif fgi_v <= 10:  # Extreme bad, halve
+                                    dynamic_risk_frac = RISK_FRACTION * 0.5
+                        except Exception:
+                            pass  # Fallback to base RISK_FRACTION
+                        
+                        risk_amount = balance * dynamic_risk_frac
                         atr_val = float(row['ATR']) if pd.notna(row.get('ATR')) else price * 0.02
                         
                         if mode == 'dca':
                             # DCA: Fixed amount
-                            amount = (HYBRID_DCA_AMOUNT / price) if price > 0 else 0
+                            # >>> INCREASE HYBRID_DCA_AMOUNT IN VOL SPIKES: Double size si RVOL>1.5
+                            dca_amount_dynamic = HYBRID_DCA_AMOUNT
+                            try:
+                                rvol15_dca = float(row.get('RVOL10', 0)) if pd.notna(row.get('RVOL10')) else 0.0
+                                if rvol15_dca > 1.5:  # Vol spike (not bad thin)
+                                    dca_amount_dynamic = HYBRID_DCA_AMOUNT * 2
+                            except Exception:
+                                pass
+                            amount = (dca_amount_dynamic / price) if price > 0 else 0
                         elif mode == 'short':
                             # Short: Based on risk
                             amount = risk_amount / (atr_val * 3.5)  # Based on SL
@@ -2659,7 +2693,22 @@ def controller_autotune():
             mk_bull, _, _ = is_market_bullish()
         except Exception:
             mk_bull = False
+        
+        # >>> DYNAMIC GATE IN FEAR: Baja score_gate más rápido (step 0.20) en RSI4h<35 si vol_slope>0
         step = GATE_STEP * (2.0 if (mk_bull and ratio < (TARGET_BUY_RATIO - BUY_RATIO_DELTA)) else 1.0)
+        try:
+            # Get RSI4h for BTC and vol_slope
+            df4h_btc = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+            df1h_btc = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="1h", limit=50)
+            rsi4h_btc = float(df4h_btc['RSI'].iloc[-1]) if df4h_btc is not None and len(df4h_btc) > 0 and pd.notna(df4h_btc['RSI'].iloc[-1]) else None
+            vol_slope_btc = calculate_vol_slope(df1h_btc, periods=10) if df1h_btc is not None else None
+            
+            if rsi4h_btc is not None and vol_slope_btc is not None and rsi4h_btc < 35 and vol_slope_btc > 0:
+                # Fear + positive vol (recovery) - baja más rápido
+                step = 0.20  # Baja más rápido (de 0.10)
+        except Exception:
+            pass  # Fallback to normal step
+        
         if ratio < (TARGET_BUY_RATIO - BUY_RATIO_DELTA):
             gate = set_score_gate(gate - step)
             logger.info(f"[controller] Low buy ratio {ratio:.2f} < target {TARGET_BUY_RATIO:.2f}. Decreasing score_gate -> {gate:.2f} (step {step:.2f})")
@@ -3081,7 +3130,19 @@ def hybrid_decision(symbol: str):
         adx_local, rvol1_local = 0.0, 0.0
 
     edge_mult_eff = 1.7 if (rvol1_local >= 1.30 or adx_local >= 30.0) else ENTRY_EDGE_MULT  # specific numbers
-    need_edge = required_edge_pct() * edge_mult_eff
+    
+    # >>> OVERRIDE PROJECTED MOVE IN FEAR: Baja MIN_GAIN_OVER_FEES_MULT a 1.2 en RSI4h<35
+    min_gain_mult_eff = MIN_GAIN_OVER_FEES_MULT
+    try:
+        df4h_btc = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+        rsi4h_btc = float(df4h_btc['RSI'].iloc[-1]) if df4h_btc is not None and len(df4h_btc) > 0 and pd.notna(df4h_btc['RSI'].iloc[-1]) else None
+        if rsi4h_btc is not None and rsi4h_btc < 35:  # Fear override
+            min_gain_mult_eff = 1.2  # De 1.7/2.0 - agresivo para low-edge dips, pero safe (aún exige >fees)
+    except Exception:
+        pass
+    
+    # Apply min_gain_mult_eff to need_edge calculation
+    need_edge = required_edge_pct() * edge_mult_eff * (min_gain_mult_eff / MIN_GAIN_OVER_FEES_MULT)
 
     if projected_move is not None and projected_move < need_edge:
         msg = f"projected move {projected_move:.2f}% < req {need_edge:.2f}% (fees x{edge_mult_eff:.1f})"
@@ -3289,14 +3350,28 @@ def hybrid_decision(symbol: str):
 
     # >>> PROXY FGI: RSI4h<RSI_FEAR_PROXY full en guards/entries (replaces FGI gate)
     # RSI4h<RSI_FEAR_PROXY = fear proxy (JSON q25 36), allow entries (best time for swings in dips)
-    # If proxy active, lower ADX_MIN to 15 (capture bottoms in fear)
+    # If proxy active, lower ADX_MIN to 15 (capture bottoms in fear) BUT only if vol_slope>0
     proxy_active_entry = False
     if (rsi4h is not None) and (rsi4h < RSI_FEAR_PROXY):
         proxy_active_entry = True
-        # Lower ADX_MIN if proxy active (capture bottoms in fear)
-        if ADX_MIN_K > 15:
-            ADX_MIN_K = 15
-            notes.append(f"Proxy active: ADX_MIN lowered to 15 (RSI4h={rsi4h:.1f}<{RSI_FEAR_PROXY})")
+        # Calculate vol_slope for ADX_MIN override
+        vol_slope_fear = None
+        try:
+            vol_slope_fear = calculate_vol_slope(df1h, periods=10) if df1h is not None else None
+        except Exception:
+            pass
+        
+        # Lower ADX_MIN if proxy active AND vol_slope>0 (fear + positive vol = early recovery)
+        # Keep 20 if vol_slope<0 (no buys in downtrends)
+        if vol_slope_fear is not None and vol_slope_fear > 0:
+            if ADX_MIN_K > 15:
+                ADX_MIN_K = 15
+                notes.append(f"Proxy active: ADX_MIN lowered to 15 (RSI4h={rsi4h:.1f}<{RSI_FEAR_PROXY}, vol_slope={vol_slope_fear:.2f}>0)")
+        else:
+            # Keep ADX_MIN at 20 if vol_slope<0 (avoid bad markets)
+            if ADX_MIN_K < 20:
+                ADX_MIN_K = 20
+                notes.append(f"Proxy active but vol_slope≤0: ADX_MIN kept at 20 (RSI4h={rsi4h:.1f}<{RSI_FEAR_PROXY}, vol_slope={vol_slope_fear})")
     
     # Only block if RSI4h < RSI_FEAR_PROXY AND trending down strongly (slope < -0.5)
     if proxy_active_entry and (rsi4h_slope < -0.5):
@@ -3305,6 +3380,10 @@ def hybrid_decision(symbol: str):
         if level != "HARD": level = "SOFT"
     elif proxy_active_entry:
         # RSI4h<RSI_FEAR_PROXY but not falling fast = opportunity (allow entries, proxy FGI fear)
+        # >>> OVERRIDE RSI RANGE: Allow RSI up to 65 in fear (overbought OK in dip market)
+        if RSI_MAX_K < 65:
+            RSI_MAX_K = 65
+            notes.append(f"Proxy active: RSI_MAX raised to 65 for fear entries (RSI4h={rsi4h:.1f}<{RSI_FEAR_PROXY})")
         notes.append(f"Proxy active: Allowing entries in fear (RSI4h={rsi4h:.1f}<{RSI_FEAR_PROXY})")
         pass  # No block, allow entries in dips
 
@@ -3340,7 +3419,21 @@ def hybrid_decision(symbol: str):
 
 
     # — Thin-tape SOFT block: BOTH 1h and 15m RVOL under floors
-    if ((rvol_1h is None or rvol_1h < rvol1_floor) and (rv15 is None or rv15 < rvol15_floor)):
+    # >>> VOL OVERRIDE FOR DCA: Bypass thin tape if DCA trigger and vol_slope>0
+    thin_tape_block = ((rvol_1h is None or rvol_1h < rvol1_floor) and (rv15 is None or rv15 < rvol15_floor))
+    
+    # Check if DCA mode and vol_slope>0 (recovering dips)
+    dca_vol_override = False
+    if thin_tape_block and proxy_active_entry:  # RSI4h<35 (fear DCA)
+        try:
+            vol_slope_dca = calculate_vol_slope(df1h, periods=10) if df1h is not None else None
+            if vol_slope_dca is not None and vol_slope_dca > 0:
+                dca_vol_override = True
+                notes.append(f"DCA vol override: bypassing thin tape (vol_slope={vol_slope_dca:.2f}>0)")
+        except Exception:
+            pass
+    
+    if thin_tape_block and not dca_vol_override:
         blocks.append(f"SOFT block: thin tape (1h RVOL {rvol_1h}, 15m RVOL {rv15}; floors {rvol1_floor:.2f}/{rvol15_floor:.2f})")
         if level != "HARD": level = "SOFT"
 
@@ -3503,20 +3596,20 @@ def hybrid_decision(symbol: str):
     except Exception:
         pass
 
-    # >>> PATCH: daily throttle (ANCHOR THROTTLE2)
-    trades_today, losers_last, n_last = daily_trade_counts()
-    if trades_today >= DAILY_TRADE_THROTTLE_N or (n_last >= LOSS_STREAK_WINDOW and losers_last >= LOSS_STREAK_MAX):
-        # In throttle mode we require both trend & volume proof
-        rvol_req = 1.5
-        try:
-            mk_bull, _, _ = is_market_bullish()
-            if mk_bull:
-                rvol_req = 1.3
-        except Exception:
-            pass
-        if not (adx4h_now and adx4h_rising_gate and (rv15_closed or 0) >= rvol_req):
-            blocks.append(f"HARD block: throttle mode → need 4h ADX rising & RVOL15_closed≥{rvol_req}")
-            level = "HARD"
+    # >>> PATCH: daily throttle (ANCHOR THROTTLE2) - TEMPORARILY DISABLED
+    # trades_today, losers_last, n_last = daily_trade_counts()
+    # if trades_today >= DAILY_TRADE_THROTTLE_N or (n_last >= LOSS_STREAK_WINDOW and losers_last >= LOSS_STREAK_MAX):
+    #     # In throttle mode we require both trend & volume proof
+    #     rvol_req = 1.5
+    #     try:
+    #         mk_bull, _, _ = is_market_bullish()
+    #         if mk_bull:
+    #             rvol_req = 1.3
+    #     except Exception:
+    #         pass
+    #     if not (adx4h_now and adx4h_rising_gate and (rv15_closed or 0) >= rvol_req):
+    #         blocks.append(f"HARD block: throttle mode → need 4h ADX rising & RVOL15_closed≥{rvol_req}")
+    #         level = "HARD"
 
 
 
@@ -3702,7 +3795,18 @@ def hybrid_decision(symbol: str):
         last_w = float(width.iloc[-1])
         hist = width.dropna().iloc[-60:]
         bb_rank = float((hist < last_w).mean())  # 0..1
-        if (adx or 0) < 20 and bb_rank < 0.30:
+        
+        # >>> RELAJA CHOP/SQUEEZE IN MOMENTUM: Bypass si ADX>18 y vol_slope>0
+        chop_block = (adx or 0) < 20 and bb_rank < 0.30
+        if chop_block:
+            # Check if momentum override (ADX>18 and vol_slope>0)
+            vol_slope_chop = calculate_vol_slope(df, periods=10) if df is not None else None
+            if (adx or 0) >= 18 and vol_slope_chop is not None and vol_slope_chop > 0:
+                # Momentum, no chop block
+                chop_block = False
+                notes.append(f"Chop bypass: ADX={adx:.1f}≥18 & vol_slope={vol_slope_chop:.2f}>0 (momentum)")
+        
+        if chop_block:
             blocks.append(f"chop/squeeze: BBwidth%rank={bb_rank:.2f}, ADX={adx:.1f}")
             level = "HARD"
     except Exception:
@@ -5758,6 +5862,22 @@ def size_position(price: float, usdt_balance: float, confidence: int, symbol: st
     conf_mult = (confidence - 50) / 50.0
     conf_mult = max(0.0, min(conf_mult, 0.84))
     base_frac = RISK_FRACTION * (0.6 + 0.4 * conf_mult)
+    
+    # >>> DYNAMIC RISK: Increase in fear dips (RSI4h<35, FGI>10), reduce in extreme fear (FGI<=10)
+    try:
+        # Get RSI4h for BTC and FGI
+        df4h_btc = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+        rsi4h_btc = float(df4h_btc['RSI'].iloc[-1]) if df4h_btc is not None and len(df4h_btc) > 0 and pd.notna(df4h_btc['RSI'].iloc[-1]) else None
+        fgi_features = fetch_fgi_features()
+        fgi_v = fgi_features.get("value") if fgi_features else None
+        
+        if rsi4h_btc is not None and fgi_v is not None:
+            if rsi4h_btc < 35 and fgi_v > 10:  # Fear but not extreme
+                base_frac *= 1.5  # 27% for aggressive dips (if base was 18%)
+            elif fgi_v <= 10:  # Extreme bad, halve
+                base_frac *= 0.5
+    except Exception:
+        pass  # Fallback to base calculation
 
     # 2) Post-loss penalty (per symbol)
     if symbol and symbol in LAST_LOSS_INFO:
@@ -6376,10 +6496,19 @@ def trade_once_with_report(symbol: str):
             return report
 
         # 4) Límite de operaciones abiertas
+        # >>> DYNAMIC MAX_OPEN_TRADES: Increase to 15 if breadth > 4 (momentum in market)
+        max_trades_dynamic = MAX_OPEN_TRADES
+        try:
+            _, breadth_count = compute_breadth()
+            if breadth_count > 4:  # Momentum in market
+                max_trades_dynamic = 15  # More diversification in good markets
+        except Exception:
+            pass
+        
         open_trades = get_open_trades_count()
-        if open_trades >= MAX_OPEN_TRADES:
-            report["note"] = "max open trades"
-            logger.info("Max open trades.")
+        if open_trades >= max_trades_dynamic:
+            report["note"] = f"max open trades ({max_trades_dynamic})"
+            logger.info(f"Max open trades ({max_trades_dynamic}).")
             log_decision(symbol, 0.0, "hold", False)
             return report
 
@@ -6414,7 +6543,15 @@ def trade_once_with_report(symbol: str):
                     
                     if ema50_1h_dca is not None and price_now < ema50_1h_dca and cooldown_ok(symbol, HYBRID_DCA_COOLDOWN_H):
                         # Execute DCA buy
-                        dca_amount = HYBRID_DCA_AMOUNT / price_now
+                        # >>> INCREASE HYBRID_DCA_AMOUNT IN VOL SPIKES: Double size si RVOL>1.5
+                        dca_amount_dynamic = HYBRID_DCA_AMOUNT
+                        try:
+                            rvol15_dca = float(snap1h_dca.get('RVOL10') or 0.0)
+                            if rvol15_dca > 1.5:  # Vol spike (not bad thin)
+                                dca_amount_dynamic = HYBRID_DCA_AMOUNT * 2
+                        except Exception:
+                            pass
+                        dca_amount = dca_amount_dynamic / price_now
                         snap1h_dca = quick_tf_snapshot(symbol, "1h", limit=120) or {}
                         atr_abs_dca = float(snap1h_dca.get("ATR") or 0.0)
                         
@@ -6515,9 +6652,18 @@ def trade_once_with_report(symbol: str):
         # 6) Zona crítica: ejecutar compra bajo lock
         with buy_lock:
             # Revalidar límites dentro del lock
+            # >>> DYNAMIC MAX_OPEN_TRADES: Increase to 15 if breadth > 4 (momentum in market)
+            max_trades_dynamic = MAX_OPEN_TRADES
+            try:
+                _, breadth_count = compute_breadth()
+                if breadth_count > 4:  # Momentum in market
+                    max_trades_dynamic = 15  # More diversification in good markets
+            except Exception:
+                pass
+            
             open_trades = get_open_trades_count()
-            if open_trades >= MAX_OPEN_TRADES:
-                report["note"] = "max open trades (post-lock)"
+            if open_trades >= max_trades_dynamic:
+                report["note"] = f"max open trades ({max_trades_dynamic}, post-lock)"
                 log_decision(symbol, score, "hold", False)
                 return report
 
