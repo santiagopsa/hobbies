@@ -54,3 +54,4 @@ fgi_historical = fetch_fgi_historical_series(start_date, end_date)
 
 Then pass `fgi_historical=fgi_historical` to both `find_successful_trends()` and `compare_with_failed_trends()`.
 
+

@@ -68,14 +68,14 @@ VOL_SIZE_MIN        = float(os.getenv("VOL_SIZE_MIN", "0.70"))   # 70% base on t
 VOL_SIZE_MAX        = float(os.getenv("VOL_SIZE_MAX", "1.60"))   # 160% base on hot volume
 VOL_SIZE_MIN_NOTION = float(os.getenv("VOL_SIZE_MIN_NOTION", "10"))
 
-HOLD_RVOL15_MIN     = float(os.getenv("HOLD_RVOL15_MIN", "2.0"))   # keep runner if >=
+HOLD_RVOL15_MIN     = float(os.getenv("HOLD_RVOL15_MIN", "1.5"))   # Lowered from 2.0 - allow more runners
 HOLD_RVOL1H_MIN     = float(os.getenv("HOLD_RVOL1H_MIN", "1.10"))
-HOLD_ADX1H_MIN      = float(os.getenv("HOLD_ADX1H_MIN", "30"))
-HOLD_TRAIL_WIDE_BPS = int(os.getenv("HOLD_TRAIL_WIDE_BPS", "600"))  # 6%
+HOLD_ADX1H_MIN      = float(os.getenv("HOLD_ADX1H_MIN", "25"))    # Lowered from 30 - allow more runners
+HOLD_TRAIL_WIDE_BPS = int(os.getenv("HOLD_TRAIL_WIDE_BPS", "800"))  # Increased from 600 to 800 (8%) - wider trail for holders
 HOLD_PARTIAL_SELL   = float(os.getenv("HOLD_PARTIAL_SELL", "0.30")) # take 30%, keep 70%
 
-DECAY_RVOL15_MAX    = float(os.getenv("DECAY_RVOL15_MAX", "0.70"))  # live < 0.70 → tighten
-DECAY_BARS          = int(os.getenv("DECAY_BARS", "2"))
+DECAY_RVOL15_MAX    = float(os.getenv("DECAY_RVOL15_MAX", "0.50"))  # Lowered from 0.70 - only tighten if volume drops much more
+DECAY_BARS          = int(os.getenv("DECAY_BARS", "4"))            # Increased from 2 - wait more bars before tightening
 
 
 # ==== LONG-TERM PARKING REGIME (ANCHOR LTP0) ====
@@ -171,16 +171,17 @@ FORCE_FGI = bool(int(os.getenv("FORCE_FGI", "0")))  # If 0, FGI gate is disabled
 # >>> HYBRID PARAMS (60% swing, 20% DCA, 20% shorts)
 HYBRID_DCA_AMOUNT = float(os.getenv("HYBRID_DCA_AMOUNT", "50.0"))  # Fixed $ per DCA buy
 HYBRID_DCA_COOLDOWN_H = int(os.getenv("HYBRID_DCA_COOLDOWN_H", "4"))  # Hours between DCA buys
-HYBRID_SHORT_RSI_MAX = float(os.getenv("HYBRID_SHORT_RSI_MAX", "70.0"))  # RSI>70 for shorts
-HYBRID_SHORT_VOL_SLOPE_MIN = float(os.getenv("HYBRID_SHORT_VOL_SLOPE_MIN", "0.0"))  # vol_slope<0 for shorts
-HYBRID_SHORT_ENABLED = bool(int(os.getenv("HYBRID_SHORT_ENABLED", "1")))  # Enable shorts
+HYBRID_SHORT_RSI_MAX = float(os.getenv("HYBRID_SHORT_RSI_MAX", "75.0"))  # Increased from 70.0 - short only when more overbought
+HYBRID_SHORT_VOL_SLOPE_MIN = float(os.getenv("HYBRID_SHORT_VOL_SLOPE_MIN", "-0.5"))  # Changed from 0.0 to -0.5 - require clear vol decay
+HYBRID_SHORT_ENABLED = bool(int(os.getenv("HYBRID_SHORT_ENABLED", "0")))  # Disabled by default until fixed (was 1)
 HYBRID_DCA_ENABLED = bool(int(os.getenv("HYBRID_DCA_ENABLED", "1")))  # Enable DCA
 
 # >>> SHORT RISK CONTROLS (For testing with controlled risk)
-MAX_OPEN_SHORTS = int(os.getenv("MAX_OPEN_SHORTS", "3"))  # Max 3 shorts simultaneously (lower risk)
-SHORT_RISK_FRACTION = float(os.getenv("SHORT_RISK_FRACTION", "0.09"))  # 9% per short (50% of normal 18%)
+MAX_OPEN_SHORTS = int(os.getenv("MAX_OPEN_SHORTS", "1"))  # Lowered from 3 to 1 for testing
+SHORT_RISK_FRACTION = float(os.getenv("SHORT_RISK_FRACTION", "0.05"))  # Lowered from 0.09 to 0.05 (5%) for testing
 SHORT_STOP_ATR_MULT = float(os.getenv("SHORT_STOP_ATR_MULT", "1.5"))  # 1.5 ATR stop (tighter than 2 ATR)
 SHORT_MAX_POSITION_SIZE_PCT = float(os.getenv("SHORT_MAX_POSITION_SIZE_PCT", "0.30"))  # Max 30% of available (was 50%)
+SHORT_LEVERAGE = int(os.getenv("SHORT_LEVERAGE", "5"))  # Leverage for futures shorts (default 5x)
 
 # Global DCA cooldown tracking
 LAST_DCA = {}  # Global dict {sym: last_ts}
@@ -207,13 +208,13 @@ ML_MODEL = None  # Will be trained on historical trades
 ALLOW_SCALE_IN = True                 # activar re-compras en el mismo símbolo
 SCALE_IN_MAX_BUYS_PER_SYMBOL = 2      # 1 base + 1 add-on
 SCALE_IN_ADD_FRACTION = 0.55          # tamaño del add-on vs el tamaño base teórico
-SCALE_IN_MIN_ADX_1H = 22.0            # exige tendencia decente
+SCALE_IN_MIN_ADX_1H = float(os.getenv("SCALE_IN_MIN_ADX_1H", "30.0"))  # Increased from 22.0 - only scale in strong trends
 SCALE_IN_STRONG_ADX_1H = 35.0         # atajo de fuerza HTF
 SCALE_IN_STRONG_ADX_4H = 25.0
 SCALE_IN_MIN_RVOL15_CLOSED = 1.10     # cinta viva en 15m (closed bar RVOL)
 SCALE_IN_MIN_RVOL15_CLOSED_RELAX = 1.00
 SCALE_IN_MIN_RVOL15_LIVE = 1.60
-SCALE_IN_COOLDOWN_MIN = 20            # enfriar entre add-ons en el mismo símbolo (min)
+SCALE_IN_COOLDOWN_MIN = int(os.getenv("SCALE_IN_COOLDOWN_MIN", "60"))  # Increased from 20 - more cooldown between scale-ins
 SCALE_IN_MIN_R_MULT = 1.0             # sólo si el trade ya está >= 1R desde la entrada
 
 # ==== Slot stealing / rotation ====
@@ -236,13 +237,13 @@ MIN_QUOTE_VOL_24H_DEFAULT = 3_000_000
 # ADX_MIN_DEFAULT = 20  # Optimized value
 # RSI_MIN_DEFAULT, RSI_MAX_DEFAULT = 40, 68  # Optimized value
 
-ADX_MIN_DEFAULT = 15  # Optimized for swing: JSON success mean ADX 31, q25 21 - capture bottoms (was 25)
-RSI_MIN_DEFAULT, RSI_MAX_DEFAULT = 35, 68  # Optimized for swing: JSON success mean RSI 44, q25 36 - capture dips (was 40)
+ADX_MIN_DEFAULT = float(os.getenv("ADX_MIN_DEFAULT", "20"))  # Increased from 15 - require more trend strength
+RSI_MIN_DEFAULT, RSI_MAX_DEFAULT = float(os.getenv("RSI_MIN_DEFAULT", "40")), 68  # Increased from 35 - avoid false oversold
 RVOL_BASE_DEFAULT = 1.35  # Ajustado desde 1.5: tendencias buenas viven entre 1.1-1.3
 # >>> PATCH START: gate & cooldowns
-SCORE_GATE_START = 4.8
+SCORE_GATE_START = float(os.getenv("SCORE_GATE_START", "5.5"))  # Increased from 4.8
 SCORE_GATE_MAX = 5.8
-SCORE_GATE_HARD_MIN = 5 # tougher floor to avoid low-quality buys
+SCORE_GATE_HARD_MIN = int(os.getenv("SCORE_GATE_HARD_MIN", "6"))  # Increased from 5 - only elite entries
 
 # re-entry/cooldowns
 COOLDOWN_AFTER_COLLAPSE_MIN = 60   # minutes — after a volume-collapse exit
@@ -278,7 +279,7 @@ EDGE_SAFETY_MULT = float(os.getenv("EDGE_SAFETY_MULT", "1.3"))
 
 # >>> PATCH: ENTRY EDGE / QUALITY / COOLDOWNS (ANCHOR EDGE1)
 ENTRY_EDGE_MULT = float(os.getenv("ENTRY_EDGE_MULT", "2.0"))         # x required_edge_pct for entry
-RVOL15_ENTRY_MIN = float(os.getenv("RVOL15_ENTRY_MIN", "1.3"))       # closed 15m RVOL floor for momentum entries
+RVOL15_ENTRY_MIN = float(os.getenv("RVOL15_ENTRY_MIN", "1.5"))       # Increased from 1.3 - only enter with live volume
 RVOL15_BREAKOUT_MIN = float(os.getenv("RVOL15_BREAKOUT_MIN", "1.5")) # closed RVOL needed when 4h trend is weak (<20)
 
 QUICK_LOSS_COOLDOWN_MIN = int(os.getenv("QUICK_LOSS_COOLDOWN_MIN", "30"))  # re-entry ban after quick small loss
@@ -307,8 +308,8 @@ TRAIL_TP_MULT = float(os.getenv("TRAIL_TP_MULT", "1.10"))
 # >>> PATCH START: REBOUND/TRAIL/TIME knobs
 # --- Exit anti-whipsaw / rebound guard ---
 REBOUND_GUARD_ENABLED = True
-REBOUND_WAIT_BARS_15M = 1          # espera confirmación 1 vela 15m antes de vender (reduced from 2 for swing volatility)
-REBOUND_MIN_RSI_BOUNCE = 5.0       # cancel exit si RSI15 sube >= +5
+REBOUND_WAIT_BARS_15M = int(os.getenv("REBOUND_WAIT_BARS_15M", "2"))  # Increased from 1 - wait 2 bars 15m for rebound confirmation
+REBOUND_MIN_RSI_BOUNCE = float(os.getenv("REBOUND_MIN_RSI_BOUNCE", "8.0"))  # Increased from 5.0 - require more RSI bounce
 REBOUND_EMA_RECLAIM = True         # cancel exit si cierra sobre EMA20 15m
 REBOUND_USE_5M_DIVERGENCE = True   # opcional: divergencia alcista 5m cancela sell
 
@@ -318,27 +319,27 @@ RVOL_SPIKE_THRESHOLD = 2.0         # si RVOL10 en últimas 3 velas > 2 → ampli
 RVOL_SPIKE_TRAIL_BONUS = 0.5       # +0.5% al trail por 15 minutos
 
 # --- Time-in-trade stop con excepción de "tape mejorando" ---
-TIME_STOP_HOURS = 24  # Base: 24h (Full swing core)
-TIME_STOP_EXTEND_HOURS = 120  # Extended: 120h (5 days) if vol_slope>0 or RSI<40 (JSON success in dips)
+TIME_STOP_HOURS = int(os.getenv("TIME_STOP_HOURS", "48"))  # Increased from 24 - more base time for swings
+TIME_STOP_EXTEND_HOURS = int(os.getenv("TIME_STOP_EXTEND_HOURS", "168"))  # Increased from 120 to 168h (7 days) if tape improving
 TAPE_IMPROVING_ADX_SLOPE_MIN = 0.0 # >0 = ADX1h subiendo
 TAPE_IMPROVING_VWAP_REQ = True     # close 1h > VWAP 1h para extender
 
 # --- Profit quality guard (evitar micro-takes post-fees) ---
-MIN_GAIN_OVER_FEES_MULT = 1.6      # exigir 1.6× fees totales antes de permitir exit por precio
-MIN_HOLD_SECONDS = 900             # 15 min mínimos globales para exits (excepto stop duro)
+MIN_GAIN_OVER_FEES_MULT = float(os.getenv("MIN_GAIN_OVER_FEES_MULT", "1.2"))  # Lowered from 1.6 - allow exits with less edge
+MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "3600"))  # Increased from 900 (15min) to 3600 (1h) - avoid immediate scratches
 # >>> PATCH END
 
 # >>> CHAN PATCH CONFIG START (ANCHOR A)
 # ——— Chandelier / estructura / BE / time-stop por velas ———
 CHAN_ATR_LEN = 22          # ATR para Chandelier (n)
 CHAN_LEN_HIGH = 22         # HH(n), típico 22
-CHAN_K_STABLE  = 3.0
-CHAN_K_MEDIUM  = 2.7
-CHAN_K_UNSTABLE= 2.3
+CHAN_K_STABLE  = float(os.getenv("CHAN_K_STABLE", "4.0"))   # Increased from 3.0 for wider trails
+CHAN_K_MEDIUM  = float(os.getenv("CHAN_K_MEDIUM", "3.5"))   # Increased from 2.7 for wider trails
+CHAN_K_UNSTABLE= float(os.getenv("CHAN_K_UNSTABLE", "3.0")) # Increased from 2.3 for wider trails
 
 # Tighten/widen dinámicos del K
-SOFT_TIGHTEN_K = 0.5       # reducción temporal de k al detectar debilidad leve (RSI/MACDh)
-RVOL_SPIKE_K_BONUS = 0.4   # aumento temporal de k si hay spike de RVOL (gracia a la volatilidad)
+SOFT_TIGHTEN_K = float(os.getenv("SOFT_TIGHTEN_K", "0.3"))       # Reduced from 0.5 - less K reduction on weakness
+RVOL_SPIKE_K_BONUS = float(os.getenv("RVOL_SPIKE_K_BONUS", "0.6"))   # Increased from 0.4 - more grace on RVOL spikes
 RVOL_K_BONUS_MINUTES = 15
 
 # Break-even cuando el trade alcanza X R
@@ -396,8 +397,8 @@ RVOL_MEAN_MIN = 1e-6
 RVOL_VALUE_MIN = 0.25
 
 # >>> PREFLIGHT KNOBS (ANCHOR PF0)
-PREFLIGHT_ADX_HARD_MIN = 12.0   # antes 15
-PREFLIGHT_RVOL1H_MIN   = 0.80   # antes 1.00
+PREFLIGHT_ADX_HARD_MIN = float(os.getenv("PREFLIGHT_ADX_HARD_MIN", "18.0"))  # Increased from 12.0 - require stronger trend
+PREFLIGHT_RVOL1H_MIN   = float(os.getenv("PREFLIGHT_RVOL1H_MIN", "1.00"))    # Increased from 0.80 - avoid thin tape
 
 
 # No-buy-under-sell thresholds
@@ -406,7 +407,7 @@ NBUS_MACDH15_NEG = -0.002
 
 # >>> PATCH A1: BEAR/THIN-TAPE & COLLAPSE KNOBS
 # Bearish-context gate (4h) & Thin-tape RVOL floors
-RSI4H_HARD_MIN = 45.0       # HARD block if 4h RSI <45 and trending down
+RSI4H_HARD_MIN = float(os.getenv("RSI4H_HARD_MIN", "50.0"))  # Increased from 45.0 - block more in bear markets
 RSI4H_SOFT_MIN = 50.0       # SOFT block if 45≤RSI<50 and trending down unless RVOL strong
 RSI4H_SLOPE_BARS = 6        # slope lookback (4h bars)
 
@@ -419,7 +420,7 @@ RVOL_FLOOR_STABLE_BONUS   = -0.10  # stable: allow 0.10 lower
 RVOL_FLOOR_UNSTABLE_BONUS = +0.10  # unstable: require 0.10 higher
 
 # Volume-collapse exit (post-entry)
-RVOL_COLLAPSE_EXIT_ENABLED = True
+RVOL_COLLAPSE_EXIT_ENABLED = bool(int(os.getenv("RVOL_COLLAPSE_EXIT_ENABLED", "0")))  # Disabled by default for testing
 RVOL_COLLAPSE_EXIT = 0.50   # if 15m RVOL < 0.50 after min hold → exit
 
 MACD_H_ENTRY_MIN = 0.0 # Require positive MACD hist for entries (earlier signal than RSI/ADX alone).
@@ -576,11 +577,13 @@ initialize_db()
 # =========================
 # Exchange
 # =========================
+# Exchange configuration - supports spot, margin, or futures
+EXCHANGE_DEFAULT_TYPE = os.getenv("EXCHANGE_DEFAULT_TYPE", "spot")  # 'spot', 'margin', or 'future'
 exchange = ccxt.binance({
     'apiKey': os.getenv("BINANCE_API_KEY_REAL"),
     'secret': os.getenv("BINANCE_SECRET_KEY_REAL"),
     'enableRateLimit': True,
-    'options': {'defaultType': 'spot', 'adjustForTimeDifference': True}
+    'options': {'defaultType': EXCHANGE_DEFAULT_TYPE, 'adjustForTimeDifference': True}
 })
 
 
@@ -4091,26 +4094,36 @@ def get_open_shorts_count() -> int:
 def execute_short(symbol: str, amount: float, signals: dict):
     """
     Execute short order (sell to open short position).
-    ⚠️ IMPORTANT: In SPOT trading, this requires having the asset first.
-    For real shorts (without having asset), you need margin/futures trading.
+    Supports spot (requires asset), margin, and futures (with leverage).
     """
     try:
-        # >>> RISK CONTROL: Verify balance for spot shorts (need asset first)
+        # >>> RISK CONTROL: Different logic for spot vs margin/futures
         base_currency = symbol.split('/')[0]
-        try:
-            balances = exchange.fetch_balance()
-            base_balance = float(balances.get('free', {}).get(base_currency, 0.0))
-            
+        exchange_type = EXCHANGE_DEFAULT_TYPE
+        
+        if exchange_type == 'spot':
             # In spot trading, shorts require having the asset first
-            if base_balance < amount * 1.001:  # Need 0.1% extra for fees
-                logger.warning(f"[SHORT-RISK] {symbol}: Insufficient {base_currency} balance for spot short. "
-                             f"Need {amount:.8f}, have {base_balance:.8f}. "
-                             f"Spot shorts require having the asset first. "
-                             f"For real shorts (without asset), enable margin/futures trading.")
-                return None
-        except Exception as e:
-            logger.warning(f"[SHORT-RISK] {symbol}: Balance check failed: {e}")
-            # Continue anyway, but log the risk
+            try:
+                balances = exchange.fetch_balance()
+                base_balance = float(balances.get('free', {}).get(base_currency, 0.0))
+                
+                if base_balance < amount * 1.001:  # Need 0.1% extra for fees
+                    logger.warning(f"[SHORT-RISK] {symbol}: Insufficient {base_currency} balance for spot short. "
+                                 f"Need {amount:.8f}, have {base_balance:.8f}. "
+                                 f"Spot shorts require having the asset first. "
+                                 f"For real shorts (without asset), set EXCHANGE_DEFAULT_TYPE=margin or future.")
+                    return None
+            except Exception as e:
+                logger.warning(f"[SHORT-RISK] {symbol}: Balance check failed: {e}")
+                # Continue anyway, but log the risk
+        elif exchange_type in ['margin', 'future']:
+            # For futures, set leverage if supported
+            try:
+                if exchange_type == 'future' and SHORT_LEVERAGE > 1:
+                    exchange.set_leverage(SHORT_LEVERAGE, symbol)
+                    logger.info(f"[SHORT] {symbol}: Set leverage to {SHORT_LEVERAGE}x for futures")
+            except Exception as e:
+                logger.warning(f"[SHORT] {symbol}: Could not set leverage (may not be supported): {e}")
         
         try:
             # Prepare amount for exchange filters
