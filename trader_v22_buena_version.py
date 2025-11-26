@@ -3152,15 +3152,6 @@ def hybrid_decision(symbol: str):
     except Exception:
         pass
     
-    # >>> MIN_GAIN IN MOMENTUM: Baja MIN_GAIN_OVER_FEES_MULT a 1.0 si vol_slope>0 y ADX>18
-    try:
-        vol_slope_momentum = calculate_vol_slope(df, periods=10) if df is not None else None
-        if vol_slope_momentum is not None and vol_slope_momentum > 0 and adx_local > 18:
-            min_gain_mult_eff = 1.0  # Más agresivo en momentum (vol_slope>0 y ADX>18)
-            notes.append(f"Momentum override: MIN_GAIN lowered to 1.0 (vol_slope={vol_slope_momentum:.2f}>0, ADX={adx_local:.1f}>18)")
-    except Exception:
-        pass
-    
     # Apply min_gain_mult_eff to need_edge calculation
     need_edge = required_edge_pct() * edge_mult_eff * (min_gain_mult_eff / MIN_GAIN_OVER_FEES_MULT)
 
