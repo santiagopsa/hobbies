@@ -865,6 +865,20 @@ def get_buy_signal_from_data(symbol: str, df: pd.DataFrame, current_price: float
         
         score_gate = trader.get_score_gate()
         
+        # >>> LOG OVERRIDE IN FEAR: Debug score 0.0 buys when fear override active
+        fear_override_active = False
+        try:
+            df4h_btc_log = trader.fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+            rsi4h_btc_log = float(df4h_btc_log['RSI'].iloc[-1]) if df4h_btc_log is not None and len(df4h_btc_log) > 0 and pd.notna(df4h_btc_log['RSI'].iloc[-1]) else None
+            if rsi4h_btc_log is not None and rsi4h_btc_log < 35:
+                fear_override_active = True
+        except Exception:
+            pass
+        
+        # >>> LOG OVERRIDE IN FEAR: Debug low score buys when fear override active
+        if score < trader.SCORE_GATE_HARD_MIN and fear_override_active:
+            print(f"[FEAR-OVERRIDE] {symbol}: Fear override buy with score {score:.1f} despite gate {score_gate:.1f} (RSI4h={rsi4h_btc_log:.1f}<35)")
+        
         if score >= score_gate:
             conf = int(min(50 + 10*(1 if in_lane else 0) + 10*(1 if clear_uptrend else 0), 100))
             return "buy", conf, score, ", ".join(notes)

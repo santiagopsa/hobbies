@@ -803,7 +803,17 @@ def hold_in_volume(symbol: str) -> dict:
     # Disable decay if proxy active OR if RSI<40 (volume dries in bottoms but rebounds come)
     decay_enabled = (not proxy_active_decay) and (rsi1h_for_decay >= 40)  # Only check decay if proxy inactive AND RSI >= 40
     
-    if decay_enabled and rvol15 > 0 and rvol15 < DECAY_RVOL15_MAX:
+    # >>> FEAR GRACE: Lower DECAY_RVOL15_MAX threshold in fear (RSI4h<35) - only extreme drop triggers
+    decay_rvol15_threshold = DECAY_RVOL15_MAX
+    try:
+        df4h_btc_decay = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+        rsi4h_btc_decay = float(df4h_btc_decay['RSI'].iloc[-1]) if df4h_btc_decay is not None and len(df4h_btc_decay) > 0 and pd.notna(df4h_btc_decay['RSI'].iloc[-1]) else None
+        if rsi4h_btc_decay is not None and rsi4h_btc_decay < 35:  # Fear grace
+            decay_rvol15_threshold = 0.2  # Only extreme drop triggers (was 0.50)
+    except Exception:
+        pass
+    
+    if decay_enabled and rvol15 > 0 and rvol15 < decay_rvol15_threshold:
         _DECAY_STREAK[symbol] += 1
     else:
         _DECAY_STREAK[symbol] = 0
@@ -2097,11 +2107,13 @@ def backtest_strategy() -> dict:
                         
                         if mode == 'dca':
                             # DCA: Fixed amount
-                            # >>> INCREASE HYBRID_DCA_AMOUNT IN VOL SPIKES: Double size si RVOL>1.5
+                            # >>> INCREASE HYBRID_DCA_AMOUNT IN VOL SPIKES: Triple if RVOL15>2.0, double if >1.5
                             dca_amount_dynamic = HYBRID_DCA_AMOUNT
                             try:
                                 rvol15_dca = float(row.get('RVOL10', 0)) if pd.notna(row.get('RVOL10')) else 0.0
-                                if rvol15_dca > 1.5:  # Vol spike (not bad thin)
+                                if rvol15_dca > 2.0:  # Extreme vol spike - triple size
+                                    dca_amount_dynamic = HYBRID_DCA_AMOUNT * 3
+                                elif rvol15_dca > 1.5:  # Vol spike - double size
                                     dca_amount_dynamic = HYBRID_DCA_AMOUNT * 2
                             except Exception:
                                 pass
@@ -3289,9 +3301,24 @@ def hybrid_decision(symbol: str):
     
     # volume_slope10 > 0 (volume trending up)
     if volume_slope10 is None or volume_slope10 <= 0:
-        vol_slope_str = f"{volume_slope10:.2f}" if volume_slope10 is not None else "None"
-        blocks.append(f"HARD block: volume_slope10 not positive ({vol_slope_str}, need >0)")
-        level = "HARD"
+        # >>> VOL_SLOPE OVERRIDE IN FEAR: Allow if RSI4h<35 even vol_slope<=0 but RVOL15>1.0 (no in real bad low vol)
+        vol_slope_override = False
+        try:
+            df4h_btc_vol = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+            rsi4h_btc_vol = float(df4h_btc_vol['RSI'].iloc[-1]) if df4h_btc_vol is not None and len(df4h_btc_vol) > 0 and pd.notna(df4h_btc_vol['RSI'].iloc[-1]) else None
+            # Get RVOL15 from 15m snapshot (tf15 is defined later, so fetch it here)
+            snap15_vol = quick_tf_snapshot(symbol, '15m', limit=60) or {}
+            rv15_vol = snap15_vol.get('RVOL10') or snap15_vol.get('RVOL')
+            if rsi4h_btc_vol is not None and rsi4h_btc_vol < 35 and rv15_vol is not None and float(rv15_vol) > 1.0:
+                vol_slope_override = True
+                notes.append(f"Vol slope override: RSI4h={rsi4h_btc_vol:.1f}<35 and RVOL15={float(rv15_vol):.2f}>1.0 (bypass vol_slope block)")
+        except Exception:
+            pass
+        
+        if not vol_slope_override:
+            vol_slope_str = f"{volume_slope10:.2f}" if volume_slope10 is not None else "None"
+            blocks.append(f"HARD block: volume_slope10 not positive ({vol_slope_str}, need >0)")
+            level = "HARD"
 
 
 
@@ -3958,6 +3985,15 @@ def hybrid_decision(symbol: str):
 
     # final action
     gate = score_gate
+    # >>> LOG OVERRIDE IN FEAR: Debug low score buys when fear override active
+    try:
+        df4h_btc_log = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+        rsi4h_btc_log = float(df4h_btc_log['RSI'].iloc[-1]) if df4h_btc_log is not None and len(df4h_btc_log) > 0 and pd.notna(df4h_btc_log['RSI'].iloc[-1]) else None
+        if rsi4h_btc_log is not None and rsi4h_btc_log < 35 and raw_score < SCORE_GATE_HARD_MIN:
+            logger.info(f"[FEAR-OVERRIDE] {symbol}: Fear override buy with score {raw_score:.1f} despite gate {gate:.1f} (RSI4h={rsi4h_btc_log:.1f}<35)")
+    except Exception:
+        pass
+    
     if exec_allowed and raw_score >= gate:
         action = "buy"
     else:
@@ -4769,6 +4805,12 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                             prearm_ceiling = loop._prearm_ceiling
 
                             if last_price >= prearm_ceiling:
+                                # >>> PREARM ENFORCE MIN_HOLD: Check minimum hold time before prearm-stop
+                                duration_sec = time.time() - opened_at_ts  # opened_at_ts is already a timestamp
+                                if duration_sec < MIN_HOLD_SECONDS:
+                                    logger.debug(f"[prearm-stop-short] {symbol}: Skipping prearm-stop (duration={duration_sec:.0f}s < {MIN_HOLD_SECONDS}s)")
+                                    continue  # No sell early - enforce minimum hold
+                                
                                 logger.info(f"[prearm-stop-short] {symbol} hit {prearm_ceiling:.4f} (entry={entry_price:.4f}) — exit before arming")
                                 close_short(symbol, amount_to_sell, trade_id=trade_id, source="prearm-stop-short")
                                 time.sleep(EXIT_CHECK_EVERY_SEC)
@@ -4789,6 +4831,12 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                             prearm_floor = cand_floor if prearm_floor is None else max(prearm_floor, cand_floor)
 
                             if last_price <= prearm_floor:
+                                # >>> PREARM ENFORCE MIN_HOLD: Check minimum hold time before prearm-stop
+                                duration_sec = time.time() - opened_at_ts  # opened_at_ts is already a timestamp
+                                if duration_sec < MIN_HOLD_SECONDS:
+                                    logger.debug(f"[prearm-stop] {symbol}: Skipping prearm-stop (duration={duration_sec:.0f}s < {MIN_HOLD_SECONDS}s)")
+                                    continue  # No sell early - enforce minimum hold
+                                
                                 logger.info(f"[prearm-stop] {symbol} hit {prearm_floor:.4f} (entry={entry_price:.4f}) — exit before arming")
                                 sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="prearm-stop")
                                 time.sleep(EXIT_CHECK_EVERY_SEC)
@@ -6561,11 +6609,14 @@ def trade_once_with_report(symbol: str):
                     
                     if ema50_1h_dca is not None and price_now < ema50_1h_dca and cooldown_ok(symbol, HYBRID_DCA_COOLDOWN_H):
                         # Execute DCA buy
-                        # >>> INCREASE HYBRID_DCA_AMOUNT IN VOL SPIKES: Double size si RVOL>1.5
+                        # >>> INCREASE HYBRID_DCA_AMOUNT IN VOL SPIKES: Triple if RVOL15>2.0, double if >1.5
                         dca_amount_dynamic = HYBRID_DCA_AMOUNT
                         try:
-                            rvol15_dca = float(snap1h_dca.get('RVOL10') or 0.0)
-                            if rvol15_dca > 1.5:  # Vol spike (not bad thin)
+                            snap15_dca = quick_tf_snapshot(symbol, "15m", limit=60) or {}
+                            rvol15_dca = float(snap15_dca.get('RVOL10') or snap15_dca.get('RVOL') or 0.0)
+                            if rvol15_dca > 2.0:  # Extreme vol spike - triple size
+                                dca_amount_dynamic = HYBRID_DCA_AMOUNT * 3
+                            elif rvol15_dca > 1.5:  # Vol spike - double size
                                 dca_amount_dynamic = HYBRID_DCA_AMOUNT * 2
                         except Exception:
                             pass
