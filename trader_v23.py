@@ -1,7 +1,7 @@
 
 
 # =========================
-# trader_v22.py -- ver variable VERSION
+# trader_v23.py -- ver variable VERSION
 # =========================
 from __future__ import annotations
 from pathlib import Path
@@ -32,7 +32,7 @@ load_dotenv()
 # >>> STRATEGY PROFILE (ANCHOR SP0)
 # Selector de estrategia
 
-VERSION = "v22"
+VERSION = "v23"
 PARK_IN_MOMENTUM = bool(int(os.getenv("PARK_IN_MOMENTUM", "0")))
 
 STRATEGY_PROFILES = {"USDT_MOMENTUM", "BTC_PARK", "AUTO_HYBRID"}
@@ -4759,6 +4759,61 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
 
                 last_price = get_last_price(symbol)  # or your own px getter
 
+                # === DENTRO DE dynamic_trailing_stop, justo después de calcular duration_sec ===
+                # NUEVA LÓGICA RAPID-KILL MEJORADA
+                duration_sec = time.time() - opened_at_ts
+                gain_pct = (last_price / entry_price - 1.0) * 100.0
+                
+                # Track highest price for new high check
+                if not hasattr(loop, '_highest_price'):
+                    loop._highest_price = purchase_price
+                if last_price > loop._highest_price:
+                    loop._highest_price = last_price
+                has_new_high = last_price >= loop._highest_price * 0.999  # tolerancia 0.1%
+
+                # 1) Rapid-kill más apretado en fear (0.4% en vez de 0.7%)
+                rsi4h_btc = None
+                try:
+                    df4h_btc = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+                    if df4h_btc is not None and len(df4h_btc) > 0:
+                        rsi4h_btc = float(df4h_btc['RSI'].iloc[-1]) if pd.notna(df4h_btc['RSI'].iloc[-1]) else None
+                except Exception:
+                    pass
+
+                if rsi4h_btc is not None and rsi4h_btc < 35:
+                    rapid_kill_threshold = 0.40   # era 0.7
+                else:
+                    rapid_kill_threshold = 0.60   # un poco más laxo fuera de fear
+
+                # 2) Si lleva más de 30 minutos sin hacer nuevo high → rapid-kill también
+                minutes_since_entry = duration_sec / 60
+                if minutes_since_entry > 30 and not has_new_high:
+                    rapid_kill_threshold = min(rapid_kill_threshold, gain_pct + 0.05)  # lo saca casi en cero
+
+                # Aplicar rapid-kill
+                if gain_pct > rapid_kill_threshold:
+                    # Ya tiene profit suficiente → arma trailing normal (tu lógica actual sigue)
+                    pass
+                elif gain_pct > 0.05:  # está ligeramente en verde
+                    if minutes_since_entry > 25 and not has_new_high:
+                        logger.info(f"🔪 Rapid-kill por estancamiento: {symbol} +{gain_pct:.2f}% en {minutes_since_entry:.0f}min sin nuevo high")
+                        if mode == 'short':
+                            close_short(symbol, amount_to_sell, trade_id=trade_id, source="rapid-kill")
+                        else:
+                            sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="rapid-kill")
+                        time.sleep(EXIT_CHECK_EVERY_SEC)
+                        continue
+
+                # Corte duro si lleva mucho tiempo y está en pérdida clara
+                if minutes_since_entry > 40 and gain_pct < -0.9:
+                    logger.info(f"🛑 Corte de emergencia: {symbol} {gain_pct:.2f}% después de {minutes_since_entry:.0f}min")
+                    if mode == 'short':
+                        close_short(symbol, amount_to_sell, trade_id=trade_id, source="emergency_cut")
+                    else:
+                        sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="emergency_cut")
+                    time.sleep(EXIT_CHECK_EVERY_SEC)
+                    continue
+
                 # >>> CATASTROPHIC FLOOR (HOOK SAFE1)
                 try:
                     if mode == 'short':
@@ -5071,9 +5126,21 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                     # Donchian lower (already calculated above for structural_exit, but store for stop calculation)
                     donchian_lower_val = donchian_lower(df1h, length=DONCHIAN_LEN_EXIT)
                 
-                # >>> BREAK-EVEN: Move stop to BE when trade reaches BE_R_MULT (1.3R)
+                # >>> BREAK-EVEN: Move stop to BE when trade reaches BE_R_MULT (dinámico: 1.8 en fear, 1.5 fuera)
                 be_stop_candidate = None
-                if gain_in_R >= BE_R_MULT:
+                # BE más tardío en fear (1.8 vs 1.5)
+                be_r_mult_dynamic = BE_R_MULT
+                try:
+                    df4h_btc_be = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+                    if df4h_btc_be is not None and len(df4h_btc_be) > 0:
+                        rsi4h_btc_be = float(df4h_btc_be['RSI'].iloc[-1]) if pd.notna(df4h_btc_be['RSI'].iloc[-1]) else None
+                        if rsi4h_btc_be is not None and rsi4h_btc_be < 35:
+                            be_r_mult_dynamic = 1.8  # Más tardío en fear
+                        else:
+                            be_r_mult_dynamic = 1.5  # Normal fuera de fear
+                except Exception:
+                    pass
+                if gain_in_R >= be_r_mult_dynamic:
                     # Move stop to break-even (entry + fees)
                     be_stop_candidate = purchase_price * (1.0 + required_edge_pct() / 100.0)
                 
