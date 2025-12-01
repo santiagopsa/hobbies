@@ -4983,11 +4983,11 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                         vol_ok  = (rvol15 is not None and float(rvol15) >= rvol15_min)
 
                         if bad_15m and bad_1h and vol_ok:
-                        logger.info(f"[rapid-kill] {symbol} RSI15={rsi15:.1f} MACDh15={macdh15:.3f} "
-                                    f"RSI1h={rsi1h:.1f} RVOL15={float(rvol15):.2f}")
-                        sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="rapid-kill")
-                        time.sleep(EXIT_CHECK_EVERY_SEC)
-                        continue
+                            logger.info(f"[rapid-kill] {symbol} RSI15={rsi15:.1f} MACDh15={macdh15:.3f} "
+                                        f"RSI1h={rsi1h:.1f} RVOL15={float(rvol15):.2f}")
+                            sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="rapid-kill")
+                            time.sleep(EXIT_CHECK_EVERY_SEC)
+                            continue
                 except Exception as e:
                     logger.warning(f"[rapid-kill] check failed {symbol}: {e}")
 
