@@ -4905,28 +4905,28 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                                         pass  # Will be handled in trailing logic
                             else:
                                 # For longs: normal prearm floor (price going down = loss)
-                            floor_by_loss = entry_price * (1.0 - PREARM_MAX_LOSS_BPS * 0.0001)
-                            floor_by_atr  = entry_price * (1.0 - max(0.0, atr_pct) * PREARM_ATR_MULT * 0.01)
-                            cand_floor = max(floor_by_loss, floor_by_atr)   # tighter of the two
-                            prearm_floor = cand_floor if prearm_floor is None else max(prearm_floor, cand_floor)
+                                floor_by_loss = entry_price * (1.0 - PREARM_MAX_LOSS_BPS * 0.0001)
+                                floor_by_atr  = entry_price * (1.0 - max(0.0, atr_pct) * PREARM_ATR_MULT * 0.01)
+                                cand_floor = max(floor_by_loss, floor_by_atr)   # tighter of the two
+                                prearm_floor = cand_floor if prearm_floor is None else max(prearm_floor, cand_floor)
 
-                            if last_price <= prearm_floor:
-                                # >>> PREARM ENFORCE MIN_HOLD: Check minimum hold time before prearm-stop
-                                duration_sec = time.time() - opened_at_ts  # opened_at_ts is already a timestamp
-                                if duration_sec < MIN_HOLD_SECONDS:
-                                    logger.debug(f"[prearm-stop] {symbol}: Skipping prearm-stop (duration={duration_sec:.0f}s < {MIN_HOLD_SECONDS}s)")
-                                    continue  # No sell early - enforce minimum hold
-                                
-                                logger.info(f"[prearm-stop] {symbol} hit {prearm_floor:.4f} (entry={entry_price:.4f}) — exit before arming")
-                                sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="prearm-stop")
-                                time.sleep(EXIT_CHECK_EVERY_SEC)
-                                continue
+                                if last_price <= prearm_floor:
+                                    # >>> PREARM ENFORCE MIN_HOLD: Check minimum hold time before prearm-stop
+                                    duration_sec = time.time() - opened_at_ts  # opened_at_ts is already a timestamp
+                                    if duration_sec < MIN_HOLD_SECONDS:
+                                        logger.debug(f"[prearm-stop] {symbol}: Skipping prearm-stop (duration={duration_sec:.0f}s < {MIN_HOLD_SECONDS}s)")
+                                        continue  # No sell early - enforce minimum hold
+                                    
+                                    logger.info(f"[prearm-stop] {symbol} hit {prearm_floor:.4f} (entry={entry_price:.4f}) — exit before arming")
+                                    sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="prearm-stop")
+                                    time.sleep(EXIT_CHECK_EVERY_SEC)
+                                    continue
 
-                            if minutes_open >= ARM_TIME_MAX_MIN:
-                                trail_armed = True
-                                # seed your trail manager with an absolute floor clamp
-                                set_symbol_trailing(symbol, trail_bps=None, absolute_floor=prearm_floor)  # implement clamp inside
-                                logger.info(f"[prearm-arm] {symbol} auto-armed after {minutes_open:.1f}m; floor={prearm_floor:.4f}")
+                                if minutes_open >= ARM_TIME_MAX_MIN:
+                                    trail_armed = True
+                                    # seed your trail manager with an absolute floor clamp
+                                    set_symbol_trailing(symbol, trail_bps=None, absolute_floor=prearm_floor)  # implement clamp inside
+                                    logger.info(f"[prearm-arm] {symbol} auto-armed after {minutes_open:.1f}m; floor={prearm_floor:.4f}")
                 except Exception as e:
                     logger.warning(f"[prearm] check failed {symbol}: {e}")
                     # If entry_price was the issue, try to fetch it from DB
