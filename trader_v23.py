@@ -149,7 +149,7 @@ STRONG_TREND_K_UNSTABLE = 2.5
 # Execution / risk
 MIN_NOTIONAL = 8.0
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "10"))  # Max parallel trades (configurable via .env)
-RESERVE_USDT = 100.0
+RESERVE_USDT = 20.0
 RISK_FRACTION = 0.18  # base fraction per trade (modulated)
 
 # >>> EQUITY GUARD / CIRCUIT BREAKER (ANCHOR EQGUARD)
