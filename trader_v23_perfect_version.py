@@ -1,7 +1,7 @@
 
 
 # =========================
-# trader_v22.py -- ver variable VERSION
+# trader_v23.py -- ver variable VERSION
 # =========================
 from __future__ import annotations
 from pathlib import Path
@@ -32,7 +32,7 @@ load_dotenv()
 # >>> STRATEGY PROFILE (ANCHOR SP0)
 # Selector de estrategia
 
-VERSION = "v22"
+VERSION = "v23"
 PARK_IN_MOMENTUM = bool(int(os.getenv("PARK_IN_MOMENTUM", "0")))
 
 STRATEGY_PROFILES = {"USDT_MOMENTUM", "BTC_PARK", "AUTO_HYBRID"}
@@ -123,7 +123,7 @@ AUTO_SAFE_ATRP_BTC = float(os.getenv("AUTO_SAFE_ATRP_BTC", "1.2"))  # ATR% 30d d
 DB_NAME = "trading_real.db"
 LOG_PATH = os.path.expanduser("~/hobbies/trading.log")
 
-TOP_COINS = ['BTC','ETH','BNB','SOL','XRP','TRX','DOGE','ADA','AVAX','MATIC','UNI','LINK','ATOM']  # +4 coins: DOGE, ADA, AVAX, MATIC
+TOP_COINS = ['BTC','ETH','BNB','SOL','XRP','TRX','DOGE','ADA','AVAX','MATIC']  # +4 coins: DOGE, ADA, AVAX, MATIC
 SELECTED_CRYPTOS = [f"{c}/USDT" for c in TOP_COINS]
 
 # >>> REGIME/BREADTH CONFIG (ANCHOR RBG)
@@ -4759,6 +4759,61 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
 
                 last_price = get_last_price(symbol)  # or your own px getter
 
+                # === DENTRO DE dynamic_trailing_stop, justo después de calcular duration_sec ===
+                # NUEVA LÓGICA RAPID-KILL MEJORADA
+                duration_sec = time.time() - opened_at_ts
+                gain_pct = (last_price / entry_price - 1.0) * 100.0
+                
+                # Track highest price for new high check
+                if not hasattr(loop, '_highest_price'):
+                    loop._highest_price = purchase_price
+                if last_price > loop._highest_price:
+                    loop._highest_price = last_price
+                has_new_high = last_price >= loop._highest_price * 0.999  # tolerancia 0.1%
+
+                # 1) Rapid-kill más apretado en fear (0.4% en vez de 0.7%)
+                rsi4h_btc = None
+                try:
+                    df4h_btc = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+                    if df4h_btc is not None and len(df4h_btc) > 0:
+                        rsi4h_btc = float(df4h_btc['RSI'].iloc[-1]) if pd.notna(df4h_btc['RSI'].iloc[-1]) else None
+                except Exception:
+                    pass
+
+                if rsi4h_btc is not None and rsi4h_btc < 35:
+                    rapid_kill_threshold = 0.40   # era 0.7
+                else:
+                    rapid_kill_threshold = 0.60   # un poco más laxo fuera de fear
+
+                # 2) Si lleva más de 30 minutos sin hacer nuevo high → rapid-kill también
+                minutes_since_entry = duration_sec / 60
+                if minutes_since_entry > 30 and not has_new_high:
+                    rapid_kill_threshold = min(rapid_kill_threshold, gain_pct + 0.05)  # lo saca casi en cero
+
+                # Aplicar rapid-kill
+                if gain_pct > rapid_kill_threshold:
+                    # Ya tiene profit suficiente → arma trailing normal (tu lógica actual sigue)
+                    pass
+                elif gain_pct > 0.05:  # está ligeramente en verde
+                    if minutes_since_entry > 25 and not has_new_high:
+                        logger.info(f"🔪 Rapid-kill por estancamiento: {symbol} +{gain_pct:.2f}% en {minutes_since_entry:.0f}min sin nuevo high")
+                        if mode == 'short':
+                            close_short(symbol, amount_to_sell, trade_id=trade_id, source="rapid-kill")
+                        else:
+                            sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="rapid-kill")
+                        time.sleep(EXIT_CHECK_EVERY_SEC)
+                        continue
+
+                # Corte duro si lleva mucho tiempo y está en pérdida clara
+                if minutes_since_entry > 40 and gain_pct < -0.9:
+                    logger.info(f"🛑 Corte de emergencia: {symbol} {gain_pct:.2f}% después de {minutes_since_entry:.0f}min")
+                    if mode == 'short':
+                        close_short(symbol, amount_to_sell, trade_id=trade_id, source="emergency_cut")
+                    else:
+                        sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="emergency_cut")
+                    time.sleep(EXIT_CHECK_EVERY_SEC)
+                    continue
+
                 # >>> CATASTROPHIC FLOOR (HOOK SAFE1)
                 try:
                     if mode == 'short':
@@ -4803,59 +4858,75 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                     if PREARM_ENABLE and not trail_armed:
                         minutes_open = (time.time() - opened_at_ts) / 60.0
                         
-                        if mode == 'short':
-                            # For shorts: prearm ceiling (price going up = loss)
-                            ceiling_by_loss = entry_price * (1.0 + PREARM_MAX_LOSS_BPS * 0.0001)  # Above entry
-                            ceiling_by_atr = entry_price * (1.0 + max(0.0, atr_pct) * PREARM_ATR_MULT * 0.01)  # Above entry
-                            cand_ceiling = min(ceiling_by_loss, ceiling_by_atr)  # tighter (lower) of the two
-                            if not hasattr(loop, '_prearm_ceiling'):
-                                loop._prearm_ceiling = cand_ceiling
-                            loop._prearm_ceiling = min(loop._prearm_ceiling, cand_ceiling)  # Tightest (lowest) ceiling
-                            prearm_ceiling = loop._prearm_ceiling
-
-                            if last_price >= prearm_ceiling:
-                                # >>> PREARM ENFORCE MIN_HOLD: Check minimum hold time before prearm-stop
-                                duration_sec = time.time() - opened_at_ts  # opened_at_ts is already a timestamp
-                                if duration_sec < MIN_HOLD_SECONDS:
-                                    logger.debug(f"[prearm-stop-short] {symbol}: Skipping prearm-stop (duration={duration_sec:.0f}s < {MIN_HOLD_SECONDS}s)")
-                                    continue  # No sell early - enforce minimum hold
-                                
-                                logger.info(f"[prearm-stop-short] {symbol} hit {prearm_ceiling:.4f} (entry={entry_price:.4f}) — exit before arming")
-                                close_short(symbol, amount_to_sell, trade_id=trade_id, source="prearm-stop-short")
-                                time.sleep(EXIT_CHECK_EVERY_SEC)
-                                continue
-                            
-                            if minutes_open >= ARM_TIME_MAX_MIN:
-                                trail_armed = True
-                                logger.info(f"[prearm-arm-short] {symbol} auto-armed after {minutes_open:.1f}m; ceiling={prearm_ceiling:.4f}")
-                                # Set ceiling for trailing (inverse of floor for longs)
-                                if hasattr(loop, '_prearm_ceiling'):
-                                    # For shorts: ceiling = max price, stop below it
-                                    pass  # Will be handled in trailing logic
+                        # >>> RAPID/PREARM GRACE IN FEAR: If RSI4h<35 and gain>0.2%, delay 30min
+                        rsi4h_btc_prearm = None
+                        try:
+                            df4h_btc_prearm = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+                            if df4h_btc_prearm is not None and len(df4h_btc_prearm) > 0:
+                                rsi4h_btc_prearm = float(df4h_btc_prearm['RSI'].iloc[-1]) if pd.notna(df4h_btc_prearm['RSI'].iloc[-1]) else None
+                        except Exception:
+                            pass
+                        
+                        # Skip prearm check if in grace period (fear + positive gain)
+                        prearm_grace_active = (rsi4h_btc_prearm is not None and rsi4h_btc_prearm < 35 and gain_pct > 0.2 and minutes_open < 30)
+                        if prearm_grace_active:
+                            logger.debug(f"[prearm-grace-fear] {symbol}: Skipping prearm (RSI4h={rsi4h_btc_prearm:.1f}<35, gain={gain_pct:.2f}%, {minutes_open:.1f}m < 30m grace)")
+                            # Skip prearm check, continue to next check
                         else:
-                            # For longs: normal prearm floor (price going down = loss)
-                            floor_by_loss = entry_price * (1.0 - PREARM_MAX_LOSS_BPS * 0.0001)
-                            floor_by_atr  = entry_price * (1.0 - max(0.0, atr_pct) * PREARM_ATR_MULT * 0.01)
-                            cand_floor = max(floor_by_loss, floor_by_atr)   # tighter of the two
-                            prearm_floor = cand_floor if prearm_floor is None else max(prearm_floor, cand_floor)
+                            # Continue with normal prearm logic
+                            if mode == 'short':
+                                # For shorts: prearm ceiling (price going up = loss)
+                                ceiling_by_loss = entry_price * (1.0 + PREARM_MAX_LOSS_BPS * 0.0001)  # Above entry
+                                ceiling_by_atr = entry_price * (1.0 + max(0.0, atr_pct) * PREARM_ATR_MULT * 0.01)  # Above entry
+                                cand_ceiling = min(ceiling_by_loss, ceiling_by_atr)  # tighter (lower) of the two
+                                if not hasattr(loop, '_prearm_ceiling'):
+                                    loop._prearm_ceiling = cand_ceiling
+                                loop._prearm_ceiling = min(loop._prearm_ceiling, cand_ceiling)  # Tightest (lowest) ceiling
+                                prearm_ceiling = loop._prearm_ceiling
 
-                            if last_price <= prearm_floor:
-                                # >>> PREARM ENFORCE MIN_HOLD: Check minimum hold time before prearm-stop
-                                duration_sec = time.time() - opened_at_ts  # opened_at_ts is already a timestamp
-                                if duration_sec < MIN_HOLD_SECONDS:
-                                    logger.debug(f"[prearm-stop] {symbol}: Skipping prearm-stop (duration={duration_sec:.0f}s < {MIN_HOLD_SECONDS}s)")
-                                    continue  # No sell early - enforce minimum hold
+                                if last_price >= prearm_ceiling:
+                                    # >>> PREARM ENFORCE MIN_HOLD: Check minimum hold time before prearm-stop
+                                    duration_sec = time.time() - opened_at_ts  # opened_at_ts is already a timestamp
+                                    if duration_sec < MIN_HOLD_SECONDS:
+                                        logger.debug(f"[prearm-stop-short] {symbol}: Skipping prearm-stop (duration={duration_sec:.0f}s < {MIN_HOLD_SECONDS}s)")
+                                        continue  # No sell early - enforce minimum hold
+                                    
+                                    logger.info(f"[prearm-stop-short] {symbol} hit {prearm_ceiling:.4f} (entry={entry_price:.4f}) — exit before arming")
+                                    close_short(symbol, amount_to_sell, trade_id=trade_id, source="prearm-stop-short")
+                                    time.sleep(EXIT_CHECK_EVERY_SEC)
+                                    continue
                                 
-                                logger.info(f"[prearm-stop] {symbol} hit {prearm_floor:.4f} (entry={entry_price:.4f}) — exit before arming")
-                                sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="prearm-stop")
-                                time.sleep(EXIT_CHECK_EVERY_SEC)
-                                continue
+                                if minutes_open >= ARM_TIME_MAX_MIN:
+                                    trail_armed = True
+                                    logger.info(f"[prearm-arm-short] {symbol} auto-armed after {minutes_open:.1f}m; ceiling={prearm_ceiling:.4f}")
+                                    # Set ceiling for trailing (inverse of floor for longs)
+                                    if hasattr(loop, '_prearm_ceiling'):
+                                        # For shorts: ceiling = max price, stop below it
+                                        pass  # Will be handled in trailing logic
+                            else:
+                                # For longs: normal prearm floor (price going down = loss)
+                                floor_by_loss = entry_price * (1.0 - PREARM_MAX_LOSS_BPS * 0.0001)
+                                floor_by_atr  = entry_price * (1.0 - max(0.0, atr_pct) * PREARM_ATR_MULT * 0.01)
+                                cand_floor = max(floor_by_loss, floor_by_atr)   # tighter of the two
+                                prearm_floor = cand_floor if prearm_floor is None else max(prearm_floor, cand_floor)
 
-                            if minutes_open >= ARM_TIME_MAX_MIN:
-                                trail_armed = True
-                                # seed your trail manager with an absolute floor clamp
-                                set_symbol_trailing(symbol, trail_bps=None, absolute_floor=prearm_floor)  # implement clamp inside
-                                logger.info(f"[prearm-arm] {symbol} auto-armed after {minutes_open:.1f}m; floor={prearm_floor:.4f}")
+                                if last_price <= prearm_floor:
+                                    # >>> PREARM ENFORCE MIN_HOLD: Check minimum hold time before prearm-stop
+                                    duration_sec = time.time() - opened_at_ts  # opened_at_ts is already a timestamp
+                                    if duration_sec < MIN_HOLD_SECONDS:
+                                        logger.debug(f"[prearm-stop] {symbol}: Skipping prearm-stop (duration={duration_sec:.0f}s < {MIN_HOLD_SECONDS}s)")
+                                        continue  # No sell early - enforce minimum hold
+                                    
+                                    logger.info(f"[prearm-stop] {symbol} hit {prearm_floor:.4f} (entry={entry_price:.4f}) — exit before arming")
+                                    sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="prearm-stop")
+                                    time.sleep(EXIT_CHECK_EVERY_SEC)
+                                    continue
+
+                                if minutes_open >= ARM_TIME_MAX_MIN:
+                                    trail_armed = True
+                                    # seed your trail manager with an absolute floor clamp
+                                    set_symbol_trailing(symbol, trail_bps=None, absolute_floor=prearm_floor)  # implement clamp inside
+                                    logger.info(f"[prearm-arm] {symbol} auto-armed after {minutes_open:.1f}m; floor={prearm_floor:.4f}")
                 except Exception as e:
                     logger.warning(f"[prearm] check failed {symbol}: {e}")
                     # If entry_price was the issue, try to fetch it from DB
@@ -4878,29 +4949,45 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
 
                 # >>> RAPID DETERIORATION KILL (HOOK SAFE3)
                 try:
-                    tf15 = quick_tf_snapshot(symbol, "15m", limit=40) or {}
-                    tf1h = quick_tf_snapshot(symbol, "1h",  limit=60) or {}
+                    # >>> RAPID/PREARM GRACE IN FEAR: If RSI4h<35 and gain>0.2%, delay 30min
+                    rsi4h_btc_rapid = None
+                    try:
+                        df4h_btc_rapid = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+                        if df4h_btc_rapid is not None and len(df4h_btc_rapid) > 0:
+                            rsi4h_btc_rapid = float(df4h_btc_rapid['RSI'].iloc[-1]) if pd.notna(df4h_btc_rapid['RSI'].iloc[-1]) else None
+                    except Exception:
+                        pass
+                    
+                    # Grace period: skip rapid-kill if in fear and positive
+                    rapid_kill_grace_active = (rsi4h_btc_rapid is not None and rsi4h_btc_rapid < 35 and gain_pct > 0.2 and minutes_since_entry < 30)
+                    if rapid_kill_grace_active:
+                        logger.debug(f"[rapid-kill-grace-fear] {symbol}: Skipping rapid-kill (RSI4h={rsi4h_btc_rapid:.1f}<35, gain={gain_pct:.2f}%, {minutes_since_entry:.1f}m < 30m grace)")
+                        # Skip rapid-kill check, continue to next check
+                    else:
+                        # Continue with normal rapid-kill logic
+                        tf15 = quick_tf_snapshot(symbol, "15m", limit=40) or {}
+                        tf1h = quick_tf_snapshot(symbol, "1h",  limit=60) or {}
 
-                    rsi15   = tf15.get("RSI")
-                    macdh15 = (tf15.get("MACD-h") or tf15.get("MACDh") or tf15.get("MACD_HIST"))
-                    rvol15  = (tf15.get("RVOL_live") or tf15.get("RVOL10_live") or tf15.get("RVOL") or tf15.get("RVOL10"))
-                    rsi1h   = tf1h.get("RSI")
+                        rsi15   = tf15.get("RSI")
+                        macdh15 = (tf15.get("MACD-h") or tf15.get("MACDh") or tf15.get("MACD_HIST"))
+                        rvol15  = (tf15.get("RVOL_live") or tf15.get("RVOL10_live") or tf15.get("RVOL") or tf15.get("RVOL10"))
+                        rsi1h   = tf1h.get("RSI")
 
-                    # Slightly looser for BTC/ETH (optional)
-                    rsi15_max = RK_RSI15_MAX + (3 if base in {"BTC","ETH"} else 0)
-                    rsi1h_max = RK_RSI1H_MAX + (2 if base in {"BTC","ETH"} else 0)
-                    rvol15_min = RK_RVOL15_MIN - (0.2 if base in {"BTC","ETH"} else 0.0)
+                        # Slightly looser for BTC/ETH (optional)
+                        rsi15_max = RK_RSI15_MAX + (3 if base in {"BTC","ETH"} else 0)
+                        rsi1h_max = RK_RSI1H_MAX + (2 if base in {"BTC","ETH"} else 0)
+                        rvol15_min = RK_RVOL15_MIN - (0.2 if base in {"BTC","ETH"} else 0.0)
 
-                    bad_15m = (rsi15 is not None and rsi15 <= rsi15_max) and (macdh15 is not None and macdh15 <= RK_MACDH15_MAX)
-                    bad_1h  = (rsi1h is not None and rsi1h <= rsi1h_max)
-                    vol_ok  = (rvol15 is not None and float(rvol15) >= rvol15_min)
+                        bad_15m = (rsi15 is not None and rsi15 <= rsi15_max) and (macdh15 is not None and macdh15 <= RK_MACDH15_MAX)
+                        bad_1h  = (rsi1h is not None and rsi1h <= rsi1h_max)
+                        vol_ok  = (rvol15 is not None and float(rvol15) >= rvol15_min)
 
-                    if bad_15m and bad_1h and vol_ok:
-                        logger.info(f"[rapid-kill] {symbol} RSI15={rsi15:.1f} MACDh15={macdh15:.3f} "
-                                    f"RSI1h={rsi1h:.1f} RVOL15={float(rvol15):.2f}")
-                        sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="rapid-kill")
-                        time.sleep(EXIT_CHECK_EVERY_SEC)
-                        continue
+                        if bad_15m and bad_1h and vol_ok:
+                            logger.info(f"[rapid-kill] {symbol} RSI15={rsi15:.1f} MACDh15={macdh15:.3f} "
+                                        f"RSI1h={rsi1h:.1f} RVOL15={float(rvol15):.2f}")
+                            sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="rapid-kill")
+                            time.sleep(EXIT_CHECK_EVERY_SEC)
+                            continue
                 except Exception as e:
                     logger.warning(f"[rapid-kill] check failed {symbol}: {e}")
 
@@ -5071,9 +5158,21 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                     # Donchian lower (already calculated above for structural_exit, but store for stop calculation)
                     donchian_lower_val = donchian_lower(df1h, length=DONCHIAN_LEN_EXIT)
                 
-                # >>> BREAK-EVEN: Move stop to BE when trade reaches BE_R_MULT (1.3R)
+                # >>> BREAK-EVEN: Move stop to BE when trade reaches BE_R_MULT (dinámico: 1.8 en fear, 1.5 fuera)
                 be_stop_candidate = None
-                if gain_in_R >= BE_R_MULT:
+                # BE más tardío en fear (1.8 vs 1.5)
+                be_r_mult_dynamic = BE_R_MULT
+                try:
+                    df4h_btc_be = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+                    if df4h_btc_be is not None and len(df4h_btc_be) > 0:
+                        rsi4h_btc_be = float(df4h_btc_be['RSI'].iloc[-1]) if pd.notna(df4h_btc_be['RSI'].iloc[-1]) else None
+                        if rsi4h_btc_be is not None and rsi4h_btc_be < 35:
+                            be_r_mult_dynamic = 1.8  # Más tardío en fear
+                        else:
+                            be_r_mult_dynamic = 1.5  # Normal fuera de fear
+                except Exception:
+                    pass
+                if gain_in_R >= be_r_mult_dynamic:
                     # Move stop to break-even (entry + fees)
                     be_stop_candidate = purchase_price * (1.0 + required_edge_pct() / 100.0)
                 
@@ -5567,12 +5666,24 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 rsi1h_for_rebound = float(df1h['RSI'].iloc[-1]) if pd.notna(df1h['RSI'].iloc[-1]) else None
                 rebound_enabled = REBOUND_GUARD_ENABLED and (rsi1h_for_rebound is None or rsi1h_for_rebound >= 45)
                 
+                # >>> EMA20 RECLAIM GRACE: If RSI4h<35, require 3 bars reclaim fail instead of 2
+                rebound_wait_bars_dynamic = REBOUND_WAIT_BARS_15M
+                try:
+                    df4h_btc_rebound = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+                    if df4h_btc_rebound is not None and len(df4h_btc_rebound) > 0:
+                        rsi4h_btc_rebound = float(df4h_btc_rebound['RSI'].iloc[-1]) if pd.notna(df4h_btc_rebound['RSI'].iloc[-1]) else None
+                        if rsi4h_btc_rebound is not None and rsi4h_btc_rebound < 35:
+                            rebound_wait_bars_dynamic = 3  # Grace fear: 3 bars instead of 2
+                            logger.debug(f"[rebound-grace-fear] {symbol}: Using 3 bars wait (RSI4h={rsi4h_btc_rebound:.1f}<35)")
+                except Exception:
+                    pass
+                
                 if structural_exit and rebound_enabled:
                     try:
                         if rebound_pending_until is None:
-                            rebound_pending_until = time.time() + REBOUND_WAIT_BARS_15M * 15 * 60
+                            rebound_pending_until = time.time() + rebound_wait_bars_dynamic * 15 * 60
                             last_exit_trigger_reason = 'structure'
-                            logger.info(f"[rebound-guard] {symbol} structural exit pending for {REBOUND_WAIT_BARS_15M}x15m")
+                            logger.info(f"[rebound-guard] {symbol} structural exit pending for {rebound_wait_bars_dynamic}x15m")
 
                         cancel_exit = False
                         df15r = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=60)
