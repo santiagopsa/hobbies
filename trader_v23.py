@@ -23,6 +23,8 @@ except ImportError:
     # Note: logger not yet defined, will log later after logger initialization
 
 PARK_LOCK = threading.Lock()
+# >>> CACHE RSI4h BTC: Module-level cache with TTL 300s
+_RSI4H_BTC_CACHE = {'rsi': None, 'ts': 0}
 # =========================
 # Config & initialization
 # =========================
@@ -358,8 +360,8 @@ TIER2_K_TIGHTEN = 0.5      # reducción extra de k
 DONCHIAN_LEN_EXIT = 20     # N-bar low para salida de tendencia si se pierde estructura
 
 # Time-stop por barras del TF 1h
-TIME_STOP_BARS_1H = int(os.getenv("TIME_STOP_BARS_1H", "8"))  # ~8h base (increased from 3 for swing trading)
-TIME_STOP_EXTEND_BARS = int(os.getenv("TIME_STOP_EXTEND_BARS", "24"))  # hasta 1 día si tape mejora (increased from 6)
+TIME_STOP_BARS_1H = int(os.getenv("TIME_STOP_BARS_1H", "12"))  # ~12h base (increased from 8 for swing trading)
+TIME_STOP_EXTEND_BARS = int(os.getenv("TIME_STOP_EXTEND_BARS", "48"))  # hasta 2 días si tape mejora (increased from 24)
 # >>> CHAN PATCH CONFIG END
 
 
@@ -821,7 +823,8 @@ def hold_in_volume(symbol: str) -> dict:
     if _DECAY_STREAK[symbol] >= DECAY_BARS:
         return {"hold": False, "trail_bps": int(HOLD_TRAIL_WIDE_BPS * 0.5), "partial": 0.0}
 
-    if rvol15 >= 2.0 and adx1h >= 30:  # Updated hold min + ADX
+    # >>> UNIFY THRESHOLDS: Use env vars instead of hardcoded
+    if rvol15 >= HOLD_RVOL15_MIN and adx1h >= HOLD_ADX1H_MIN:
         return {"hold": True, "trail_bps": HOLD_TRAIL_WIDE_BPS * 1.2, "partial": 0.3}  # Widen trail, partial at 1R
 
     return {"hold": False, "trail_bps": None, "partial": 0.0}
@@ -2081,7 +2084,7 @@ def backtest_strategy() -> dict:
                         rsi_min = float(os.getenv("BACKTEST_RSI_MIN", str(RSI_MIN_DEFAULT)))
                         adx_min = float(os.getenv("BACKTEST_ADX_MIN", str(ADX_MIN_DEFAULT)))
                         if rsi >= rsi_min and rsi <= 70 and adx >= adx_min and vol_slope > 0:
-                            mode = 'swing'
+                            mode = 'momentum'
                     
                     if mode:
                         # Calculate position size
@@ -2193,7 +2196,7 @@ def backtest_strategy() -> dict:
         total_return = ((balance - initial_balance) / initial_balance * 100.0) if initial_balance > 0 else 0.0
         
         # Statistics by mode
-        swing_trades = [t for t in trades if t.get('mode') == 'swing']
+        momentum_trades = [t for t in trades if t.get('mode') == 'momentum' or t.get('mode') == 'swing']  # Support both for backward compatibility
         dca_trades = [t for t in trades if t.get('mode') == 'dca']
         short_trades = [t for t in trades if t.get('mode') == 'short']
         
@@ -2360,7 +2363,7 @@ def hybrid_preflight(symbol: str) -> tuple[str | None, str]:
     Hybrid preflight determines entry mode:
     - 'dca': If RSI4h < RSI_FEAR_PROXY and vol_slope > 0 (fear proxy: DCA mode)
     - 'short': If RSI1h > HYBRID_SHORT_RSI_MAX and vol_slope < 0 (overbought: short mode)
-    - 'swing': Normal swing entry (default)
+    - 'momentum': Normal momentum entry (default, renamed from 'swing')
     Returns (mode, reason) tuple.
     """
     try:
@@ -2376,11 +2379,20 @@ def hybrid_preflight(symbol: str) -> tuple[str | None, str]:
             ema50 = float(df1h['EMA50'].iloc[-1]) if pd.notna(df1h['EMA50'].iloc[-1]) else None
             price = float(df1h['close'].iloc[-1])
             vol_slope = calculate_vol_slope(df1h, periods=10)
+            
+            # Get RSI4h for BTC (market proxy for DCA decision)
+            rsi4h_btc = None
+            try:
+                df4h_btc = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+                if df4h_btc is not None and len(df4h_btc) > 0:
+                    rsi4h_btc = float(df4h_btc['RSI'].iloc[-1]) if pd.notna(df4h_btc['RSI'].iloc[-1]) else None
+            except Exception:
+                pass
         except Exception:
             return None, "data calculation error"
         
-        # >>> DCA Mode: Fear proxy + vol rising (dips with volume recovery) + RVOL15 check
-        if HYBRID_DCA_ENABLED and rsi4h < RSI_FEAR_PROXY and vol_slope > HYBRID_SHORT_VOL_SLOPE_MIN:
+        # >>> DCA Mode: Fear proxy (RSI4h BTC < 35) + vol rising (dips with volume recovery) + RVOL15 check
+        if HYBRID_DCA_ENABLED and rsi4h_btc is not None and rsi4h_btc < 35 and vol_slope > HYBRID_SHORT_VOL_SLOPE_MIN:
             # Check RVOL15 before allowing DCA (skip DCA if volume too thin)
             try:
                 df15 = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=50)
@@ -2391,19 +2403,21 @@ def hybrid_preflight(symbol: str) -> tuple[str | None, str]:
                 logger.debug(f"RVOL15 check error for DCA {symbol}: {e}")
                 return None, f"DCA blocked: RVOL15 check failed"
             
-            return 'dca', f"Fear proxy: Trigger DCA (RSI4h={rsi4h:.1f}<{RSI_FEAR_PROXY}, vol_slope={vol_slope:.2f}, RVOL15={rvol15_closed:.2f})"
+            return 'dca', f"Fear proxy: Trigger DCA (RSI4h_BTC={rsi4h_btc:.1f}<35, vol_slope={vol_slope:.2f}, RVOL15={rvol15_closed:.2f})"
         
         # >>> Short Mode: Overbought + vol falling (hedge downs)
         if HYBRID_SHORT_ENABLED and rsi1h > HYBRID_SHORT_RSI_MAX and vol_slope < HYBRID_SHORT_VOL_SLOPE_MIN:
             return 'short', f"Overbought: Trigger short (RSI1h={rsi1h:.1f}>{HYBRID_SHORT_RSI_MAX}, vol_slope={vol_slope:.2f})"
         
-        # >>> Swing Mode: Normal entry (default)
-        # Check vol_slope for swing (JSON edge: >0 required)
+        # >>> 2-MODES THESIS: 'dca' vs 'momentum' (instead of 'swing')
+        # If RSI4h BTC < 35: mode = 'dca' (already handled above), else mode = 'momentum'
+        # Momentum mode: Normal entry (default, renamed from 'swing')
+        # Check vol_slope for momentum (JSON edge: >0 required)
         if vol_slope <= 0:
             return None, "Vol slope not rising – skip low quality"
         
-        # Continue with normal swing preflight (hybrid_decision will handle)
-        return 'swing', "OK for swing"
+        # Continue with normal momentum preflight (hybrid_decision will handle)
+        return 'momentum', "OK for momentum"
     except Exception as e:
         logger.debug(f"hybrid_preflight error {symbol}: {e}")
         return None, f"error: {e}"
@@ -4610,10 +4624,10 @@ def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"
     except Exception as e:
         logger.error(f"sell_symbol error {symbol}: {e}")
 
-def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, trade_id: str, atr_abs: float, mode: str = 'swing'):
+def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, trade_id: str, atr_abs: float, mode: str = 'momentum'):
     """
     Dynamic trailing stop for hybrid modes:
-    - 'swing': Normal swing trailing (default)
+    - 'momentum': Normal momentum trailing (default, renamed from 'swing')
     - 'dca': Wider trailing (k*=1.5), disable decay (DCA in dips)
     - 'short': Inverse trailing (trail from low, exit if price > stop)
     """
@@ -4640,6 +4654,11 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 return n > 0
             except Exception:
                 return False
+        
+        def cleanup_trade_state():
+            # >>> POP STATE ON CLOSE: Cleanup trade state when trade closes
+            if hasattr(loop, '_trade_states'):
+                loop._trade_states.pop(trade_id, None)
 
         try:
             if not symbol or amount <= 0 or not purchase_price:
@@ -4724,6 +4743,8 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
             RK_MACDH15_MAX = float(os.getenv("RK_MACDH15_MAX", "0"))
             RK_RSI1H_MAX   = float(os.getenv("RK_RSI1H_MAX", "50"))
             RK_RVOL15_MIN  = float(os.getenv("RK_RVOL15_MIN", "1.20"))
+            RK_GRACE_MIN = int(os.getenv("RK_GRACE_MIN", "10"))  # Grace period: 10 minutes
+            RK_MIN_DD_BPS = int(os.getenv("RK_MIN_DD_BPS", "15"))  # 0.15% minimum drawdown
 
             opened_at_ts = time.time()     # or your entry timestamp
             prearm_floor = None            # hard floor while trail not armed
@@ -4764,21 +4785,30 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 duration_sec = time.time() - opened_at_ts
                 gain_pct = (last_price / entry_price - 1.0) * 100.0
                 
-                # Track highest price for new high check
-                if not hasattr(loop, '_highest_price'):
-                    loop._highest_price = purchase_price
-                if last_price > loop._highest_price:
-                    loop._highest_price = last_price
-                has_new_high = last_price >= loop._highest_price * 0.999  # tolerancia 0.1%
+                # Track highest price for new high check (local state per trade)
+                if not hasattr(loop, '_trade_states'):
+                    loop._trade_states = {}
+                state = loop._trade_states.get(trade_id, {})
+                if 'highest_price' not in state:
+                    state['highest_price'] = purchase_price
+                if last_price > state['highest_price']:
+                    state['highest_price'] = last_price
+                loop._trade_states[trade_id] = state
+                has_new_high = last_price >= state['highest_price'] * 0.999  # tolerancia 0.1%
 
                 # 1) Rapid-kill más apretado en fear (0.4% en vez de 0.7%)
+                # >>> CACHE BTC RSI4h: Cache with 300s TTL
                 rsi4h_btc = None
-                try:
-                    df4h_btc = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
-                    if df4h_btc is not None and len(df4h_btc) > 0:
-                        rsi4h_btc = float(df4h_btc['RSI'].iloc[-1]) if pd.notna(df4h_btc['RSI'].iloc[-1]) else None
-                except Exception:
-                    pass
+                if not hasattr(loop, '_rsi4h_btc_cache') or time.time() - loop._rsi4h_btc_cache.get('ts', 0) > 300:
+                    try:
+                        df4h_btc = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+                        if df4h_btc is not None and len(df4h_btc) > 0:
+                            rsi4h_btc = float(df4h_btc['RSI'].iloc[-1]) if pd.notna(df4h_btc['RSI'].iloc[-1]) else None
+                            loop._rsi4h_btc_cache = {'rsi': rsi4h_btc, 'ts': time.time()}
+                    except Exception:
+                        pass
+                else:
+                    rsi4h_btc = loop._rsi4h_btc_cache.get('rsi')
 
                 if rsi4h_btc is not None and rsi4h_btc < 35:
                     rapid_kill_threshold = 0.40   # era 0.7
@@ -4795,7 +4825,19 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                     # Ya tiene profit suficiente → arma trailing normal (tu lógica actual sigue)
                     pass
                 elif gain_pct > 0.05:  # está ligeramente en verde
-                    if minutes_since_entry > 25 and not has_new_high:
+                    # >>> STALL TO TIGHTEN-BE: Convert stall to raise stop to BE +0.05%
+                    if mode == 'dca' or duration_sec < MIN_HOLD_SECONDS or gain_pct > 0.4:
+                        # No estancamiento kill for DCA, min hold, or green gains
+                        pass
+                    elif minutes_since_entry > 25 and not has_new_high and 0.05 < gain_pct < 0.4:
+                        # Tighten to BE +0.05% instead of selling
+                        be_floor = entry_price * (1.0 + 0.0005)  # BE +0.05%
+                        set_symbol_trailing(symbol, absolute_floor=be_floor, ttl_sec=3600)  # 1 hour TTL
+                        logger.info(f"Tighten to BE: {symbol} +{gain_pct:.2f}% estancamiento (BE+0.05%={be_floor:.4f})")
+                        # No sell, let trail continue
+                        pass
+                    elif minutes_since_entry > 25 and not has_new_high and gain_pct >= 0.4:
+                        # Still sell if gain >= 0.4% (original behavior for higher gains)
                         logger.info(f"🔪 Rapid-kill por estancamiento: {symbol} +{gain_pct:.2f}% en {minutes_since_entry:.0f}min sin nuevo high")
                         if mode == 'short':
                             close_short(symbol, amount_to_sell, trade_id=trade_id, source="rapid-kill")
@@ -4811,6 +4853,7 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                         close_short(symbol, amount_to_sell, trade_id=trade_id, source="emergency_cut")
                     else:
                         sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="emergency_cut")
+                    cleanup_trade_state()
                     time.sleep(EXIT_CHECK_EVERY_SEC)
                     continue
 
@@ -4948,48 +4991,63 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                             pass
 
                 # >>> RAPID DETERIORATION KILL (HOOK SAFE3)
-                try:
-                    # >>> RAPID/PREARM GRACE IN FEAR: If RSI4h<35 and gain>0.2%, delay 30min
-                    rsi4h_btc_rapid = None
+                # Disable SAFE3 for DCA mode (no rapid-kill in fear DCA)
+                if mode == 'dca':
+                    logger.debug(f"[safe3-dca] {symbol}: Skipping SAFE3 rapid-kill (DCA mode)")
+                else:
                     try:
-                        df4h_btc_rapid = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
-                        if df4h_btc_rapid is not None and len(df4h_btc_rapid) > 0:
-                            rsi4h_btc_rapid = float(df4h_btc_rapid['RSI'].iloc[-1]) if pd.notna(df4h_btc_rapid['RSI'].iloc[-1]) else None
-                    except Exception:
-                        pass
-                    
-                    # Grace period: skip rapid-kill if in fear and positive
-                    rapid_kill_grace_active = (rsi4h_btc_rapid is not None and rsi4h_btc_rapid < 35 and gain_pct > 0.2 and minutes_since_entry < 30)
-                    if rapid_kill_grace_active:
-                        logger.debug(f"[rapid-kill-grace-fear] {symbol}: Skipping rapid-kill (RSI4h={rsi4h_btc_rapid:.1f}<35, gain={gain_pct:.2f}%, {minutes_since_entry:.1f}m < 30m grace)")
-                        # Skip rapid-kill check, continue to next check
-                    else:
-                        # Continue with normal rapid-kill logic
-                        tf15 = quick_tf_snapshot(symbol, "15m", limit=40) or {}
-                        tf1h = quick_tf_snapshot(symbol, "1h",  limit=60) or {}
+                        # >>> RAPID/PREARM GRACE IN FEAR: If RSI4h<35 and gain>0.2%, delay 30min
+                        rsi4h_btc_rapid = None
+                        try:
+                            df4h_btc_rapid = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+                            if df4h_btc_rapid is not None and len(df4h_btc_rapid) > 0:
+                                rsi4h_btc_rapid = float(df4h_btc_rapid['RSI'].iloc[-1]) if pd.notna(df4h_btc_rapid['RSI'].iloc[-1]) else None
+                        except Exception:
+                            pass
+                        
+                        # Grace period: skip rapid-kill if in fear and positive
+                        rapid_kill_grace_active = (rsi4h_btc_rapid is not None and rsi4h_btc_rapid < 35 and gain_pct > 0.2 and minutes_since_entry < 30)
+                        if rapid_kill_grace_active:
+                            logger.debug(f"[rapid-kill-grace-fear] {symbol}: Skipping rapid-kill (RSI4h={rsi4h_btc_rapid:.1f}<35, gain={gain_pct:.2f}%, {minutes_since_entry:.1f}m < 30m grace)")
+                            # Skip rapid-kill check, continue to next check
+                        else:
+                            # Continue with normal rapid-kill logic
+                            # >>> RAPID-KILL GRACE/MIN DD: Kill only if loss/flat after grace 10min/min_dd 0.15%
+                            minutes = (time.time() - opened_at_ts) / 60.0
+                            dd_bps = max(0.0, (entry_price - last_price) / entry_price * 10000)
+                            
+                            if minutes >= RK_GRACE_MIN and dd_bps >= RK_MIN_DD_BPS:
+                                tf15 = quick_tf_snapshot(symbol, "15m", limit=40) or {}
+                                tf1h = quick_tf_snapshot(symbol, "1h",  limit=60) or {}
 
-                        rsi15   = tf15.get("RSI")
-                        macdh15 = (tf15.get("MACD-h") or tf15.get("MACDh") or tf15.get("MACD_HIST"))
-                        rvol15  = (tf15.get("RVOL_live") or tf15.get("RVOL10_live") or tf15.get("RVOL") or tf15.get("RVOL10"))
-                        rsi1h   = tf1h.get("RSI")
+                                rsi15   = tf15.get("RSI")
+                                macdh15 = (tf15.get("MACD-h") or tf15.get("MACDh") or tf15.get("MACD_HIST"))
+                                rvol15  = (tf15.get("RVOL_live") or tf15.get("RVOL10_live") or tf15.get("RVOL") or tf15.get("RVOL10"))
+                                rsi1h   = tf1h.get("RSI")
 
-                        # Slightly looser for BTC/ETH (optional)
-                        rsi15_max = RK_RSI15_MAX + (3 if base in {"BTC","ETH"} else 0)
-                        rsi1h_max = RK_RSI1H_MAX + (2 if base in {"BTC","ETH"} else 0)
-                        rvol15_min = RK_RVOL15_MIN - (0.2 if base in {"BTC","ETH"} else 0.0)
+                                # Slightly looser for BTC/ETH (optional)
+                                rsi15_max = RK_RSI15_MAX + (3 if base in {"BTC","ETH"} else 0)
+                                rsi1h_max = RK_RSI1H_MAX + (2 if base in {"BTC","ETH"} else 0)
+                                rvol15_min = RK_RVOL15_MIN - (0.2 if base in {"BTC","ETH"} else 0.0)
 
-                        bad_15m = (rsi15 is not None and rsi15 <= rsi15_max) and (macdh15 is not None and macdh15 <= RK_MACDH15_MAX)
-                        bad_1h  = (rsi1h is not None and rsi1h <= rsi1h_max)
-                        vol_ok  = (rvol15 is not None and float(rvol15) >= rvol15_min)
+                                bad_15m = (rsi15 is not None and rsi15 <= rsi15_max) and (macdh15 is not None and macdh15 <= RK_MACDH15_MAX)
+                                bad_1h  = (rsi1h is not None and rsi1h <= rsi1h_max)
+                                vol_ok  = (rvol15 is not None and float(rvol15) >= rvol15_min)
 
-                        if bad_15m and bad_1h and vol_ok:
-                            logger.info(f"[rapid-kill] {symbol} RSI15={rsi15:.1f} MACDh15={macdh15:.3f} "
-                                        f"RSI1h={rsi1h:.1f} RVOL15={float(rvol15):.2f}")
-                            sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="rapid-kill")
-                            time.sleep(EXIT_CHECK_EVERY_SEC)
-                            continue
-                except Exception as e:
-                    logger.warning(f"[rapid-kill] check failed {symbol}: {e}")
+                                if bad_15m and bad_1h and vol_ok:
+                                    # >>> MIN HOLD CHECK: Unify min hold for all exits
+                                    duration_sec = time.time() - opened_at_ts
+                                    if duration_sec < MIN_HOLD_SECONDS:
+                                        logger.debug(f"[rapid-kill] {symbol}: Skipping rapid-kill (duration={duration_sec:.0f}s < {MIN_HOLD_SECONDS}s)")
+                                    else:
+                                        logger.info(f"[rapid-kill] {symbol} RSI15={rsi15:.1f} MACDh15={macdh15:.3f} "
+                                                    f"RSI1h={rsi1h:.1f} RVOL15={float(rvol15):.2f}")
+                                        sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="rapid-kill")
+                                        cleanup_trade_state()
+                                        time.sleep(EXIT_CHECK_EVERY_SEC)
+                                        continue
+                    except Exception as e:
+                        logger.warning(f"[rapid-kill] check failed {symbol}: {e}")
 
                 # >>> TIGHT TRAIL @ +3% (HOOK TIGHT3)
                 try:
@@ -5020,6 +5078,7 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
 
                 if trade_is_closed():
                     logger.info(f"[trailing] {symbol} trade {trade_id} already closed — stopping trailing thread.")
+                    cleanup_trade_state()
                     return
 
                 price = fetch_price(symbol)
@@ -5052,31 +5111,51 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
 
                 # Immediate guard on 15m EMA20 / recent swing-low
                 # >>> EXIT CONFIRMATION (2x closed below EMA20 OR 1x below + MACDh15<0 & ADX1h slope≤0) (ANCHOR EXITCONF)
-                try:
-                    df15c = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=80)
-                    if df15c is not None and len(df15c) > 25:
-                        # two CLOSED bars check
-                        ema20_15_c = float(ta.ema(df15c['close'], length=20).shift(1).iloc[-1])
-                        c1 = float(df15c['close'].shift(1).iloc[-1])
-                        c2 = float(df15c['close'].shift(2).iloc[-1])
-                        two_below = (c1 < ema20_15_c) and (c2 < ema20_15_c)
+                # No ema20_confirmed for DCA mode
+                if mode != 'dca':
+                    try:
+                        df15c = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=80)
+                        if df15c is not None and len(df15c) > 25:
+                            # two CLOSED bars check
+                            ema20_15_c = float(ta.ema(df15c['close'], length=20).shift(1).iloc[-1])
+                            c1 = float(df15c['close'].shift(1).iloc[-1])
+                            c2 = float(df15c['close'].shift(2).iloc[-1])
+                            two_below = (c1 < ema20_15_c) and (c2 < ema20_15_c)
 
-                        # 1-bar + MACDh15<0 + ADX1h slope≤0
-                        macd15c = ta.macd(df15c['close'], fast=12, slow=26, signal=9)['MACDh_12_26_9']
-                        macd15_neg = float(macd15c.shift(1).iloc[-1]) < 0.0 if macd15c is not None else False
-                        try:
-                            adx_series = ta.adx(df1h['high'], df1h['low'], df1h['close'], length=14)['ADX_14']
-                            adx_slope6 = linregress(np.arange(6), adx_series.iloc[-6:]).slope
-                        except Exception:
-                            adx_slope6 = 0.0
-                        one_below_now = float(df15c['close'].iloc[-1]) < float(ta.ema(df15c['close'], length=20).iloc[-1])
-                        conf_exit = two_below or (one_below_now and macd15_neg and (adx_slope6 <= 0))
+                            # 1-bar + MACDh15<0 + ADX1h slope≤0
+                            macd15c = ta.macd(df15c['close'], fast=12, slow=26, signal=9)['MACDh_12_26_9']
+                            macd15_neg = float(macd15c.shift(1).iloc[-1]) < 0.0 if macd15c is not None else False
+                            adx_slope6 = None
+                            try:
+                                adx_series = ta.adx(df1h['high'], df1h['low'], df1h['close'], length=14)['ADX_14'].dropna()
+                                if len(adx_series) >= 6:
+                                    adx_slope6 = linregress(np.arange(6), adx_series.iloc[-6:]).slope
+                            except Exception:
+                                pass
+                            one_below_now = float(df15c['close'].iloc[-1]) < float(ta.ema(df15c['close'], length=20).iloc[-1])
+                            conf_exit = two_below or (one_below_now and macd15_neg and (adx_slope6 is not None and adx_slope6 <= 0))
 
-                        if conf_exit:
-                            sell_symbol(symbol, amount, trade_id, source="ema20_15m_confirmed")
-                            return
-                except Exception as e:
-                    logger.warning(f"[exit][{symbol}] exit confirmation check failed: {e}")
+                            if conf_exit:
+                                # >>> MIN HOLD CHECK: Unify min hold for all exits
+                                duration_sec = (datetime.now(timezone.utc) - opened_ts).total_seconds()
+                                if duration_sec < MIN_HOLD_SECONDS:
+                                    logger.debug(f"[ema20-exit] {symbol}: Skipping ema20 exit (duration={duration_sec:.0f}s < {MIN_HOLD_SECONDS}s)")
+                                else:
+                                    sell_symbol(symbol, amount, trade_id, source="ema20_15m_confirmed")
+                                    cleanup_trade_state()
+                                    return
+                    except Exception as e:
+                        logger.warning(f"[exit][{symbol}] exit confirmation check failed: {e}")
+                
+                # >>> DCA TAKE-PROFIT: +1.5R take-profit for DCA mode
+                if mode == 'dca':
+                    gain_pct = (price / purchase_price - 1.0) * 100.0
+                    ATR_MULT = INIT_STOP_ATR_MULT  # Use INIT_STOP_ATR_MULT as ATR_MULT
+                    if gain_pct > 1.5 * ATR_MULT:
+                        logger.info(f"[take-profit-dca] {symbol}: DCA take-profit triggered (gain={gain_pct:.2f}% > {1.5 * ATR_MULT:.2f}%)")
+                        sell_symbol(symbol, amount, trade_id, source="take_profit_dca")
+                        cleanup_trade_state()
+                        return
 
 
                 # 1h context
@@ -5300,12 +5379,16 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 # Analysis shows: best exits are pure price + ATR, not based on RSI/ADX/RVOL/slopes
                 # These variables are good for filtering entries, not for deciding exits
                 
-                # Track highest price for MFE calculation (for kill switch)
-                if not hasattr(loop, '_highest_price'):
-                    loop._highest_price = purchase_price
-                if price > loop._highest_price:
-                    loop._highest_price = price
-                mfe_in_R = (loop._highest_price - purchase_price) / initial_R if initial_R > 0 else 0.0
+                # Track highest price for MFE calculation (for kill switch) - local state per trade
+                if not hasattr(loop, '_trade_states'):
+                    loop._trade_states = {}
+                state = loop._trade_states.get(trade_id, {})
+                if 'highest_price' not in state:
+                    state['highest_price'] = purchase_price
+                if price > state['highest_price']:
+                    state['highest_price'] = price
+                loop._trade_states[trade_id] = state
+                mfe_in_R = (state['highest_price'] - purchase_price) / initial_R if initial_R > 0 else 0.0
                 
                 # Regime flag for kill-switch: trending = either strong local trend or global regime OK
                 try:
@@ -5520,6 +5603,14 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 except Exception:
                     n_bars = None
                 if n_bars is not None and n_bars >= TIME_STOP_BARS_1H:
+                    gain_pct = (price / purchase_price - 1.0) * 100.0
+                    vol_slope = calculate_vol_slope(df1h, periods=10)
+                    
+                    # Extend time-stop if gain>0.5% and vol_slope>0
+                    time_stop_extend_bars = TIME_STOP_EXTEND_BARS
+                    if gain_pct > 0.5 and vol_slope > 0:
+                        time_stop_extend_bars = 48  # 2 days 1h
+                    
                     tape_improving = True
                     try:
                         adx_series = ta.adx(df1h['high'], df1h['low'], df1h['close'], length=14)['ADX_14']
@@ -5529,10 +5620,9 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                         tape_improving = (adx_slope is not None and adx_slope >= TAPE_IMPROVING_ADX_SLOPE_MIN) and vwap_ok
                     except Exception:
                         tape_improving = False
-                    if not tape_improving or n_bars >= TIME_STOP_EXTEND_BARS:
+                    if not tape_improving or n_bars >= time_stop_extend_bars:
                         # >>> MEJORADO: Sólo matamos si el trade no despegó o es claramente perdedor
                         # Si vamos claramente en verde, no usamos time-stop, dejamos que el trailing mande
-                        gain_pct = (price / purchase_price - 1.0) * 100.0
                         if gain_pct < -0.5:
                             logger.info(f"[time-stop] {symbol}: Exiting loss (gain={gain_pct:.2f}%, bars={n_bars})")
                             sell_symbol(symbol, amount, trade_id, source="time_stop_bars_loss")
@@ -7297,6 +7387,16 @@ if __name__ == "__main__":
 
             cycle_decisions = []
             
+            # >>> CACHE RSI4h BTC: Update cache if expired (TTL 300s)
+            if time.time() - _RSI4H_BTC_CACHE['ts'] > 300:
+                try:
+                    df4h_btc_main = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+                    if df4h_btc_main is not None and len(df4h_btc_main) > 0:
+                        _RSI4H_BTC_CACHE['rsi'] = float(df4h_btc_main['RSI'].iloc[-1]) if pd.notna(df4h_btc_main['RSI'].iloc[-1]) else None
+                        _RSI4H_BTC_CACHE['ts'] = time.time()
+                except Exception:
+                    pass
+            
             # >>> EQUITY GUARD / CIRCUIT BREAKER (ANCHOR EQGUARD)
             # Check equity guard before scanning symbols
             equity_block, equity_reason = check_equity_guard()
@@ -7309,10 +7409,11 @@ if __name__ == "__main__":
             # Replace FGI gate with RSI4h<40 check (same effect, no API dependency)
             # RSI4h<40 = fear proxy (JSON q25 36), force cycle (allow entries in dips)
             try:
-                # Check RSI4h for BTC (market proxy)
-                df4h_btc = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
-                rsi4h_btc = None
-                if df4h_btc is not None and len(df4h_btc) >= 14:
+                # Check RSI4h for BTC (market proxy) - use cached value
+                rsi4h_btc = _RSI4H_BTC_CACHE.get('rsi')
+                if rsi4h_btc is None:
+                    df4h_btc = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
+                    if df4h_btc is not None and len(df4h_btc) >= 14:
                     try:
                         rsi4h_btc = float(df4h_btc['RSI'].iloc[-1]) if pd.notna(df4h_btc['RSI'].iloc[-1]) else None
                     except Exception:
