@@ -4825,26 +4825,40 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                     # Ya tiene profit suficiente → arma trailing normal (tu lógica actual sigue)
                     pass
                 elif gain_pct > 0.05:  # está ligeramente en verde
-                    # >>> STALL TO TIGHTEN-BE: Convert stall to raise stop to BE +0.05%
-                    if mode == 'dca' or duration_sec < MIN_HOLD_SECONDS or gain_pct > 0.4:
-                        # No estancamiento kill for DCA, min hold, or green gains
+                    # >>> DISABLE STALL FOR DCA/FEAR/ADJUST: Skip if mode=='dca' or RSI4h<35, or adjust >120min/gain<0.4/vol_slope<0
+                    if mode == 'dca' or (rsi4h_btc is not None and rsi4h_btc < 35):
+                        # No stall kill for DCA or fear (RSI4h<35)
                         pass
-                    elif minutes_since_entry > 25 and not has_new_high and 0.05 < gain_pct < 0.4:
-                        # Tighten to BE +0.05% instead of selling
-                        be_floor = entry_price * (1.0 + 0.0005)  # BE +0.05%
-                        set_symbol_trailing(symbol, absolute_floor=be_floor, ttl_sec=3600)  # 1 hour TTL
-                        logger.info(f"Tighten to BE: {symbol} +{gain_pct:.2f}% estancamiento (BE+0.05%={be_floor:.4f})")
-                        # No sell, let trail continue
+                    elif duration_sec < MIN_HOLD_SECONDS or gain_pct > 0.4:
+                        # No stall kill for min hold or green gains
                         pass
-                    elif minutes_since_entry > 25 and not has_new_high and gain_pct >= 0.4:
-                        # Still sell if gain >= 0.4% (original behavior for higher gains)
-                        logger.info(f"🔪 Rapid-kill por estancamiento: {symbol} +{gain_pct:.2f}% en {minutes_since_entry:.0f}min sin nuevo high")
-                        if mode == 'short':
-                            close_short(symbol, amount_to_sell, trade_id=trade_id, source="rapid-kill")
-                        else:
-                            sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="rapid-kill")
-                        time.sleep(EXIT_CHECK_EVERY_SEC)
-                        continue
+                    else:
+                        # Check for stall conditions: >120min, gain<0.4%, vol_slope<0
+                        vol_slope = None
+                        try:
+                            df1h_stall = fetch_and_prepare_data_hybrid(symbol, timeframe="1h", limit=50)
+                            if df1h_stall is not None and len(df1h_stall) >= 10:
+                                vol_slope = calculate_vol_slope(df1h_stall, periods=10)
+                        except Exception:
+                            pass
+                        
+                        if minutes_since_entry > 120 and gain_pct < 0.4 and (vol_slope is None or vol_slope < 0):
+                            # Stall kill: >120min, gain<0.4%, vol_slope<0
+                            logger.info(f"Stall kill: {symbol} +{gain_pct:.2f}% after {minutes_since_entry:.0f}min (vol_slope={vol_slope:.2f})")
+                            if mode == 'short':
+                                close_short(symbol, amount_to_sell, trade_id=trade_id, source="stall-kill")
+                            else:
+                                sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="stall-kill")
+                            cleanup_trade_state()
+                            time.sleep(EXIT_CHECK_EVERY_SEC)
+                            continue
+                        elif minutes_since_entry > 25 and not has_new_high and 0.05 < gain_pct < 0.4:
+                            # Tighten to BE +0.05% instead of selling (original stall-to-tighten logic)
+                            be_floor = entry_price * (1.0 + 0.0005)  # BE +0.05%
+                            set_symbol_trailing(symbol, absolute_floor=be_floor, ttl_sec=3600)  # 1 hour TTL
+                            logger.info(f"Tighten to BE: {symbol} +{gain_pct:.2f}% estancamiento (BE+0.05%={be_floor:.4f})")
+                            # No sell, let trail continue
+                            pass
 
                 # Corte duro si lleva mucho tiempo y está en pérdida clara
                 if minutes_since_entry > 40 and gain_pct < -0.9:
@@ -5147,12 +5161,14 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                     except Exception as e:
                         logger.warning(f"[exit][{symbol}] exit confirmation check failed: {e}")
                 
-                # >>> DCA TAKE-PROFIT: +1.5R take-profit for DCA mode
+                # >>> DCA TAKE-PROFIT: Convert TP DCA to Real R_Pct - R_pct = INIT_STOP_ATR_MULT * atr_pct_1h, TP = 1.5 * R_pct
                 if mode == 'dca':
                     gain_pct = (price / purchase_price - 1.0) * 100.0
-                    ATR_MULT = INIT_STOP_ATR_MULT  # Use INIT_STOP_ATR_MULT as ATR_MULT
-                    if gain_pct > 1.5 * ATR_MULT:
-                        logger.info(f"[take-profit-dca] {symbol}: DCA take-profit triggered (gain={gain_pct:.2f}% > {1.5 * ATR_MULT:.2f}%)")
+                    # Calculate ATR% 1h and R_pct
+                    atr_pct_1h = (atr_abs / entry_price * 100.0) if (atr_abs and entry_price) else 2.0
+                    r_pct = INIT_STOP_ATR_MULT * atr_pct_1h
+                    if gain_pct > 1.5 * r_pct:
+                        logger.info(f"[take-profit-dca] {symbol}: DCA take-profit triggered (gain={gain_pct:.2f}% > {1.5 * r_pct:.2f}% = 1.5R, R={r_pct:.2f}%)")
                         sell_symbol(symbol, amount, trade_id, source="take_profit_dca")
                         cleanup_trade_state()
                         return
@@ -7414,10 +7430,10 @@ if __name__ == "__main__":
                 if rsi4h_btc is None:
                     df4h_btc = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="4h", limit=50)
                     if df4h_btc is not None and len(df4h_btc) >= 14:
-                    try:
-                        rsi4h_btc = float(df4h_btc['RSI'].iloc[-1]) if pd.notna(df4h_btc['RSI'].iloc[-1]) else None
-                    except Exception:
-                        pass
+                        try:
+                            rsi4h_btc = float(df4h_btc['RSI'].iloc[-1]) if pd.notna(df4h_btc['RSI'].iloc[-1]) else None
+                        except Exception:
+                            pass
                 
                 # If RSI4h<35 (fear proxy), force cycle (best time for swing entries in deeper dips)
                 if rsi4h_btc is not None and rsi4h_btc < 35:
