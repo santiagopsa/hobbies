@@ -1,7 +1,7 @@
 
 
 # =========================
-# trader_v23.py -- ver variable VERSION
+# trader_v24.py -- ver variable VERSION
 # =========================
 from __future__ import annotations
 from pathlib import Path
@@ -36,7 +36,7 @@ load_dotenv()
 # >>> STRATEGY PROFILE (ANCHOR SP0)
 # Selector de estrategia
 
-VERSION = "v23"
+VERSION = "v24"
 PARK_IN_MOMENTUM = bool(int(os.getenv("PARK_IN_MOMENTUM", "0")))
 
 STRATEGY_PROFILES = {"USDT_MOMENTUM", "BTC_PARK", "AUTO_HYBRID"}
@@ -1042,7 +1042,7 @@ def park_to_btc_if_needed() -> bool:
       PARK_MIN_HOLD_MIN, MIN_NOTIONAL, MIN_RESERVE_USDT.
     """
     # >>> REMOVE MODULE-LEVEL GLOBALS: Use _TRADE_STATES dict instead of PARK_GUARD
-    global _TRADE_STATES
+    # No need for global declaration - we're only mutating the dict
     
     # Get or initialize park state
     park_state = _TRADE_STATES.get(PARK_TRADE_ID, {})
@@ -1081,7 +1081,7 @@ def park_to_btc_if_needed() -> bool:
     # --- helpers locales ---
     def _init_guard():
         # >>> REMOVE MODULE-LEVEL GLOBALS: Use _TRADE_STATES dict
-        global _TRADE_STATES
+        # No need for global declaration - we're only mutating the dict
         with PARK_LOCK:
             if PARK_TRADE_ID not in _TRADE_STATES:
                 _TRADE_STATES[PARK_TRADE_ID] = {
@@ -1106,7 +1106,7 @@ def park_to_btc_if_needed() -> bool:
         return PARK_PROTECT_ENABLED and btc_val_usdt >= max(MIN_NOTIONAL, 25)
 
     def _update_anchor_and_floor(last_px: float):
-        global _TRADE_STATES
+        # No need for global declaration - we're only mutating the dict
         with PARK_LOCK:
             park_state = _TRADE_STATES.get(PARK_TRADE_ID, {})
             if park_state.get("high") is None or last_px > park_state.get("high", 0):
@@ -1119,7 +1119,7 @@ def park_to_btc_if_needed() -> bool:
             _TRADE_STATES[PARK_TRADE_ID] = park_state
 
     def _reentry_trigger_price(current_px: float) -> float:
-        global _TRADE_STATES
+        # No need for global declaration - we're only mutating the dict
         with PARK_LOCK:
             park_state = _TRADE_STATES.get(PARK_TRADE_ID, {})
             base = park_state.get("high") or current_px
@@ -1145,7 +1145,7 @@ def park_to_btc_if_needed() -> bool:
     # (1) Si tengo BTC y guard activo → trailing y vender si rompe piso
     if _floor_guard_active(btc_val):
         _update_anchor_and_floor(btc_px)
-        global _TRADE_STATES
+        # No need for global declaration - we're only mutating the dict
         with PARK_LOCK:
             park_state = _TRADE_STATES.get(PARK_TRADE_ID, {})
             floor = park_state.get("floor") or 0.0
@@ -1168,7 +1168,7 @@ def park_to_btc_if_needed() -> bool:
 
                 try:
                     sell_symbol(symbol, qty_to_sell, trade_id=trade_id, source="park-floor")
-                    global _TRADE_STATES
+                    # No need for global declaration - we're only mutating the dict
                     with PARK_LOCK:
                         park_state = _TRADE_STATES.get(PARK_TRADE_ID, {})
                         park_state["last_change"] = now_epoch
@@ -1182,7 +1182,7 @@ def park_to_btc_if_needed() -> bool:
 
     # (2) Si estoy aparcado (sin BTC) → re-entrada sólo si cooldown + reclaim
     if PARK_PROTECT_ENABLED and btc_free <= 0.0 and usdt_free >= (MIN_NOTIONAL + 1.0):
-        global _TRADE_STATES
+        # No need for global declaration - we're only mutating the dict
         with PARK_LOCK:
             park_state = _TRADE_STATES.get(PARK_TRADE_ID, {})
             last_change = park_state.get("last_change")
@@ -1220,7 +1220,7 @@ def park_to_btc_if_needed() -> bool:
                 except Exception as e:
                     logger.warning(f"[unwind] snapshot entrada falló: {e}")
 
-                global _TRADE_STATES
+                # No need for global declaration - we're only mutating the dict
                 with PARK_LOCK:
                     park_state = _TRADE_STATES.get(PARK_TRADE_ID, {})
                     park_state["last_change"] = now_epoch
@@ -4433,6 +4433,36 @@ def close_short(symbol: str, amount: float, trade_id: str, source: str = "trail"
         except Exception:
             pass
 
+# >>> EXIT TRADE WRAPPER (ANCHOR EXITWRAP): Guarantees cleanup + log + sell/close
+def exit_trade(symbol: str, amount: float, trade_id: str, source: str, is_short: bool = False):
+    """
+    Unified exit wrapper that guarantees cleanup_trade_state() is called.
+    Replaces direct calls to sell_symbol/close_short for full exits.
+    Always cleans up trade state, even if sell/close fails.
+    """
+    try:
+        if is_short:
+            ok = close_short(symbol, amount, trade_id, source)
+        else:
+            ok = sell_symbol(symbol, amount, trade_id, source)
+        if ok:
+            logger.info(f"[exit_trade] {symbol} exited via {source} (is_short={is_short})")
+        else:
+            logger.warning(f"[exit_trade] {symbol} exit failed via {source}")
+    except Exception as e:
+        logger.error(f"[exit_trade] error {symbol} {source}: {e}")
+    finally:
+        # Always cleanup, even if sell/close failed
+        try:
+            if hasattr(exit_trade, '_cleanup_func'):
+                exit_trade._cleanup_func(trade_id)
+            else:
+                # Fallback: cleanup via _TRADE_STATES module-level dict
+                global _TRADE_STATES
+                _TRADE_STATES.pop(trade_id, None)
+        except Exception as cleanup_err:
+            logger.warning(f"[exit_trade] cleanup error {symbol} {trade_id}: {cleanup_err}")
+
 def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"):
     """
     Sell symbol with improved balance checking and retry logic.
@@ -4846,10 +4876,42 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 else:
                     rapid_kill_threshold = 0.60   # un poco más laxo fuera de fear
 
-                # 2) Si lleva más de 30 minutos sin hacer nuevo high → rapid-kill también
+                # 2) Si lleva más de 30 minutos sin hacer nuevo high → tighten a BE+fees solo si deterioro confirmado
                 minutes_since_entry = duration_sec / 60
                 if minutes_since_entry > 30 and not has_new_high:
-                    rapid_kill_threshold = min(rapid_kill_threshold, gain_pct + 0.05)  # lo saca casi en cero
+                    # >>> PATCH A/1: Tighten a BE+fees solo si deterioro confirmado (no kill inmediato)
+                    vol_slope = None
+                    macdh15 = None
+                    try:
+                        # Get vol_slope (reintenta si None)
+                        df1h_no_high = fetch_and_prepare_data_hybrid(symbol, timeframe="1h", limit=50)
+                        if df1h_no_high is not None and len(df1h_no_high) >= 10:
+                            vol_slope = calculate_vol_slope(df1h_no_high, periods=10)
+                        
+                        # Get MACDh15 (check last 2 bars for confirmation)
+                        df15m_no_high = fetch_and_prepare_data_hybrid(symbol, timeframe="15m", limit=20)
+                        if df15m_no_high is not None and len(df15m_no_high) >= 14:
+                            macd15_df = ta.macd(df15m_no_high['close'], fast=12, slow=26, signal=9)
+                            if macd15_df is not None and not macd15_df.empty:
+                                macdh_last = macd15_df['MACDh_12_26_9'].iloc[-1]
+                                macdh_prev = macd15_df['MACDh_12_26_9'].iloc[-2] if len(macd15_df) >= 2 else None
+                                if pd.notna(macdh_last) and (macdh_prev is None or pd.notna(macdh_prev)):
+                                    # Both bars negative = confirmed deterioration
+                                    if float(macdh_last) < 0 and (macdh_prev is None or float(macdh_prev) < 0):
+                                        macdh15 = float(macdh_last)
+                    except Exception as e:
+                        logger.debug(f"[no-new-high] fetch error {symbol}: {e}")
+                    
+                    # Only tighten if deterioration confirmed (vol_slope<0 AND MACDh15<0 for >=2 bars)
+                    if vol_slope is not None and vol_slope < 0 and macdh15 is not None and macdh15 < 0:
+                        # Tighten floor a BE + 0.1% (fees + margin)
+                        fees_bps = FEE_BPS_PER_SIDE * 2  # buy + sell
+                        be_floor = entry_price * (1.0 + (fees_bps / 10000.0) + 0.001)  # BE + fees + 0.1% margin
+                        rapid_kill_threshold_pct = ((be_floor / entry_price) - 1.0) * 100.0
+                        rapid_kill_threshold = min(rapid_kill_threshold, rapid_kill_threshold_pct)
+                        logger.debug(f"[no-new-high-tighten] {symbol}: Tightened to BE+fees ({be_floor:.4f}) due to deterioration (vol_slope={vol_slope:.2f}<0, macdh15={macdh15:.4f}<0)")
+                    else:
+                        logger.debug(f"[no-new-high-skip] {symbol}: No tighten (no deterioration: vol_slope={vol_slope}, macdh15={macdh15})")
 
                 # Aplicar rapid-kill
                 if gain_pct > rapid_kill_threshold:
@@ -4873,17 +4935,25 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                         except Exception:
                             pass
                         
-                        # Adjust: stall kill only if >120min, gain<0.4%, vol_slope<0
-                        if minutes_since_entry > 120 and gain_pct < 0.4 and (vol_slope is None or vol_slope < 0):
-                            # Stall kill: >120min, gain<0.4%, vol_slope<0
-                            logger.info(f"Stall kill: {symbol} +{gain_pct:.2f}% after {minutes_since_entry:.0f}min (vol_slope={vol_slope:.2f})")
-                            if mode == 'short':
-                                close_short(symbol, amount_to_sell, trade_id=trade_id, source="stall-kill")
-                            else:
-                                sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="stall-kill")
-                            cleanup_trade_state()
+                        # >>> PATCH B/2: Stall kill only if >120min, gain<0.4%, vol_slope<0 (fail-open: no kill if vol_slope None)
+                        # Retry vol_slope fetch once if None
+                        if vol_slope is None:
+                            try:
+                                df1h_stall_retry = fetch_and_prepare_data_hybrid(symbol, timeframe="1h", limit=50)
+                                if df1h_stall_retry is not None and len(df1h_stall_retry) >= 10:
+                                    vol_slope = calculate_vol_slope(df1h_stall_retry, periods=10)
+                            except Exception:
+                                pass
+                        
+                        # Only kill if vol_slope is not None and < 0 (fail-open: skip if None)
+                        if minutes_since_entry > 120 and gain_pct < 0.4 and vol_slope is not None and vol_slope < 0:
+                            # Stall kill: >120min, gain<0.4%, vol_slope<0 (confirmed)
+                            logger.info(f"[stall-kill] {symbol} +{gain_pct:.2f}% after {minutes_since_entry:.0f}min (vol_slope={vol_slope:.2f})")
+                            exit_trade(symbol, amount_to_sell, trade_id, "stall-kill", is_short=(mode == 'short'))
                             time.sleep(EXIT_CHECK_EVERY_SEC)
                             continue
+                        elif vol_slope is None:
+                            logger.warning(f"[stall-kill-skip] {symbol}: vol_slope None after retry - no kill (fail-open)")
                         elif minutes_since_entry > 25 and not has_new_high and 0.05 < gain_pct < 0.4:
                             # >>> STAGNATION TIGHTEN TO BE+FEES: Tighten stop to BE + fees, but NO force sell unless deterioration
                             fees_bps = FEE_BPS_PER_SIDE * 2  # buy + sell
@@ -4940,7 +5010,7 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                         price_increase_pct = ((last_price / entry_price) - 1.0) * 100.0
                         if price_increase_pct >= (abs(cata_dd_bps) / 100.0):  # e.g., +3.5% = catastrophic for shorts
                             logger.warning(f"[cata-short] {symbol} price increase {price_increase_pct:.2f}% >= {abs(cata_dd_bps)/100.0:.2f}% — force exit")
-                            close_short(symbol, amount_to_sell, trade_id=trade_id, source="catastrophic-short")
+                            exit_trade(symbol, amount_to_sell, trade_id, "catastrophic-short", is_short=True)
                             time.sleep(EXIT_CHECK_EVERY_SEC)
                             continue
                     else:
@@ -4948,7 +5018,7 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                         dd_bps = int(round((1.0 - (last_price / entry_price)) * 10000))
                         if dd_bps >= cata_dd_bps:
                             logger.warning(f"[cata] {symbol} max DD {dd_bps}bps >= {cata_dd_bps}bps — force exit")
-                            sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="catastrophic")
+                            exit_trade(symbol, amount_to_sell, trade_id, "catastrophic", is_short=False)
                             time.sleep(EXIT_CHECK_EVERY_SEC)
                             continue
                 except Exception as e:
@@ -5006,7 +5076,7 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                                         continue  # No sell early - enforce minimum hold
                                     
                                     logger.info(f"[prearm-stop-short] {symbol} hit {prearm_ceiling:.4f} (entry={entry_price:.4f}) — exit before arming")
-                                    close_short(symbol, amount_to_sell, trade_id=trade_id, source="prearm-stop-short")
+                                    exit_trade(symbol, amount_to_sell, trade_id, "prearm-stop-short", is_short=True)
                                     time.sleep(EXIT_CHECK_EVERY_SEC)
                                     continue
                                 
@@ -5032,7 +5102,7 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                                         continue  # No sell early - enforce minimum hold
                                     
                                     logger.info(f"[prearm-stop] {symbol} hit {prearm_floor:.4f} (entry={entry_price:.4f}) — exit before arming")
-                                    sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="prearm-stop")
+                                    exit_trade(symbol, amount_to_sell, trade_id, "prearm-stop", is_short=False)
                                     time.sleep(EXIT_CHECK_EVERY_SEC)
                                     continue
 
@@ -5109,8 +5179,7 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                                     else:
                                         logger.info(f"[rapid-kill] {symbol} RSI15={rsi15:.1f} MACDh15={macdh15:.3f} "
                                                     f"RSI1h={rsi1h:.1f} RVOL15={float(rvol15):.2f}")
-                                        sell_symbol(symbol, amount_to_sell, trade_id=trade_id, source="rapid-kill")
-                                        cleanup_trade_state()
+                                        exit_trade(symbol, amount_to_sell, trade_id, "rapid-kill", is_short=False)
                                         time.sleep(EXIT_CHECK_EVERY_SEC)
                                         continue
                     except Exception as e:
@@ -5321,9 +5390,9 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 try:
                     rsi4h_btc_be = get_btc_rsi4h_cached()  # Use cached helper
                     if rsi4h_btc_be is not None and rsi4h_btc_be < 35:
-                            be_r_mult_dynamic = 1.8  # Más tardío en fear
-                        else:
-                            be_r_mult_dynamic = 1.5  # Normal fuera de fear
+                        be_r_mult_dynamic = 1.8  # Más tardío en fear
+                    else:
+                        be_r_mult_dynamic = 1.5  # Normal fuera de fear
                 except Exception:
                     pass
                 if gain_in_R >= be_r_mult_dynamic:
@@ -5610,7 +5679,7 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                                 logger.warning(f"[exit-hold] check failed {symbol}: {_e}")
 
 
-                            sell_symbol(symbol, amount, trade_id, source="collapse")
+                            exit_trade(symbol, amount, trade_id, "collapse", is_short=False)
                             return
                     except Exception as e:
                         logger.debug(f"collapse-exit check error {symbol}: {e}")
