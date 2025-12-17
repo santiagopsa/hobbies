@@ -4945,8 +4945,12 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                             except Exception:
                                 pass
                         
+                        # >>> REMOVE STALL KILL IF GREEN: No kill if gain > 0.2%
+                        if gain_pct > 0.2:
+                            # No stall kill if green
+                            pass
                         # Only kill if vol_slope is not None and < 0 (fail-open: skip if None)
-                        if minutes_since_entry > 120 and gain_pct < 0.4 and vol_slope is not None and vol_slope < 0:
+                        elif minutes_since_entry > 120 and gain_pct < 0.4 and vol_slope is not None and vol_slope < 0:
                             # Stall kill: >120min, gain<0.4%, vol_slope<0 (confirmed)
                             logger.info(f"[stall-kill] {symbol} +{gain_pct:.2f}% after {minutes_since_entry:.0f}min (vol_slope={vol_slope:.2f})")
                             exit_trade(symbol, amount_to_sell, trade_id, "stall-kill", is_short=(mode == 'short'))
@@ -5342,6 +5346,27 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 gain_pct_now = (price / purchase_price - 1.0) * 100.0
                 gain_in_R = (price - purchase_price) / initial_R if initial_R > 0 else 0.0
                 
+                # >>> CONNECT HOLD_IN_VOLUME TO TRAILING: Widen/tighten trail based on volume
+                hold_info = hold_in_volume(symbol)
+                if hold_info["hold"]:
+                    # Widen trail and partial if volume persists
+                    if hold_info["trail_bps"] is not None:
+                        # Widen trail using set_symbol_trailing override
+                        set_symbol_trailing(symbol, trail_bps=hold_info["trail_bps"] or int(CHAN_K_STABLE * 100), ttl_sec=300)  # 5min TTL
+                    if hold_info["partial"] > 0 and gain_pct_now >= 1.0:  # At least 1R
+                        try:
+                            pos_qty = current_position_qty(symbol)
+                            partial_amt = pos_qty * hold_info["partial"]
+                            if partial_amt * price >= MIN_NOTIONAL and partial_amt > 0:
+                                execute_order_sell(symbol, partial_amt, signals={"reason": "volume-hold-partial"})
+                                logger.info(f"[hold-volume-partial] {symbol}: Partial take {hold_info['partial']*100:.0f}% at {gain_pct_now:.2f}%")
+                        except Exception as e:
+                            logger.debug(f"hold volume partial sell error {symbol}: {e}")
+                else:
+                    # Decay: Tighten trail
+                    if hold_info["trail_bps"] is not None:
+                        set_symbol_trailing(symbol, trail_bps=hold_info["trail_bps"], ttl_sec=300)  # 5min TTL to tighten
+                
                 # >>> PARTIAL SELL: Take 30% profit at +4% (Full swing core - adjust from +5%)
                 # Trail the rest with wide trailing (1200bps if strong_trend)
                 if gain_pct_now >= 4.0:
@@ -5550,6 +5575,50 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 if _floor:
                     stop_price = max(stop_price, float(_floor))  # hard floor
                 
+                # >>> RAPID-KILL GRACE IN FEAR (Trailing): If RSI4h<35 and gain>0.2%, delay 30min
+                # Calculate minutes since entry and check for new high in trailing section
+                minutes_since_entry_trail = (datetime.now(timezone.utc) - opened_ts).total_seconds() / 60.0
+                has_new_high_trail = price >= state.get('highest_price', purchase_price) * 0.999  # tolerancia 0.1%
+                
+                if mode != 'short':  # Only for longs
+                    try:
+                        rsi4h_btc_trail = get_btc_rsi4h_cached()  # Use cached helper
+                        if rsi4h_btc_trail is not None and rsi4h_btc_trail < 35 and gain_pct_now > 0.2 and minutes_since_entry_trail < 30:
+                            logger.debug(f"[rapid-kill-grace-trailing] {symbol}: Skipping exit (RSI4h={rsi4h_btc_trail:.1f}<35, gain={gain_pct_now:.2f}%, {minutes_since_entry_trail:.1f}m < 30m grace)")
+                            time.sleep(EXIT_CHECK_EVERY_SEC)
+                            continue  # Grace early positive fear - skip exit this iteration
+                    except Exception as e:
+                        logger.debug(f"[rapid-kill-grace-trailing] error: {e}")
+                
+                # >>> EMERGENCY_CUT TIGHTER (Trailing): Trigger at -1.5% after 60min, but skip if trending+ fear (rebound potential)
+                if mode != 'short':  # Only for longs
+                    if minutes_since_entry_trail >= 60 and gain_pct_now < -1.5:
+                        # Check if it's trending and in fear (potential rebound - don't cut)
+                        try:
+                            snap1h_ec = quick_tf_snapshot(symbol, "1h", limit=60) or {}
+                            is_trending = snap1h_ec.get("ADX", 0) >= STRONG_TREND_ADX_1H  # 30
+                            is_fear = False
+                            try:
+                                rsi4h_btc_ec = get_btc_rsi4h_cached()
+                                is_fear = rsi4h_btc_ec is not None and rsi4h_btc_ec < RSI_FEAR_PROXY  # 35
+                            except Exception:
+                                pass
+                            
+                            # Only cut if NOT (trending AND fear) - skip potential rebounds
+                            if not (is_trending and is_fear):
+                                logger.info(f"🛑 [emergency_cut_tighter] {symbol}: {gain_pct_now:.2f}% after {minutes_since_entry_trail:.0f}min (trending={is_trending}, fear={is_fear})")
+                                sell_symbol(symbol, amount, trade_id, source="emergency_cut")
+                                return
+                            else:
+                                logger.debug(f"[emergency_cut_skip] {symbol}: Skipping cut (trending={is_trending}, fear={is_fear} - potential rebound)")
+                        except Exception as e:
+                            logger.debug(f"[emergency_cut] error checking conditions: {e}")
+                            # Fail-open: if we can't check conditions, proceed with cut
+                            if minutes_since_entry_trail >= 60 and gain_pct_now < -1.5:
+                                logger.info(f"🛑 [emergency_cut_tighter] {symbol}: {gain_pct_now:.2f}% after {minutes_since_entry_trail:.0f}min (conditions check failed)")
+                                sell_symbol(symbol, amount, trade_id, source="emergency_cut")
+                                return
+                
                 # >>> SHORT MODE: Inverse trailing (for shorts, trail from low, exit if price > stop)
                 if mode == 'short':
                     # For shorts: track lowest price (inverse of highest) - unified per trade_id
@@ -5742,18 +5811,39 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                         logger.warning(f"[exit][{symbol}] time-stop MACDh15 check failed: {e}")
 
                 # Optional: bar-based time-stop with extension if tape improving
+                # >>> WIDER TIME_STOP IN FEAR: Use 48 bars threshold if RSI4h<35 (instead of 12)
+                time_stop_threshold_bars = TIME_STOP_BARS_1H  # Default 12 bars
+                try:
+                    rsi4h_btc_threshold = get_btc_rsi4h_cached()  # Use cached helper
+                    if rsi4h_btc_threshold is not None and rsi4h_btc_threshold < 35:
+                        time_stop_threshold_bars = TIME_STOP_EXTEND_BARS  # 48 bars in fear
+                        logger.debug(f"[time-stop-fear-threshold] {symbol}: Using {time_stop_threshold_bars} bars threshold (RSI4h={rsi4h_btc_threshold:.1f}<35)")
+                except Exception:
+                    pass
+                
                 try:
                     n_bars = count_closed_bars_since(df1h, opened_ts)
                 except Exception:
                     n_bars = None
-                if n_bars is not None and n_bars >= TIME_STOP_BARS_1H:
+                if n_bars is not None and n_bars >= time_stop_threshold_bars:
                     gain_pct = (price / purchase_price - 1.0) * 100.0
                     vol_slope = calculate_vol_slope(df1h, periods=10)
                     
                     # >>> STRONG_TREND_ADX_1H: Let winners run - extend time-stop for strong trends
+                    # >>> WIDER TIME_STOP IN FEAR: Extend to 12/48 if RSI4h<35
+                    rsi4h_btc_time_stop = None
+                    try:
+                        rsi4h_btc_time_stop = get_btc_rsi4h_cached()  # Use cached helper
+                    except Exception:
+                        pass
+                    
                     if strong_trend:
                         time_stop_extend_bars = TIME_STOP_EXTEND_BARS * 2  # Double extension for strong trends
                         logger.debug(f"[time-stop-strong-trend] {symbol}: Extended to {time_stop_extend_bars} bars (ADX1h={adx1h:.1f}>=30, ADX4h={adx4h:.1f}>=30)")
+                    elif rsi4h_btc_time_stop is not None and rsi4h_btc_time_stop < 35:
+                        # Fear mode: extend to 48 bars (TIME_STOP_EXTEND_BARS)
+                        time_stop_extend_bars = TIME_STOP_EXTEND_BARS  # 48 bars
+                        logger.debug(f"[time-stop-fear] {symbol}: Extended to {time_stop_extend_bars} bars (RSI4h={rsi4h_btc_time_stop:.1f}<35)")
                     elif gain_pct > 0.5 and vol_slope > 0:
                         time_stop_extend_bars = TIME_STOP_EXTEND_BARS
                         logger.debug(f"[time-stop] {symbol}: Extended to {time_stop_extend_bars} bars (gain={gain_pct:.2f}%, vol_slope={vol_slope:.2f})")
@@ -6640,6 +6730,28 @@ def get_open_trades_count() -> int:
     return int(cnt)
 
 # >>> EQUITY GUARD / CIRCUIT BREAKER FUNCTIONS (ANCHOR EQGUARD)
+def close_all_opens(reason: str = "equity_guard") -> None:
+    """
+    Emergency close all open positions.
+    Iterates _open_buys_all and closes each position.
+    """
+    try:
+        opens = _open_buys_all()
+        logger.warning(f"🚨 [close_all_opens] Closing {len(opens)} open positions (reason: {reason})")
+        for pos in opens:
+            symbol = pos["symbol"]
+            amount = pos["amount"]
+            trade_id = pos["trade_id"]
+            try:
+                # Check if it's a short or long (would need to track mode in transactions)
+                # For now, assume all are longs (can be enhanced if shorts are tracked)
+                sell_symbol(symbol, amount, trade_id, source=f"emergency-close-{reason}")
+                logger.info(f"[close_all_opens] Closed {symbol} (trade_id={trade_id}, amount={amount})")
+            except Exception as e:
+                logger.error(f"[close_all_opens] Error closing {symbol}: {e}")
+    except Exception as e:
+        logger.error(f"[close_all_opens] Error: {e}")
+
 def calculate_daily_pnl() -> tuple[float, float, float]:
     """
     Calculate daily PnL (realized + unrealized) for equity guard.
@@ -6829,30 +6941,59 @@ def check_equity_guard() -> tuple[bool, str]:
         # Adjust max loss threshold based on FGI
         # In fear (FGI < 20), allow more risk (-5% vs -3%) because fear bottoms historically give +100% recovery
         max_loss_threshold = EQUITY_GUARD_MAX_LOSS_PCT
+        threshold_total = EQUITY_GUARD_MAX_LOSS_PCT_FEAR  # -5% in fear for total PnL
         if fgi_value is not None and fgi_value <= 20:
             max_loss_threshold = EQUITY_GUARD_MAX_LOSS_PCT_FEAR
+            threshold_total = EQUITY_GUARD_MAX_LOSS_PCT_FEAR  # Use same in fear
             logger.debug(f"Equity guard: FGI={fgi_value} (fear) → threshold adjusted to {max_loss_threshold}%")
         
         # Calculate daily PnL
         realized_pnl, unrealized_pnl, total_pnl_pct = calculate_daily_pnl()
         
-        # Check if loss threshold exceeded
-        if total_pnl_pct <= max_loss_threshold:
+        # Get starting balance for realized_pct calculation
+        try:
+            bal = exchange.fetch_balance()
+            usdt_total = float(bal.get('USDT', {}).get('total', 0.0) or 0.0)
+            starting_balance = usdt_total - realized_pnl - unrealized_pnl
+            realized_pct = (realized_pnl / starting_balance * 100.0) if starting_balance > 0 else 0.0
+        except Exception:
+            realized_pct = 0.0
+            starting_balance = None
+        
+        # >>> EQUITY GUARD: Prioritize Realized PnL
+        threshold_realized = EQUITY_GUARD_MAX_LOSS_PCT  # -3%
+        if realized_pct <= threshold_realized:
             _EQUITY_BREAKER_ACTIVE = True
+            logger.error(f"🚨 EQUITY GUARD: Realized {realized_pct:.2f}% <= {threshold_realized}%")
+            send_telegram_message(
+                f"🚨 *EQUITY GUARD TRIGGERED (Realized)*\n"
+                f"Realized PnL: `{realized_pct:.2f}%`\n"
+                f"Threshold: `{threshold_realized}%`\n"
+                f"Realized: `{realized_pnl:.2f}` USDT\n"
+                f"All new trades blocked until {_EQUITY_LAST_RESET_DATE + timedelta(days=1)} UTC"
+            )
+            return True, f"realized_guard ({realized_pct:.2f}%)"
+        
+        # Check total PnL threshold (with fear adjustment)
+        if total_pnl_pct <= threshold_total:
+            _EQUITY_BREAKER_ACTIVE = True
+            # Optional: Emergency close opens if total DD is extreme
+            close_all_opens(reason="equity_total_guard")
             logger.error(
-                f"🚨 EQUITY GUARD TRIGGERED: Daily PnL {total_pnl_pct:.2f}% <= {max_loss_threshold}% "
+                f"🚨 EQUITY GUARD TRIGGERED: Total PnL {total_pnl_pct:.2f}% <= {threshold_total}% "
                 f"(realized: {realized_pnl:.2f} USDT, unrealized: {unrealized_pnl:.2f} USDT, "
                 f"FGI={fgi_value if fgi_value else 'N/A'})"
             )
             send_telegram_message(
-                f"🚨 *EQUITY GUARD TRIGGERED*\n"
-                f"Daily PnL: `{total_pnl_pct:.2f}%`\n"
-                f"Threshold: `{max_loss_threshold}%` (FGI={fgi_value if fgi_value else 'N/A'})\n"
+                f"🚨 *EQUITY GUARD TRIGGERED (Total)*\n"
+                f"Total PnL: `{total_pnl_pct:.2f}%`\n"
+                f"Threshold: `{threshold_total}%` (FGI={fgi_value if fgi_value else 'N/A'})\n"
                 f"Realized: `{realized_pnl:.2f}` USDT\n"
                 f"Unrealized: `{unrealized_pnl:.2f}` USDT\n"
+                f"All positions closed\n"
                 f"All new trades blocked until {_EQUITY_LAST_RESET_DATE + timedelta(days=1)} UTC"
             )
-            return True, f"equity_guard_triggered (pnl={total_pnl_pct:.2f}%, threshold={max_loss_threshold}%)"
+            return True, f"total_guard ({total_pnl_pct:.2f}%)"
         
         return False, "ok"
     except Exception as e:
@@ -6881,19 +7022,29 @@ def trade_once_with_report(symbol: str):
                             atr_abs = float(df1h_si['ATR'].iloc[-1]) if (df1h_si is not None and pd.notna(df1h_si['ATR'].iloc[-1])) else 0.0
                             snap15 = quick_tf_snapshot(symbol, "15m", limit=120) or {}
                             snap1h = quick_tf_snapshot(symbol, "1h", limit=120) or {}
+                            # >>> FIX SCORE IN TELEGRAM: Calculate real score via hybrid_decision
+                            try:
+                                action_scale, conf_scale, score_scale, note_scale = hybrid_decision(symbol)
+                            except Exception:
+                                # Fallback: quick calc score = (ADX/20 + (70-RSI)/10 + RVOL) / 3
+                                adx_val = float(snap1h.get('ADX') or 0.0)
+                                rsi_val = float(snap1h.get('RSI') or 50.0)
+                                rvol_val = float(snap1h.get('RVOL10') or 1.0)
+                                score_scale = (adx_val / 20.0 + (70.0 - rsi_val) / 10.0 + rvol_val) / 3.0
+                                conf_scale = int((_open_buys_for_symbol(symbol)[0]['confidence']) if _open_buys_for_symbol(symbol) else 60)
                             order = execute_order_buy(symbol, amt, {
                                 'adx': float(snap1h.get('ADX') or 0.0),
                                 'rsi': float(snap1h.get('RSI') or 0.0),
                                 'rvol': float(snap1h.get('RVOL10') or 0.0),
                                 'atr': atr_abs,
-                                'score': 0.0,
-                                'confidence': int((_open_buys_for_symbol(symbol)[0]['confidence']) if _open_buys_for_symbol(symbol) else 60),
+                                'score': float(score_scale),
+                                'confidence': conf_scale,
                             })
                             if order:
                                 report["executed"] = True
                                 report["action"] = "buy"
                                 report["note"] = "scale-in"
-                                log_decision(symbol, 0.0, "buy-scale-in", True)
+                                log_decision(symbol, float(score_scale), "buy-scale-in", True)
                                 logger.info(f"{symbol}: SCALE-IN @ {order['price']} ({amt} units)")
                                 # Small delay to ensure DB commit is synced before starting trailing
                                 time.sleep(0.5)
@@ -6989,19 +7140,29 @@ def trade_once_with_report(symbol: str):
                         atr_abs_dca = float(snap1h_dca.get("ATR") or 0.0)
                         
                         logger.info(f"[DCA-HYBRID] {symbol}: Executing DCA buy @ {price_now} (amount={HYBRID_DCA_AMOUNT} USDT) - {preflight_reason}")
+                        # >>> FIX SCORE IN TELEGRAM: Calculate real score via hybrid_decision
+                        try:
+                            action_dca, conf_dca, score_dca, note_dca = hybrid_decision(symbol)
+                        except Exception:
+                            # Fallback: quick calc score = (ADX/20 + (70-RSI)/10 + RVOL) / 3
+                            adx_dca_val = float(snap1h_dca.get('ADX') or 0.0)
+                            rsi_dca_val = float(df1h_dca['RSI'].iloc[-1]) if pd.notna(df1h_dca['RSI'].iloc[-1]) else 50.0
+                            rvol_dca_val = float(snap1h_dca.get('RVOL10') or 1.0)
+                            score_dca = (adx_dca_val / 20.0 + (70.0 - rsi_dca_val) / 10.0 + rvol_dca_val) / 3.0
+                            conf_dca = 50
                         order = execute_order_buy(symbol, dca_amount, {
                             'adx': float(snap1h_dca.get('ADX') or 0.0),
                             'rsi': float(df1h_dca['RSI'].iloc[-1]) if pd.notna(df1h_dca['RSI'].iloc[-1]) else 0.0,
                             'rvol': float(snap1h_dca.get('RVOL10') or 0.0),
                             'atr': atr_abs_dca,
-                            'score': 0.0,
-                            'confidence': 50,
+                            'score': float(score_dca),
+                            'confidence': conf_dca,
                         })
                         if order:
                             report["executed"] = True
                             report["action"] = "buy"
                             report["note"] = f"DCA-hybrid ({preflight_reason})"
-                            log_decision(symbol, 0.0, "buy-dca-hybrid", True)
+                            log_decision(symbol, float(score_dca), "buy-dca-hybrid", True)
                             # Small delay to ensure DB commit is synced before starting trailing
                             time.sleep(0.5)
                             # Pass mode='dca' to trailing stop
@@ -7048,20 +7209,30 @@ def trade_once_with_report(symbol: str):
                 
                 if short_amount > 0:
                     snap1h_short = quick_tf_snapshot(symbol, "1h", limit=120) or {}
+                    # >>> FIX SCORE IN TELEGRAM: Calculate real score via hybrid_decision or quick calc
+                    try:
+                        action_short, conf_short, score_short, note_short = hybrid_decision(symbol)
+                    except Exception:
+                        # Fallback: quick calc score = (ADX/20 + (70-RSI)/10 + RVOL) / 3
+                        adx_short_val = float(snap1h_short.get('ADX') or 0.0)
+                        rsi_short_val = float(df1h_short['RSI'].iloc[-1]) if pd.notna(df1h_short['RSI'].iloc[-1]) else 50.0
+                        rvol_short_val = float(snap1h_short.get('RVOL10') or 1.0)
+                        score_short = (adx_short_val / 20.0 + (70.0 - rsi_short_val) / 10.0 + rvol_short_val) / 3.0
+                        conf_short = 50
                     logger.info(f"[SHORT-HYBRID] {symbol}: Executing short @ {price_short} (risk={SHORT_RISK_FRACTION*100:.1f}%, stop={SHORT_STOP_ATR_MULT}ATR) - {preflight_reason}")
                     order = execute_short(symbol, short_amount, {
                         'adx': float(snap1h_short.get('ADX') or 0.0),
                         'rsi': float(df1h_short['RSI'].iloc[-1]) if pd.notna(df1h_short['RSI'].iloc[-1]) else 0.0,
                         'rvol': float(snap1h_short.get('RVOL10') or 0.0),
                         'atr': atr_abs_short,
-                        'score': 0.0,
-                        'confidence': 50,
+                        'score': float(score_short),
+                        'confidence': conf_short,
                     })
                     if order:
                         report["executed"] = True
                         report["action"] = "short"
                         report["note"] = f"Short-hybrid ({preflight_reason}, risk={SHORT_RISK_FRACTION*100:.1f}%)"
-                        log_decision(symbol, 0.0, "short-hybrid", True)
+                        log_decision(symbol, float(score_short), "short-hybrid", True)
                         # Small delay to ensure DB commit is synced before starting trailing
                         time.sleep(0.5)
                         # Pass mode='short' to trailing stop
