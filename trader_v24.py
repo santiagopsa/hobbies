@@ -366,6 +366,18 @@ TIME_STOP_BARS_1H = int(os.getenv("TIME_STOP_BARS_1H", "12"))  # ~12h base (incr
 TIME_STOP_EXTEND_BARS = int(os.getenv("TIME_STOP_EXTEND_BARS", "48"))  # hasta 2 días si tape mejora (increased from 24)
 # >>> CHAN PATCH CONFIG END
 
+# >>> ANCHOR EXH0: EXHAUSTION DETECTION CONFIG
+# Exhaustion detection to tighten stops when momentum fades
+EXHAUSTION_ENABLED = bool(int(os.getenv("EXHAUSTION_ENABLED", "1")))  # Toggle exhaustion detection
+EXHAUSTION_ADX_SLOPE_MIN = float(os.getenv("EXHAUSTION_ADX_SLOPE_MIN", "-0.5"))  # Falling ADX threshold
+EXHAUSTION_RSI_FALL_MIN = float(os.getenv("EXHAUSTION_RSI_FALL_MIN", "-5.0"))  # RSI point drop threshold
+EXHAUSTION_RVOL_DROP_PCT = float(os.getenv("EXHAUSTION_RVOL_DROP_PCT", "30.0"))  # % RVOL fade from peak
+EXHAUSTION_TIGHTEN_K = float(os.getenv("EXHAUSTION_TIGHTEN_K", "0.7"))  # Extra K reduction on exhaustion
+EXHAUSTION_PRIMARY_TF = os.getenv("EXHAUSTION_PRIMARY_TF", "1d")  # Primary timeframe for ADX/RSI checks
+EXHAUSTION_SECONDARY_TF = os.getenv("EXHAUSTION_SECONDARY_TF", "4h")  # Secondary confirmation timeframe
+EXHAUSTION_VOL_TF = os.getenv("EXHAUSTION_VOL_TF", "15m")  # Volume timeframe for RVOL drops
+# >>> ANCHOR EXH0 END
+
 
 # Momentum penalties/blocks
 RSI_OVERBOUGHT_4H = 78.0
@@ -2832,6 +2844,106 @@ def fetch_and_prepare_data_hybrid(symbol: str, limit: int = 200, timeframe: str 
     except Exception:
         df['VWAP'] = np.nan
     return df
+
+# >>> EXHAUSTION DETECTION (ANCHOR EXH1)
+def check_exhaustion(symbol: str, primary_tf: str = EXHAUSTION_PRIMARY_TF, secondary_tf: str = EXHAUSTION_SECONDARY_TF) -> tuple[bool, str]:
+    """
+    Check for trend exhaustion signals:
+    - ADX slope falling (primary_tf, last 6 bars)
+    - RSI dropping (primary_tf and secondary_tf)
+    - RVOL dropping from recent peak (EXHAUSTION_VOL_TF)
+    Returns (is_exhausted: bool, reason: str)
+    """
+    if not EXHAUSTION_ENABLED:
+        return False, "exhaustion disabled"
+    
+    try:
+        reasons = []
+        
+        # Fetch primary timeframe data (~2 months on 1D)
+        df_primary = fetch_and_prepare_data_hybrid(symbol, timeframe=primary_tf, limit=50)
+        if df_primary is None or len(df_primary) < 6:
+            return False, "insufficient primary data"
+        
+        # ADX slope check (last 6 bars on primary_tf)
+        try:
+            if 'ADX' in df_primary.columns and len(df_primary) >= 6:
+                adx_series = df_primary['ADX'].dropna()
+                if len(adx_series) >= 6:
+                    x = np.arange(6)
+                    adx_slope = linregress(x, adx_series.iloc[-6:]).slope
+                    if adx_slope is not None and adx_slope < EXHAUSTION_ADX_SLOPE_MIN:
+                        reasons.append(f"ADX_slope={adx_slope:.2f} < {EXHAUSTION_ADX_SLOPE_MIN} ({primary_tf})")
+                        
+                        # Confirm on secondary_tf if possible
+                        try:
+                            df_secondary = fetch_and_prepare_data_hybrid(symbol, timeframe=secondary_tf, limit=50)
+                            if df_secondary is not None and len(df_secondary) >= 6:
+                                adx_sec = df_secondary['ADX'].dropna()
+                                if len(adx_sec) >= 6:
+                                    adx_slope_sec = linregress(x, adx_sec.iloc[-6:]).slope
+                                    if adx_slope_sec is not None and adx_slope_sec < EXHAUSTION_ADX_SLOPE_MIN:
+                                        reasons.append(f"confirmed on {secondary_tf}")
+                        except Exception:
+                            pass  # Secondary confirmation is optional
+        except Exception as e:
+            logger.debug(f"ADX slope check error for {symbol}: {e}")
+        
+        # RSI fall check (primary_tf)
+        try:
+            if 'RSI' in df_primary.columns and len(df_primary) >= 2:
+                rsi_series = df_primary['RSI'].dropna()
+                if len(rsi_series) >= 2:
+                    rsi_current = float(rsi_series.iloc[-1])
+                    rsi_prev = float(rsi_series.iloc[-2])
+                    rsi_delta = rsi_current - rsi_prev
+                    if rsi_delta < EXHAUSTION_RSI_FALL_MIN:
+                        reasons.append(f"RSI_drop={rsi_delta:.1f} < {EXHAUSTION_RSI_FALL_MIN} ({primary_tf})")
+                        
+                        # Check secondary_tf for intra-swing sensitivity
+                        try:
+                            df_secondary = fetch_and_prepare_data_hybrid(symbol, timeframe=secondary_tf, limit=50)
+                            if df_secondary is not None and len(df_secondary) >= 2:
+                                rsi_sec = df_secondary['RSI'].dropna()
+                                if len(rsi_sec) >= 2:
+                                    rsi_delta_sec = float(rsi_sec.iloc[-1]) - float(rsi_sec.iloc[-2])
+                                    if rsi_delta_sec < EXHAUSTION_RSI_FALL_MIN:
+                                        reasons.append(f"RSI_drop_confirmed={rsi_delta_sec:.1f} ({secondary_tf})")
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.debug(f"RSI fall check error for {symbol}: {e}")
+        
+        # RVOL drop check (EXHAUSTION_VOL_TF)
+        try:
+            df_vol = fetch_and_prepare_data_hybrid(symbol, timeframe=EXHAUSTION_VOL_TF, limit=20)
+            if df_vol is not None and len(df_vol) >= DECAY_BARS:
+                if 'RVOL10' in df_vol.columns:
+                    rvol_series = df_vol['RVOL10'].dropna()
+                    if len(rvol_series) >= DECAY_BARS:
+                        # Find peak in last DECAY_BARS
+                        recent_segment = rvol_series.iloc[-DECAY_BARS:]
+                        peak_rvol = float(recent_segment.max())
+                        current_rvol = float(rvol_series.iloc[-1])
+                        
+                        if peak_rvol > 0:
+                            rvol_drop_pct = ((peak_rvol - current_rvol) / peak_rvol) * 100.0
+                            if rvol_drop_pct > EXHAUSTION_RVOL_DROP_PCT:
+                                reasons.append(f"RVOL_drop={rvol_drop_pct:.1f}% from {peak_rvol:.2f} ({EXHAUSTION_VOL_TF})")
+        except Exception as e:
+            logger.debug(f"RVOL drop check error for {symbol}: {e}")
+        
+        if reasons:
+            reason_str = "; ".join(reasons)
+            logger.info(f"[exhaustion] {symbol}: Exhaustion detected - {reason_str}")
+            return True, reason_str
+        
+        return False, "no exhaustion"
+        
+    except Exception as e:
+        logger.warning(f"check_exhaustion error for {symbol}: {e}")
+        return False, f"error: {e}"
+# >>> ANCHOR EXH1 END
 
 # >>> RVOL CLOSED HELPERS (ANCHOR RVOLC)
 def rvol10_closed(df: pd.DataFrame) -> float | None:
@@ -5398,12 +5510,25 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 atr1h_abs = float(df1h['ATR'].iloc[-1]) if pd.notna(df1h['ATR'].iloc[-1]) else atr_abs
                 atr_pct = (atr1h_abs / close1h * 100.0) if close1h > 0 and atr1h_abs > 0 else 2.15  # Default 2.15% (mean from analysis)
                 
+                # >>> EXHAUSTION CHECK: Tighten K if exhaustion detected
+                effective_k = base_k
+                if EXHAUSTION_ENABLED:
+                    try:
+                        is_exhausted, exhaustion_reason = check_exhaustion(symbol, primary_tf=EXHAUSTION_PRIMARY_TF, secondary_tf=EXHAUSTION_SECONDARY_TF)
+                        if is_exhausted:
+                            # Reduce K by EXHAUSTION_TIGHTEN_K (minimum floor 1.0)
+                            effective_k = max(1.0, base_k - EXHAUSTION_TIGHTEN_K)
+                            logger.info(f"[exhaustion] {symbol}: Tightening K from {base_k:.2f} to {effective_k:.2f} - {exhaustion_reason}")
+                    except Exception as e:
+                        logger.debug(f"Exhaustion check error for {symbol}: {e}")
+                        effective_k = base_k
+                
                 # >>> HYBRID EXIT: Calculate Chandelier stop and Donchian lower when EXIT_MODE == "hybrid"
                 chandelier_stop = None
                 donchian_lower_val = None
                 if EXIT_MODE == "hybrid":
-                    # Chandelier stop (CHAN)
-                    chandelier_stop = chandelier_stop_long(df1h, atr_len=CHAN_ATR_LEN, hh_len=CHAN_LEN_HIGH, k=base_k)
+                    # Chandelier stop (CHAN) - use effective_k (may be reduced by exhaustion)
+                    chandelier_stop = chandelier_stop_long(df1h, atr_len=CHAN_ATR_LEN, hh_len=CHAN_LEN_HIGH, k=effective_k)
                     
                     # Donchian lower (already calculated above for structural_exit, but store for stop calculation)
                     donchian_lower_val = donchian_lower(df1h, length=DONCHIAN_LEN_EXIT)
@@ -5837,7 +5962,21 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                     except Exception:
                         pass
                     
-                    if strong_trend:
+                    # >>> EXHAUSTION CHECK: Prevent extensions if exhausted
+                    is_exhausted = False
+                    if EXHAUSTION_ENABLED:
+                        try:
+                            is_exhausted, _ = check_exhaustion(symbol, primary_tf=EXHAUSTION_PRIMARY_TF, secondary_tf=EXHAUSTION_SECONDARY_TF)
+                            if is_exhausted:
+                                logger.debug(f"[time-stop-exhaustion] {symbol}: Exhaustion detected - preventing time stop extension")
+                        except Exception as e:
+                            logger.debug(f"Exhaustion check in time-stop error for {symbol}: {e}")
+                    
+                    if is_exhausted:
+                        # No extension if exhausted
+                        time_stop_extend_bars = TIME_STOP_BARS_1H
+                        logger.debug(f"[time-stop-exhaustion] {symbol}: Using base time stop bars ({time_stop_extend_bars}) due to exhaustion")
+                    elif strong_trend:
                         time_stop_extend_bars = TIME_STOP_EXTEND_BARS * 2  # Double extension for strong trends
                         logger.debug(f"[time-stop-strong-trend] {symbol}: Extended to {time_stop_extend_bars} bars (ADX1h={adx1h:.1f}>=30, ADX4h={adx4h:.1f}>=30)")
                     elif rsi4h_btc_time_stop is not None and rsi4h_btc_time_stop < 35:
@@ -6005,6 +6144,17 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 except Exception:
                     pass
                 
+                # >>> EXHAUSTION CHECK: Reduce REBOUND_MIN_RSI_BOUNCE if exhausted (easier exit on weak bounces)
+                rebound_min_rsi_bounce_dynamic = REBOUND_MIN_RSI_BOUNCE
+                if EXHAUSTION_ENABLED:
+                    try:
+                        is_exhausted, _ = check_exhaustion(symbol, primary_tf=EXHAUSTION_PRIMARY_TF, secondary_tf=EXHAUSTION_SECONDARY_TF)
+                        if is_exhausted:
+                            rebound_min_rsi_bounce_dynamic = max(0.0, REBOUND_MIN_RSI_BOUNCE - 2.0)  # Reduce by 2.0 (minimum 0.0)
+                            logger.debug(f"[rebound-exhaustion] {symbol}: Reduced REBOUND_MIN_RSI_BOUNCE from {REBOUND_MIN_RSI_BOUNCE:.1f} to {rebound_min_rsi_bounce_dynamic:.1f} due to exhaustion")
+                    except Exception as e:
+                        logger.debug(f"Exhaustion check in rebound guard error for {symbol}: {e}")
+                
                 if structural_exit and rebound_enabled:
                     try:
                         if rebound_pending_until is None:
@@ -6024,7 +6174,7 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                                 ema_ok = float(df15r['close'].iloc[-1]) > float(ema20_15_r.iloc[-1])
                             rsi_bounce = False
                             if rsi_now is not None and rsi_prev is not None:
-                                rsi_bounce = (rsi_now - rsi_prev) >= REBOUND_MIN_RSI_BOUNCE
+                                rsi_bounce = (rsi_now - rsi_prev) >= rebound_min_rsi_bounce_dynamic
 
                             div_ok = False
                             if REBOUND_USE_5M_DIVERGENCE:
