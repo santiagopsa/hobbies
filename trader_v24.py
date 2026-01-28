@@ -222,12 +222,13 @@ SCALE_IN_COOLDOWN_MIN = int(os.getenv("SCALE_IN_COOLDOWN_MIN", "60"))  # Increas
 SCALE_IN_MIN_R_MULT = 1.0             # sólo si el trade ya está >= 1R desde la entrada
 
 # ==== Slot stealing / rotation ====
-SLOT_STEAL_ENABLED = True
-SLOT_STEAL_MAX_PER_DAY = 3
-SLOT_STEAL_MIN_CONF = 65
-SLOT_STEAL_SCORE_DELTA = 1.2
-SLOT_STEAL_MIN_HOLD_MINUTES = 15
-SLOT_STEAL_MIN_NOTIONAL = 50.0  # no intentes rotar por montos muy bajos
+# ==== Slot stealing / rotation (ANCHOR SLOT0) ====
+SLOT_STEAL_ENABLED = bool(int(os.getenv("SLOT_STEAL_ENABLED", "1")))
+SLOT_STEAL_MAX_PER_DAY = int(os.getenv("SLOT_STEAL_MAX_PER_DAY", "1"))  # Low for swings
+SLOT_STEAL_MIN_CONF = int(os.getenv("SLOT_STEAL_MIN_CONF", "75"))       # Higher bar
+SLOT_STEAL_SCORE_DELTA = float(os.getenv("SLOT_STEAL_SCORE_DELTA", "1.5"))  # Stronger delta needed
+SLOT_STEAL_MIN_HOLD_MINUTES = int(os.getenv("SLOT_STEAL_MIN_HOLD_MINUTES", "240"))  # 4h+ before steal
+SLOT_STEAL_MIN_NOTIONAL = float(os.getenv("SLOT_STEAL_MIN_NOTIONAL", "50.0"))  # Min size to steal
 
 MIN_RESERVE_USDT = RESERVE_USDT
 # Decision params (defaults)
@@ -4297,8 +4298,8 @@ def execute_order_buy(symbol: str, amount: float, signals: dict):
 def execute_order_sell(symbol: str, amount: float, signals: dict | None = None) -> dict | None:
     """
     Venta *parcial* por mercado que NO cierra el trade.
-    Inserta una fila en transactions con side='sell_partial' (status='open'),
-    dejando intacto el 'buy' (status 'open') y permitiendo que el trailing continúe.
+    Inserta una fila en transactions con side='sell' (status='open'),
+    decrementa el amount del 'buy' abierto (status 'open' hasta full sell).
     """
     try:
         # 1) Precio de referencia y orden
@@ -4326,14 +4327,14 @@ def execute_order_sell(symbol: str, amount: float, signals: dict | None = None) 
             # Fallback si no hay 'buy' abierto (no debería pasar si controlas 1 posición por símbolo)
             trade_id = f"{symbol}-{sell_ts.replace(':','-')}-partial"
 
-        # 3) Registrar la venta parcial (NO usar side='sell' para no cerrar)
+        # 3) Registrar la venta parcial (side='sell', status='open')
         conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
         cur.execute("""
             INSERT INTO transactions (
                 symbol, side, price, amount, ts, trade_id,
                 adx, rsi, rvol, atr, score, confidence, status
             ) VALUES (
-                ?, 'sell_partial', ?, ?, ?, ?,
+                ?, 'sell', ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, 'open'
             )
         """, (
@@ -4346,6 +4347,28 @@ def execute_order_sell(symbol: str, amount: float, signals: dict | None = None) 
             (signals or {}).get('confidence'),
         ))
         conn.commit(); conn.close()
+
+        # ADD: Decrement the buy amount (match oldest open buy)
+        conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+        cur.execute("""
+            SELECT rowid, amount FROM transactions
+            WHERE symbol=? AND side='buy' AND status='open' AND trade_id=?
+            ORDER BY ts ASC LIMIT 1
+        """, (symbol, trade_id))
+        row = cur.fetchone()
+        if row:
+            buy_rowid, buy_amt = row
+            remaining = max(0, buy_amt - amount)  # Decrement
+            if remaining > 0:
+                cur.execute("UPDATE transactions SET amount=? WHERE rowid=?", (remaining, buy_rowid))
+            else:
+                cur.execute("UPDATE transactions SET status='closed' WHERE rowid=?", (buy_rowid,))
+            conn.commit()
+        conn.close()
+
+        # ADD: Set 'partial_done' flag in _TRADE_STATES to prevent repeats
+        _TRADE_STATES[trade_id] = _TRADE_STATES.get(trade_id, {})
+        _TRADE_STATES[trade_id]['partial_done'] = True
 
         # 4) Notificación
         try:
@@ -5185,12 +5208,6 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                                 prearm_ceiling = loop._prearm_ceiling
 
                                 if last_price >= prearm_ceiling:
-                                    # >>> PREARM ENFORCE MIN_HOLD: Check minimum hold time before prearm-stop
-                                    duration_sec = time.time() - opened_at_ts  # opened_at_ts is already a timestamp
-                                    if duration_sec < MIN_HOLD_SECONDS:
-                                        logger.debug(f"[prearm-stop-short] {symbol}: Skipping prearm-stop (duration={duration_sec:.0f}s < {MIN_HOLD_SECONDS}s)")
-                                        continue  # No sell early - enforce minimum hold
-                                    
                                     logger.info(f"[prearm-stop-short] {symbol} hit {prearm_ceiling:.4f} (entry={entry_price:.4f}) — exit before arming")
                                     exit_trade(symbol, amount_to_sell, trade_id, "prearm-stop-short", is_short=True)
                                     time.sleep(EXIT_CHECK_EVERY_SEC)
@@ -5211,12 +5228,6 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                                 prearm_floor = cand_floor if prearm_floor is None else max(prearm_floor, cand_floor)
 
                                 if last_price <= prearm_floor:
-                                    # >>> PREARM ENFORCE MIN_HOLD: Check minimum hold time before prearm-stop
-                                    duration_sec = time.time() - opened_at_ts  # opened_at_ts is already a timestamp
-                                    if duration_sec < MIN_HOLD_SECONDS:
-                                        logger.debug(f"[prearm-stop] {symbol}: Skipping prearm-stop (duration={duration_sec:.0f}s < {MIN_HOLD_SECONDS}s)")
-                                        continue  # No sell early - enforce minimum hold
-                                    
                                     logger.info(f"[prearm-stop] {symbol} hit {prearm_floor:.4f} (entry={entry_price:.4f}) — exit before arming")
                                     exit_trade(symbol, amount_to_sell, trade_id, "prearm-stop", is_short=False)
                                     time.sleep(EXIT_CHECK_EVERY_SEC)
@@ -5470,7 +5481,11 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                             pos_qty = current_position_qty(symbol)
                             partial_amt = pos_qty * hold_info["partial"]
                             if partial_amt * price >= MIN_NOTIONAL and partial_amt > 0:
-                                execute_order_sell(symbol, partial_amt, signals={"reason": "volume-hold-partial"})
+                                if _TRADE_STATES.get(trade_id, {}).get('partial_done', False):
+                                    logger.debug(f"Skip partial {symbol}: already done for {trade_id}")
+                                    continue
+                                else:
+                                    execute_order_sell(symbol, partial_amt, signals={"reason": "volume-hold-partial"})
                                 logger.info(f"[hold-volume-partial] {symbol}: Partial take {hold_info['partial']*100:.0f}% at {gain_pct_now:.2f}%")
                         except Exception as e:
                             logger.debug(f"hold volume partial sell error {symbol}: {e}")
@@ -5491,12 +5506,16 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                             pos_qty = current_position_qty(symbol)
                             qty_partial = round(pos_qty * 0.30, 8)  # 30% partial
                             if qty_partial * price >= MIN_NOTIONAL and qty_partial > 0:
-                                execute_order_sell(symbol, qty_partial, signals={"reason": "partial-profit-4pct"})
-                                loop._partial_taken = True
-                                logger.info(f"[partial-sell] {symbol}: Took 30% profit at +{gain_pct_now:.2f}%, trailing rest")
-                                # Widen trailing for the runner (1200bps if strong_trend)
-                                if strong_trend:
-                                    set_symbol_trailing(symbol, trail_bps=1200)
+                                if _TRADE_STATES.get(trade_id, {}).get('partial_done', False):
+                                    logger.debug(f"Skip partial {symbol}: already done for {trade_id}")
+                                    continue
+                                else:
+                                    execute_order_sell(symbol, qty_partial, signals={"reason": "partial-profit-4pct"})
+                                    loop._partial_taken = True
+                                    logger.info(f"[partial-sell] {symbol}: Took 30% profit at +{gain_pct_now:.2f}%, trailing rest")
+                                    # Widen trailing for the runner (1200bps if strong_trend)
+                                    if strong_trend:
+                                        set_symbol_trailing(symbol, trail_bps=1200)
                     except Exception as e:
                         logger.debug(f"partial sell check error {symbol}: {e}")
                 
@@ -5864,7 +5883,11 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                                     pos_qty = current_position_qty(symbol)
                                     qty_partial = round(pos_qty * max(0.10, min(0.70, HOLD_PARTIAL_SELL)), 8)
                                     if qty_partial * last_price >= MIN_NOTIONAL and qty_partial > 0:
-                                        execute_order_sell(symbol, qty_partial, signals={"reason": "volume-partial"})
+                                        if _TRADE_STATES.get(trade_id, {}).get('partial_done', False):
+                                            logger.debug(f"Skip partial {symbol}: already done for {trade_id}")
+                                            continue
+                                        else:
+                                            execute_order_sell(symbol, qty_partial, signals={"reason": "volume-partial"})
                                     set_symbol_trailing(symbol, trail_bps=wide_bps)  # widen trailing for the runner
                                     logger.info(f"[exit-hold] {symbol}: RVOL ok & 1h structure up — partial + widen to {wide_bps}bps; defer full exit")
                                     time.sleep(EXIT_CHECK_EVERY_SEC)
@@ -6063,7 +6086,11 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                                 pos_qty = current_position_qty(symbol)
                                 qty_partial = round(pos_qty * max(0.10, min(0.70, HOLD_PARTIAL_SELL)), 8)
                                 if qty_partial * last_price >= MIN_NOTIONAL and qty_partial > 0:
-                                    execute_order_sell(symbol, qty_partial, signals={"reason": "volume-partial"})
+                                    if _TRADE_STATES.get(trade_id, {}).get('partial_done', False):
+                                        logger.debug(f"Skip partial {symbol}: already done for {trade_id}")
+                                        continue
+                                    else:
+                                        execute_order_sell(symbol, qty_partial, signals={"reason": "volume-partial"})
                                 set_symbol_trailing(symbol, trail_bps=wide_bps)  # widen trailing for the runner
                                 logger.info(f"[exit-hold] {symbol}: RVOL ok & 1h structure up — partial + widen to {wide_bps}bps; defer full exit")
                                 time.sleep(EXIT_CHECK_EVERY_SEC)
@@ -7255,6 +7282,15 @@ def trade_once_with_report(symbol: str):
 
         # 5) >>> HYBRID PREFLIGHT: Determine entry mode (DCA, short, or swing)
         mode, preflight_reason = hybrid_preflight(symbol)
+
+        # >>> Optional 4h filter (extra swing focus)
+        feats = build_rich_features(symbol)
+        rsi_4h = feats.get('timeframes', {}).get('4h', {}).get('rsi', 0)
+        adx_4h = feats.get('timeframes', {}).get('4h', {}).get('adx', 0)
+        if rsi_4h <= 50 or adx_4h <= 20:
+            logger.debug(f"Skip entry {symbol}: 4h RSI {rsi_4h} <=50 or ADX {adx_4h} <=20")
+            report["note"] = f"4h_filter: RSI={rsi_4h}, ADX={adx_4h}"
+            return report
         
         # >>> DCA MODE: Execute DCA buy if conditions met
         if mode == 'dca':
@@ -7871,7 +7907,7 @@ if __name__ == "__main__":
             equity_block, equity_reason = check_equity_guard()
             if equity_block:
                 logger.warning(f"⏸️  Cycle skipped due to equity guard: {equity_reason}")
-                time.sleep(30)
+                time.sleep(90)
                 continue
             
             # >>> PROXY FGI: RSI4h<40 full en guards/entries (ANCHOR FGI3)
@@ -7894,7 +7930,7 @@ if __name__ == "__main__":
                     mk_bull, fgi_v, tag = is_market_bullish()
                     if (fgi_v is not None and fgi_v <= FGI_EXTREME_FEAR) and (not market_regime_ok()):
                         logger.warning(f"⏸️  Cycle skipped due to Extreme Fear (FGI={fgi_v}, {tag}) with regime off.")
-                        time.sleep(30)
+                        time.sleep(90)
                         continue
                 except Exception as e:
                     logger.debug(f"FGI gate error: {e}")
@@ -7903,7 +7939,7 @@ if __name__ == "__main__":
             try:
                 if park_to_btc_if_needed():
                     # Estamos en BTC_PARK y régimen off → saltamos el escaneo de alts
-                    time.sleep(30)
+                    time.sleep(90)
                     continue
             except Exception as e:
                 logger.debug(f"strategy router error: {e}")
@@ -7925,7 +7961,7 @@ if __name__ == "__main__":
             controller_autotune()
             print_cycle_summary(cycle_decisions)
             write_status_json(cycle_decisions)
-            time.sleep(30)
+            time.sleep(90)
     except (KeyboardInterrupt, SystemExit):
         logger.info("Shutting down gracefully.")
         logging.shutdown()
