@@ -6944,6 +6944,42 @@ def close_all_opens(reason: str = "equity_guard") -> None:
     except Exception as e:
         logger.error(f"[close_all_opens] Error: {e}")
 
+def get_total_equity_usdt() -> float | None:
+    """
+    Estimate total account equity in USDT:
+    USDT total + sum(other asset totals * current USDT price).
+    Returns None if balance fetch fails.
+    """
+    try:
+        bal = exchange.fetch_balance() or {}
+        totals = bal.get("total") or {}
+        total_equity = 0.0
+
+        usdt_total = float(totals.get("USDT", 0.0) or 0.0)
+        total_equity += usdt_total
+
+        for asset, amt in totals.items():
+            if asset == "USDT":
+                continue
+            try:
+                amt_f = float(amt or 0.0)
+            except Exception:
+                continue
+            if amt_f <= 0:
+                continue
+            symbol = f"{asset}/USDT"
+            try:
+                px = fetch_price(symbol)
+            except Exception:
+                px = None
+            if px:
+                total_equity += amt_f * float(px)
+
+        return total_equity
+    except Exception as e:
+        logger.warning(f"get_total_equity_usdt error: {e}")
+        return None
+
 def calculate_daily_pnl() -> tuple[float, float, float]:
     """
     Calculate daily PnL (realized + unrealized) for equity guard.
@@ -6991,16 +7027,14 @@ def calculate_daily_pnl() -> tuple[float, float, float]:
             except Exception:
                 pass  # Skip if can't fetch price
         
-        # Get current balance for PnL%
-        try:
-            bal = exchange.fetch_balance()
-            usdt_total = float(bal.get('USDT', {}).get('total', 0.0) or 0.0)
-            
-            # Estimate starting balance (current - today's realized - today's unrealized)
+        # Get current total equity for PnL%
+        total_equity = get_total_equity_usdt()
+        if total_equity is not None:
+            # Estimate starting balance (current total equity - today's realized - today's unrealized)
             # This is approximate; for precise tracking, maintain daily balance snapshots
-            starting_balance = usdt_total - realized_pnl - unrealized_pnl
+            starting_balance = total_equity - realized_pnl - unrealized_pnl
             total_pnl_pct = ((realized_pnl + unrealized_pnl) / starting_balance * 100.0) if starting_balance > 0 else 0.0
-        except Exception:
+        else:
             total_pnl_pct = 0.0
         
         return realized_pnl, unrealized_pnl, total_pnl_pct
@@ -7052,15 +7086,13 @@ def calculate_monthly_pnl() -> tuple[float, float]:
             except Exception:
                 pass
         
-        # Get current balance
-        try:
-            bal = exchange.fetch_balance()
-            usdt_total = float(bal.get('USDT', {}).get('total', 0.0) or 0.0)
-            starting_balance = usdt_total - realized_pnl - unrealized_pnl
-            total_pnl_pct = ((realized_pnl + unrealized_pnl) / starting_balance * 100.0) if starting_balance > 0 else 0.0
-            return total_pnl_pct, starting_balance
-        except Exception:
+        # Get current total equity
+        total_equity = get_total_equity_usdt()
+        if total_equity is None:
             return 0.0, None
+        starting_balance = total_equity - realized_pnl - unrealized_pnl
+        total_pnl_pct = ((realized_pnl + unrealized_pnl) / starting_balance * 100.0) if starting_balance > 0 else 0.0
+        return total_pnl_pct, starting_balance
     except Exception as e:
         logger.warning(f"calculate_monthly_pnl error: {e}")
         return 0.0, None
@@ -7142,13 +7174,12 @@ def check_equity_guard() -> tuple[bool, str]:
         # Calculate daily PnL
         realized_pnl, unrealized_pnl, total_pnl_pct = calculate_daily_pnl()
         
-        # Get starting balance for realized_pct calculation
-        try:
-            bal = exchange.fetch_balance()
-            usdt_total = float(bal.get('USDT', {}).get('total', 0.0) or 0.0)
-            starting_balance = usdt_total - realized_pnl - unrealized_pnl
+        # Get starting balance for realized_pct calculation (use total equity)
+        total_equity = get_total_equity_usdt()
+        if total_equity is not None:
+            starting_balance = total_equity - realized_pnl - unrealized_pnl
             realized_pct = (realized_pnl / starting_balance * 100.0) if starting_balance > 0 else 0.0
-        except Exception:
+        else:
             realized_pct = 0.0
             starting_balance = None
         
