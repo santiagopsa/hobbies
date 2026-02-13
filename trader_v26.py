@@ -36,7 +36,7 @@ load_dotenv()
 # >>> STRATEGY PROFILE (ANCHOR SP0)
 # Selector de estrategia
 
-VERSION = "v25"
+VERSION = "v26"
 PARK_IN_MOMENTUM = bool(int(os.getenv("PARK_IN_MOMENTUM", "0")))
 
 STRATEGY_PROFILES = {"USDT_MOMENTUM", "BTC_PARK", "AUTO_HYBRID"}
@@ -152,15 +152,16 @@ STRONG_TREND_K_UNSTABLE = 2.5
 
 # Execution / risk
 MIN_NOTIONAL = 8.0
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "10"))  # Max parallel trades (configurable via .env)
+MIN_HOLDING_VALUE_USDT = float(os.getenv("MIN_HOLDING_VALUE_USDT", "3.0"))  # Dust guard for "already holding"
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "5"))  # Max parallel trades (configurable via .env)
 RESERVE_USDT = 20.0
-RISK_FRACTION = 0.18  # base fraction per trade (modulated)
+RISK_FRACTION = float(os.getenv("RISK_FRACTION", "0.08"))  # base fraction per trade (modulated)
 
 # >>> EQUITY GUARD / CIRCUIT BREAKER (ANCHOR EQGUARD)
 EQUITY_GUARD_ENABLED = bool(int(os.getenv("EQUITY_GUARD_ENABLED", "1")))
-EQUITY_GUARD_MAX_LOSS_PCT = float(os.getenv("EQUITY_GUARD_MAX_LOSS_PCT", "-3.0"))  # -3% max loss per day (base)
-EQUITY_GUARD_MAX_LOSS_PCT_FEAR = float(os.getenv("EQUITY_GUARD_MAX_LOSS_PCT_FEAR", "-5.0"))  # -5% in fear (FGI < 20)
-EQUITY_GUARD_EMERGENCY_CLOSE_PCT = float(os.getenv("EQUITY_GUARD_EMERGENCY_CLOSE_PCT", "-8.0"))  # Close all only on deeper DD
+EQUITY_GUARD_MAX_LOSS_PCT = float(os.getenv("EQUITY_GUARD_MAX_LOSS_PCT", "-5.0"))  # -5% max loss per day (base)
+EQUITY_GUARD_MAX_LOSS_PCT_FEAR = float(os.getenv("EQUITY_GUARD_MAX_LOSS_PCT_FEAR", "-7.0"))  # -7% in fear (FGI < 20)
+EQUITY_GUARD_EMERGENCY_CLOSE_PCT = float(os.getenv("EQUITY_GUARD_EMERGENCY_CLOSE_PCT", "-10.0"))  # Close all only on deeper DD
 EQUITY_GUARD_MONTHLY_MAX_DD_PCT = float(os.getenv("EQUITY_GUARD_MONTHLY_MAX_DD_PCT", "-20.0"))  # -20% monthly DD pause
 EQUITY_GUARD_MONTHLY_PAUSE_DAYS = int(os.getenv("EQUITY_GUARD_MONTHLY_PAUSE_DAYS", "7"))  # Pause 7 days if monthly DD hit
 EQUITY_GUARD_RESET_HOUR_UTC = int(os.getenv("EQUITY_GUARD_RESET_HOUR_UTC", "0"))  # Reset at midnight UTC
@@ -285,7 +286,7 @@ EDGE_SAFETY_MULT = float(os.getenv("EDGE_SAFETY_MULT", "1.3"))
 
 # >>> PATCH: ENTRY EDGE / QUALITY / COOLDOWNS (ANCHOR EDGE1)
 ENTRY_EDGE_MULT = float(os.getenv("ENTRY_EDGE_MULT", "2.0"))         # x required_edge_pct for entry
-RVOL15_ENTRY_MIN = float(os.getenv("RVOL15_ENTRY_MIN", "1.0"))       # Lowered from 1.8 to 1.0 - less restrictive for entries
+RVOL15_ENTRY_MIN = float(os.getenv("RVOL15_ENTRY_MIN", "1.3"))       # Require healthier participation for swing entries
 RVOL15_BREAKOUT_MIN = float(os.getenv("RVOL15_BREAKOUT_MIN", "1.5")) # closed RVOL needed when 4h trend is weak (<20)
 
 QUICK_LOSS_COOLDOWN_MIN = int(os.getenv("QUICK_LOSS_COOLDOWN_MIN", "30"))  # re-entry ban after quick small loss
@@ -332,7 +333,7 @@ TAPE_IMPROVING_VWAP_REQ = True     # close 1h > VWAP 1h para extender
 
 # --- Profit quality guard (evitar micro-takes post-fees) ---
 MIN_GAIN_OVER_FEES_MULT = float(os.getenv("MIN_GAIN_OVER_FEES_MULT", "1.2"))  # Lowered from 1.6 - allow exits with less edge
-MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "3600"))  # Increased from 900 (15min) to 3600 (1h) - avoid immediate scratches
+MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "7200"))  # 2h minimum hold by default for swing behavior
 # >>> PATCH END
 
 # >>> CHAN PATCH CONFIG START (ANCHOR A)
@@ -400,7 +401,7 @@ REENTRY_BLOCK_MIN = 15  # unify with top-level patch
 REENTRY_ABOVE_LAST_EXIT_PAD = 0.0015  # 0.15% (por defecto; se ajusta por régimen)
 
 # Volatility / crash protection
-INIT_STOP_ATR_MULT = 1.4
+INIT_STOP_ATR_MULT = float(os.getenv("INIT_STOP_ATR_MULT", "2.0"))
 PORTFOLIO_MAX_UTIL = 0.75
 CRASH_HALT_DROP_PCT = 3.5
 CRASH_HALT_WINDOW_MIN = 15
@@ -6919,10 +6920,39 @@ def strong_symbol_momentum_15m(symbol: str) -> bool:
 buy_lock = threading.Lock()
 
 def has_open_position(symbol: str) -> bool:
-    conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM transactions WHERE symbol=? AND side='buy' AND status='open'", (symbol,))
-    cnt = cur.fetchone()[0]; conn.close()
-    return cnt > 0
+    try:
+        conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+        cur.execute("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE symbol=? AND side='buy' AND status='open'", (symbol,))
+        db_qty = float(cur.fetchone()[0] or 0.0)
+        conn.close()
+    except Exception:
+        db_qty = 0.0
+
+    if db_qty <= 0:
+        return False
+
+    try:
+        px = get_last_price(symbol) or fetch_price(symbol)
+    except Exception:
+        px = None
+
+    db_notional = (db_qty * float(px)) if px else 0.0
+    exch_notional = 0.0
+
+    # Use exchange balance as sanity fallback to avoid stale DB-only dust.
+    try:
+        base = symbol.split("/")[0]
+        bal = exchange.fetch_balance() or {}
+        total_base = float((bal.get("total", {}) or {}).get(base, 0.0) or 0.0)
+        if total_base > 0:
+            px2 = px or fetch_price(symbol)
+            if px2:
+                exch_notional = total_base * float(px2)
+    except Exception:
+        pass
+
+    position_notional = max(db_notional, exch_notional)
+    return position_notional >= MIN_HOLDING_VALUE_USDT
 
 def get_open_trades_count() -> int:
     conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
