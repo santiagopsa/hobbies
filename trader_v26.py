@@ -115,6 +115,10 @@ PARK_TRAIL_BPS = int(round(PARK_TRAIL_PCT * 10000))
 AUTO_PARK_PCT = float(os.getenv("AUTO_PARK_PCT", "0.60"))      # 60% del capital libre (tras reserva) hacia BTC
 AUTO_PARK_DEADBAND_BPS = int(os.getenv("AUTO_PARK_DEADBAND_BPS", "50"))  # banda muerta ±0.50% para evitar micro-churn
 
+# PARK unwind sizing controls (bounded even when signal is strong)
+PARK_UNWIND_STRONG_BOOST = float(os.getenv("PARK_UNWIND_STRONG_BOOST", "1.25"))
+PARK_UNWIND_MAX_PCT = float(os.getenv("PARK_UNWIND_MAX_PCT", "0.90"))  # never spend >90% of spendable in unwind
+
 # Anti-chop extra (puedes sobreescribir en .env)
 HYBRID_GLOBAL_COOLDOWN_SEC = int(os.getenv("HYBRID_GLOBAL_COOLDOWN_SEC", "120"))
 HYBRID_MIN_REVERSAL_BPS    = int(os.getenv("HYBRID_MIN_REVERSAL_BPS", "10"))
@@ -1218,29 +1222,39 @@ def park_to_btc_if_needed() -> bool:
         # (b) reclaim
         reclaim_px = _reentry_trigger_price(btc_px)
         if btc_px >= reclaim_px:
-            buy_usdt = max(0.0, usdt_free - MIN_RESERVE_USDT)
+            spendable_usdt = max(0.0, usdt_free - MIN_RESERVE_USDT)
+            if spendable_usdt <= 0:
+                return False
+
+            # Base allocation by regime target (bull/bear), not full balance.
+            buy_usdt = spendable_usdt * float(target_park_pct)
+
+            # Strong-signal boost, always bounded by PARK_UNWIND_MAX_PCT.
+            try:
+                snap1h = quick_tf_snapshot(symbol, "1h", limit=120) or {}
+                snap15 = quick_tf_snapshot(symbol, "15m", limit=120) or {}
+                adx1h = float(snap1h.get("ADX") or 0.0)
+                rsi1h = float(snap1h.get("RSI") or 0.0)
+                rvol15 = float(snap15.get("RVOL10") or snap15.get("RVOL") or 0.0)
+                macdh15 = float(snap15.get("MACDh") or 0.0)
+                if adx1h >= 30 and rsi1h >= 55 and rvol15 >= 1.0 and macdh15 > 0:
+                    buy_usdt *= PARK_UNWIND_STRONG_BOOST
+            except Exception:
+                pass
+
+            buy_usdt = min(buy_usdt, spendable_usdt * PARK_UNWIND_MAX_PCT)
             if buy_usdt >= MIN_NOTIONAL:
                 qty_to_buy = round(buy_usdt / btc_px, 8)
-                trade_id = f"PARK-UNWIND-{_now_iso()}"
                 try:
-                    execute_order_buy(
+                    order = execute_order_buy(
                         symbol, qty_to_buy,
                         signals={"confidence": 60, "score": 0.0},
                     )
+                    if not order:
+                        return False
                 except Exception as e:
                     logger.error(f"[unwind] error recomprando BTC: {e}")
                     return False
-
-                # Telemetría posterior (no bloqueante)
-                try:
-                    features = build_rich_features(symbol)
-                    extra = f"Price: {btc_px:,.2f}  Amount: {qty_to_buy:.8f}"
-                    send_feature_bundle_telegram(
-                        side="entry", symbol=symbol, trade_id=trade_id,
-                        features=features, extra_lines=extra,
-                    )
-                except Exception as e:
-                    logger.warning(f"[unwind] snapshot entrada falló: {e}")
 
                 # No need for global declaration - we're only mutating the dict
                 with PARK_LOCK:
@@ -8022,12 +8036,6 @@ if __name__ == "__main__":
             check_log_rotation()
 
             crash_active = crash_halt()
-            # Parking de BTC: inerte si el perfil es USDT_MOMENTUM (gate interno)
-            try:
-                park_to_btc_if_needed()
-            except Exception as e:
-                logger.warning(f"park_to_btc_if_needed error: {e}")
-
             cycle_decisions = []
             
             # >>> CACHE RSI4h BTC: Update cache via helper function (TTL 300s)
