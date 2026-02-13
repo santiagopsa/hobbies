@@ -160,6 +160,14 @@ MIN_HOLDING_VALUE_USDT = float(os.getenv("MIN_HOLDING_VALUE_USDT", "3.0"))  # Du
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "5"))  # Max parallel trades (configurable via .env)
 RESERVE_USDT = 20.0
 RISK_FRACTION = float(os.getenv("RISK_FRACTION", "0.08"))  # base fraction per trade (modulated)
+# Tiered swing sizing (fraction of total equity)
+SIZE_TIER_B_PCT = float(os.getenv("SIZE_TIER_B_PCT", "0.10"))     # normal quality
+SIZE_TIER_A_PCT = float(os.getenv("SIZE_TIER_A_PCT", "0.16"))     # strong quality
+SIZE_TIER_A_PLUS_PCT = float(os.getenv("SIZE_TIER_A_PLUS_PCT", "0.22"))  # very strong quality
+SIZE_MAX_PER_TRADE_PCT = float(os.getenv("SIZE_MAX_PER_TRADE_PCT", "0.25"))  # hard cap per position
+SIZE_MAX_SPENDABLE_PCT = float(os.getenv("SIZE_MAX_SPENDABLE_PCT", "0.50"))  # cap as % of spendable USDT
+SIZE_FEAR_BOOST = float(os.getenv("SIZE_FEAR_BOOST", "1.15"))     # constructive fear multiplier
+SIZE_VOL_PENALTY = float(os.getenv("SIZE_VOL_PENALTY", "0.70"))   # high-volatility multiplier
 
 # >>> EQUITY GUARD / CIRCUIT BREAKER (ANCHOR EQGUARD)
 EQUITY_GUARD_ENABLED = bool(int(os.getenv("EQUITY_GUARD_ENABLED", "1")))
@@ -6587,33 +6595,54 @@ def size_position(price: float, usdt_balance: float, confidence: int, symbol: st
     if spendable < MIN_NOTIONAL:
         return 0.0
 
-    # 1) Base by confidence (keeps your original curve)
+    # 1) Signal-tier base sizing (A+/A/B), bounded by hard caps.
+    tier = "B"
+    tier_frac = SIZE_TIER_B_PCT
+    adx1h = rvol15 = macdh15 = rsi4h = atrp1h = None
+    if symbol:
+        try:
+            snap1h = quick_tf_snapshot(symbol, "1h", limit=120) or {}
+            snap15 = quick_tf_snapshot(symbol, "15m", limit=120) or {}
+            snap4h = quick_tf_snapshot(symbol, "4h", limit=120) or {}
+            adx1h = float(snap1h.get("ADX") or 0.0)
+            rvol15 = float(snap15.get("RVOL10") or snap15.get("RVOL") or 0.0)
+            macdh15 = float(snap15.get("MACDh") or 0.0)
+            rsi4h = float(snap4h.get("RSI") or 50.0)
+            atrp1h = float(snap1h.get("ATR%") or 0.0)
+        except Exception:
+            pass
+
+    if adx1h is not None and rvol15 is not None and macdh15 is not None:
+        if adx1h >= 30 and rvol15 >= 1.2 and macdh15 > 0:
+            tier = "A+"
+            tier_frac = SIZE_TIER_A_PLUS_PCT
+        elif adx1h >= 25 and rvol15 >= 1.0:
+            tier = "A"
+            tier_frac = SIZE_TIER_A_PCT
+        elif adx1h >= 20 and rvol15 >= 0.8:
+            tier = "B"
+            tier_frac = SIZE_TIER_B_PCT
+        else:
+            # Weak tape: size down sharply instead of blocking outright.
+            tier = "C"
+            tier_frac = max(0.03, SIZE_TIER_B_PCT * 0.5)
+
+    # Confidence nudges tier size but never changes cap behavior.
     conf_mult = (confidence - 50) / 50.0
-    conf_mult = max(0.0, min(conf_mult, 0.84))
-    base_frac = RISK_FRACTION * (0.6 + 0.4 * conf_mult)
-    
-    # >>> DYNAMIC RISK: Increase in fear dips (RSI4h<35, FGI>10), reduce in extreme fear (FGI<=10)
+    conf_mult = max(-0.2, min(conf_mult, 0.6))
+    base_frac = tier_frac * (1.0 + 0.25 * conf_mult)
+
+    # Constructive fear boost (swing dips), bounded later by hard caps.
     try:
-        # Get RSI4h for BTC and FGI
-        rsi4h_btc = get_btc_rsi4h_cached()  # Use cached helper
+        rsi4h_btc = get_btc_rsi4h_cached()
         fgi_features = fetch_fgi_features()
         fgi_v = fgi_features.get("value") if fgi_features else None
-        
-        # >>> FGI FALLBACK: Use RSI4h proxy if FGI fails
-        if fgi_v is None:
-            logger.warning("FGI fail—fallback to RSI4h proxy")
-            if rsi4h_btc is not None and rsi4h_btc < 35:
-                # Proceed as fear (treat as if FGI indicates fear)
-                fgi_v = 20  # Set to fear level for logic consistency
-                logger.debug(f"FGI fallback: Using RSI4h={rsi4h_btc:.1f}<35 as fear proxy")
-        
-        if rsi4h_btc is not None and fgi_v is not None:
-            if rsi4h_btc < 35 and fgi_v > 10:  # Fear but not extreme
-                base_frac *= 1.5  # 27% for aggressive dips (if base was 18%)
-            elif fgi_v <= 10:  # Extreme bad, halve
-                base_frac *= 0.5
+        if rsi4h_btc is not None and fgi_v is not None and rsi4h_btc < 40 and fgi_v > 10:
+            base_frac *= SIZE_FEAR_BOOST
+        elif fgi_v is not None and fgi_v <= 10:
+            base_frac *= 0.65
     except Exception:
-        pass  # Fallback to base calculation
+        pass
 
     # 2) Post-loss penalty (per symbol)
     if symbol and symbol in LAST_LOSS_INFO:
@@ -6633,13 +6662,24 @@ def size_position(price: float, usdt_balance: float, confidence: int, symbol: st
         elif klass == "unstable":
             base_frac *= 0.85
 
-    # 4) Portfolio utilization cap
-    base_frac = min(base_frac, PORTFOLIO_MAX_UTIL)
+    # 4) High volatility penalty
+    try:
+        if atrp1h is not None and atrp1h >= 1.5:
+            base_frac *= SIZE_VOL_PENALTY
+    except Exception:
+        pass
 
-    # Tentative notional
-    notional = spendable * base_frac
+    # 5) Build target notional from total equity, then apply hard caps.
+    total_equity = get_total_equity_usdt()
+    if total_equity is None or total_equity <= 0:
+        total_equity = usdt_balance
 
-    # 5) Friction guard (spread + est. slippage for this notional)
+    notional = float(total_equity) * float(max(0.0, base_frac))
+    max_per_trade = float(total_equity) * float(max(0.0, SIZE_MAX_PER_TRADE_PCT))
+    max_spendable = spendable * float(max(0.0, min(1.0, SIZE_MAX_SPENDABLE_PCT)))
+    notional = min(notional, max_per_trade, max_spendable, spendable)
+
+    # 6) Friction guard (spread + est. slippage for this notional)
     try:
         if symbol:
             fric_pct = estimate_slippage_pct(symbol, notional=notional)  # percentage points
@@ -6653,10 +6693,15 @@ def size_position(price: float, usdt_balance: float, confidence: int, symbol: st
     except Exception:
         pass
 
-    # Keep within spendable and respect MIN_NOTIONAL
-    notional = max(MIN_NOTIONAL, min(notional, spendable))
+    # Keep within spendable and honor MIN_NOTIONAL only for strong tiers.
+    notional = min(notional, spendable)
+    if notional < MIN_NOTIONAL:
+        if spendable >= MIN_NOTIONAL and tier in ("A", "A+"):
+            notional = MIN_NOTIONAL
+        else:
+            return 0.0
 
-    # 6) Convert to amount and conform to Binance filters
+    # 7) Convert to amount and conform to Binance filters
     desired_amt = notional / price
     amt, reason = _prepare_buy_amount(symbol, desired_amt, price) if symbol else (desired_amt, None)
 
