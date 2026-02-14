@@ -346,6 +346,9 @@ TAPE_IMPROVING_VWAP_REQ = True     # close 1h > VWAP 1h para extender
 # --- Profit quality guard (evitar micro-takes post-fees) ---
 MIN_GAIN_OVER_FEES_MULT = float(os.getenv("MIN_GAIN_OVER_FEES_MULT", "1.2"))  # Lowered from 1.6 - allow exits with less edge
 MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "7200"))  # 2h minimum hold by default for swing behavior
+# Simplify defensive exits for swing behavior (can be re-enabled via env).
+RAPID_KILL_ENABLED = bool(int(os.getenv("RAPID_KILL_ENABLED", "0")))
+STALL_KILL_ENABLED = bool(int(os.getenv("STALL_KILL_ENABLED", "0")))
 # >>> PATCH END
 
 # >>> CHAN PATCH CONFIG START (ANCHOR A)
@@ -3291,6 +3294,7 @@ def hybrid_decision(symbol: str):
         blocks.append("not enough candles")
         level = "HARD"
         return "hold", 50, 0.0, " | ".join(blocks)
+    df1h = df  # alias used by some fear/DCA helper branches
 
     row = df.iloc[-1]
     # ===== fast snapshots (needed for anchors 2,8) =====
@@ -5108,7 +5112,7 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                     if mode == 'dca' or (rsi4h_btc is not None and rsi4h_btc < 35):
                         # No stall kill for DCA or fear (RSI4h<35)
                         pass
-                    elif duration_sec < MIN_HOLD_SECONDS or gain_pct > 0.4:
+                    elif (not STALL_KILL_ENABLED) or duration_sec < MIN_HOLD_SECONDS or gain_pct > 0.4:
                         # No stall kill for min hold or green gains
                         pass
                     else:
@@ -5136,7 +5140,7 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                             # No stall kill if green
                             pass
                         # Only kill if vol_slope is not None and < 0 (fail-open: skip if None)
-                        elif minutes_since_entry > 120 and gain_pct < 0.4 and vol_slope is not None and vol_slope < 0:
+                        elif STALL_KILL_ENABLED and minutes_since_entry > 120 and gain_pct < 0.4 and vol_slope is not None and vol_slope < 0:
                             # Stall kill: >120min, gain<0.4%, vol_slope<0 (confirmed)
                             logger.info(f"[stall-kill] {symbol} +{gain_pct:.2f}% after {minutes_since_entry:.0f}min (vol_slope={vol_slope:.2f})")
                             exit_trade(symbol, amount_to_sell, trade_id, "stall-kill", is_short=(mode == 'short'))
@@ -5323,8 +5327,11 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
 
                 # >>> RAPID DETERIORATION KILL (HOOK SAFE3)
                 # Disable SAFE3 for DCA mode (no rapid-kill in fear DCA)
-                if mode == 'dca':
-                    logger.debug(f"[safe3-dca] {symbol}: Skipping SAFE3 rapid-kill (DCA mode)")
+                if (not RAPID_KILL_ENABLED) or mode == 'dca':
+                    if not RAPID_KILL_ENABLED:
+                        logger.debug(f"[safe3] {symbol}: Skipping SAFE3 rapid-kill (disabled)")
+                    else:
+                        logger.debug(f"[safe3-dca] {symbol}: Skipping SAFE3 rapid-kill (DCA mode)")
                 else:
                     try:
                         # >>> RAPID/PREARM GRACE IN FEAR: If RSI4h<35 and gain>0.2%, delay 30min
@@ -5456,8 +5463,12 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                             macd15_neg = float(macd15c.shift(1).iloc[-1]) < 0.0 if macd15c is not None else False
                             adx_slope6 = None
                             try:
-                                adx_series = ta.adx(df1h['high'], df1h['low'], df1h['close'], length=14)['ADX_14'].dropna()
-                                if len(adx_series) >= 6:
+                                df1h_adx = fetch_and_prepare_data_hybrid(symbol, timeframe="1h", limit=60)
+                                adx_series = (
+                                    ta.adx(df1h_adx['high'], df1h_adx['low'], df1h_adx['close'], length=14)['ADX_14'].dropna()
+                                    if (df1h_adx is not None and len(df1h_adx) >= 20) else None
+                                )
+                                if adx_series is not None and len(adx_series) >= 6:
                                     adx_slope6 = linregress(np.arange(6), adx_series.iloc[-6:]).slope
                             except Exception:
                                 pass
