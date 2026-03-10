@@ -4947,6 +4947,14 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 loop._trade_states.pop(trade_id, None)
 
         try:
+            # v28 FIX: Python scoping bug — because 'amount = amount_to_sell' is assigned
+            # inside the while loop below, Python treats 'amount' as a LOCAL variable
+            # throughout the entire loop() function, making any reference before that
+            # assignment raise UnboundLocalError.  Initializing here with the closure
+            # value prevents the error and was the root cause of ALL trailing threads
+            # dying immediately in v27 (explaining "bot enters buys but never exits").
+            amount = float(amount)  # pin local variable from closure before the while loop
+
             if not symbol or amount <= 0 or not purchase_price:
                 logger.info(f"[trailing] Invalid params, stopping. sym={symbol} amt={amount} px={purchase_price}")
                 return
@@ -8031,7 +8039,13 @@ def _relaunch_open_trade_threads():
 
 
 def startup_cleanup():
-    logger.info("Startup cleanup: closing non-USDT balances and syncing DB states...")
+    # v28: STARTUP_FRESH=1 → sell all positions and start from zero (clean slate for new version)
+    #      STARTUP_FRESH=0 (default) → skip open DB trades and relaunch their trailing threads
+    STARTUP_FRESH = bool(int(os.getenv("STARTUP_FRESH", "0")))
+    if STARTUP_FRESH:
+        logger.info("Startup cleanup: STARTUP_FRESH=1 — selling ALL positions for a clean start...")
+    else:
+        logger.info("Startup cleanup: closing unknown non-USDT balances, relaunching open trade threads...")
     try:
         try:
             exchange.load_markets()
@@ -8042,25 +8056,26 @@ def startup_cleanup():
         free = balances.get("free", {}) or {}
         non_usdt = {a: amt for a, amt in free.items() if a != "USDT" and amt and amt > 0}
 
-        # v28 FIX: Identify open trades in DB — do NOT sell those assets
+        # When not doing a fresh start, skip assets that have tracked open trades in the DB
         open_trade_assets: set = set()
-        try:
-            conn_ot = sqlite3.connect(DB_NAME)
-            cur_ot = conn_ot.cursor()
-            cur_ot.execute("SELECT DISTINCT symbol FROM transactions WHERE side='buy' AND status='open'")
-            for (sym,) in cur_ot.fetchall():
-                open_trade_assets.add(sym.split('/')[0])
-            conn_ot.close()
-        except Exception as e:
-            logger.warning(f"[startup] Could not query open trades: {e}")
+        if not STARTUP_FRESH:
+            try:
+                conn_ot = sqlite3.connect(DB_NAME)
+                cur_ot = conn_ot.cursor()
+                cur_ot.execute("SELECT DISTINCT symbol FROM transactions WHERE side='buy' AND status='open'")
+                for (sym,) in cur_ot.fetchall():
+                    open_trade_assets.add(sym.split('/')[0])
+                conn_ot.close()
+            except Exception as e:
+                logger.warning(f"[startup] Could not query open trades: {e}")
 
         conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
 
         for asset, amt in non_usdt.items():
             symbol = f"{asset}/USDT"
 
-            # v28 FIX: skip assets that have open tracked trades — relaunch their threads instead
-            if asset in open_trade_assets:
+            # Skip assets with open tracked trades (unless STARTUP_FRESH overrides)
+            if not STARTUP_FRESH and asset in open_trade_assets:
                 logger.info(f"[startup] Skipping sell of {asset} — open trade exists in DB, thread will be relaunched")
                 continue
 
@@ -8127,8 +8142,11 @@ def startup_cleanup():
 
         conn.close()
         reconcile_orphan_open_buys()
-        # v28 FIX: relaunch trailing threads for any open trades that survived cleanup
-        _relaunch_open_trade_threads()
+        # v28: only relaunch threads when NOT doing a fresh start
+        if not STARTUP_FRESH:
+            _relaunch_open_trade_threads()
+        else:
+            logger.info("[startup] STARTUP_FRESH=1 — skipping thread relaunch, starting clean.")
         logger.info("Startup cleanup done.")
     except Exception as e:
         logger.error(f"startup_cleanup fatal: {e}", exc_info=True)
