@@ -1,7 +1,7 @@
 
 
 # =========================
-# trader_v27.py -- ver variable VERSION
+# trader_v28.py -- ver variable VERSION
 # =========================
 from __future__ import annotations
 from pathlib import Path
@@ -36,7 +36,7 @@ load_dotenv()
 # >>> STRATEGY PROFILE (ANCHOR SP0)
 # Selector de estrategia
 
-VERSION = "v27"
+VERSION = "v28"
 PARK_IN_MOMENTUM = bool(int(os.getenv("PARK_IN_MOMENTUM", "0")))
 
 STRATEGY_PROFILES = {"USDT_MOMENTUM", "BTC_PARK", "AUTO_HYBRID"}
@@ -4905,8 +4905,10 @@ def sell_symbol(symbol: str, amount: float, trade_id: str, source: str = "trail"
         analyze_and_learn(trade_id, sell_price, learn_enabled=(source != "startup"))
 
         logger.info(f"Sold {symbol}: {sold_amount:.8f} @ {sell_price} (trade {trade_id}, source={source})")
+        return True  # v28 FIX: was returning None → exit_trade always logged "exit failed"
     except Exception as e:
         logger.error(f"sell_symbol error {symbol}: {e}")
+        return False  # v28 FIX: explicit False on error
 
 def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, trade_id: str, atr_abs: float, mode: str = 'momentum'):
     """
@@ -5043,11 +5045,12 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
 
 
             while True:
+              try:  # v28: per-iteration try/except — transient errors continue, thread never dies
                 # Check if trade is still open before processing
                 if trade_is_closed():
                     logger.info(f"[trailing] Trade {trade_id} for {symbol} is closed - stopping monitoring")
                     break
-                
+
                 # Defensive amount to liquidate in catastrophic / pre-arm / rapid-kill exits
                 try:
                     amount_to_sell = current_position_qty(symbol)
@@ -5064,7 +5067,13 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                     time.sleep(EXIT_CHECK_EVERY_SEC)
                     continue
 
-                last_price = get_last_price(symbol)  # or your own px getter
+                # v28 FIX: get_last_price raises RuntimeError on API timeout — catch it
+                try:
+                    last_price = get_last_price(symbol)
+                except (RuntimeError, Exception) as _price_err:
+                    logger.warning(f"[trailing] {symbol} price fetch failed ({_price_err}) — retrying next tick")
+                    time.sleep(EXIT_CHECK_EVERY_SEC)
+                    continue
 
                 # === DENTRO DE dynamic_trailing_stop, justo después de calcular duration_sec ===
                 # NUEVA LÓGICA RAPID-KILL MEJORADA
@@ -5710,8 +5719,8 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                     pass
                 
                 # Determine trailing ATR multiple based on analysis, FGI, and PROXY
-                # Base: 1.5 ATR (centro del rango: mean 1.38, median 1.44, q75 1.87)
-                base_mult = 1.5
+                # v28: raised from 1.5 → 2.0 ATR (industry standard for crypto swing: 2.0-2.5x)
+                base_mult = 2.0
                 
                 # >>> PROXY MODULATION: If RSI4h < RSI_FEAR_PROXY, widen trailing (k*=1.5)
                 proxy_active_trail = False
@@ -5740,19 +5749,20 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 else:
                     trail_atr_mult = base_mult  # Normal: 1.5 ATR (or 2.25 if proxy active)
                 
-                # Phase 0: Fixed stop at entry - 7% until +5-6% (no trailing)
-                if gain_pct_now < 5.0:
-                    # Keep fixed stop at entry - 7% (≈3.5 ATR)
-                    stop_price = purchase_price * 0.93  # entry - 7%
+                # Phase 0: ATR-based initial stop (v28: was -7% fixed, now 1.5x ATR ≈ 3-4%)
+                # Industry standard: 1.5-2.0x ATR(14) for crypto swing trades
+                if gain_pct_now < max(1.0, atr_pct * 1.0):  # v28: phase 0 ends at +1x ATR
+                    # Use initial_stop (ATR-based, computed at entry) instead of fixed -7%
+                    stop_price = initial_stop  # e.g., entry - 1.5*ATR ≈ -3 to -4%
                     trail_armed = False
                     
                     # >>> HYBRID: Use CHAN stop if available and more protective
                     if EXIT_MODE == "hybrid" and chandelier_stop is not None:
                         stop_price = max(stop_price, chandelier_stop)
                 
-                # Phase 1: Break-even at +5% (protect capital)
-                # Analysis shows: worst MAE of winners ≈ -4.7%, so +5% gives enough margin
-                elif gain_pct_now < 8.0:
+                # Phase 1: Break-even at +1x ATR (v28: was +5% fixed — 2.5x too late)
+                # Industry standard: lock breakeven once trade gains 1x ATR (~2%)
+                elif gain_pct_now < max(1.5, atr_pct * 1.5):  # v28: phase 1 until +1.5x ATR
                     # Move stop to break-even (or +0.5% if preferred)
                     be_stop = purchase_price  # Break-even (or use * 1.005 for +0.5%)
                     stop_price = max(initial_stop, be_stop)
@@ -5767,8 +5777,8 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                     
                     trail_armed = True
                 
-                # Phase 2: Trailing dynamic with ATR at +8% (let swing run)
-                # Analysis shows: 75% of winners never retrace >3.1% from peak (≈1.5 ATR)
+                # Phase 2: Active ATR trailing at +1.5x ATR (v28: was +8% fixed — too high)
+                # Industry standard: trail starts after breakeven is locked (+1.5x ATR offset)
                 else:
                     # Activate trailing based on ATR (using highest_close, not highest_high)
                     trail_armed = True
@@ -6358,19 +6368,24 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                         return
 
                 time.sleep(EXIT_CHECK_EVERY_SEC)
-                
+
+              except Exception as e:
+                # v28 FIX: transient error → log + sleep + continue (thread survives)
+                # Only kill the thread if the trade is already gone from the exchange
+                logger.warning(f"[trailing-iter] {symbol} iteration error (will retry): {type(e).__name__}: {e}")
+                try:
+                    age_s = (datetime.now(timezone.utc) - opened_ts).total_seconds()
+                    if age_s > 30 and trade_is_closed():
+                        logger.info(f"[trailing-iter] {symbol} trade confirmed closed — stopping thread")
+                        return
+                except Exception:
+                    pass
+                time.sleep(EXIT_CHECK_EVERY_SEC)
+                continue  # ← keep the thread alive on transient failures
+
         except Exception as e:
-            logger.error(f"Trailing error {symbol}: {e}")
-            try:
-                # Protección: si el trade es muy reciente, no cierres por un glitch, reintenta.
-                age_s = (datetime.now(timezone.utc) - opened_ts).total_seconds()
-                if age_s is None or age_s < 30:   # 30s de gracia
-                    time.sleep(EXIT_CHECK_EVERY_SEC)
-                elif not trade_is_closed():
-                    sell_symbol(symbol, amount, trade_id, source="trail")
-            except Exception:
-                pass
-            return
+            # v28: outer try catches only fatal setup errors (bad params, DB unreachable at init)
+            logger.error(f"[trailing-fatal] {symbol}: unrecoverable error in setup: {type(e).__name__}: {e}")
 
     threading.Thread(target=loop, daemon=True).start()
 
@@ -7969,22 +7984,86 @@ def reconcile_orphan_open_buys():
 # =========================
 # STARTUP CLEANUP
 # =========================
+def _relaunch_open_trade_threads():
+    """
+    v28 FIX: On restart, query all open buys from DB and relaunch their trailing
+    stop threads instead of liquidating them. This restores monitoring after a crash.
+    """
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT symbol, price, amount, trade_id
+            FROM transactions
+            WHERE side='buy' AND status='open'
+            ORDER BY ts ASC
+        """)
+        rows = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        logger.error(f"[startup-recovery] DB query failed: {e}")
+        return
+
+    if not rows:
+        logger.info("[startup-recovery] No open trades to recover.")
+        return
+
+    logger.info(f"[startup-recovery] Recovering {len(rows)} open trade(s) ...")
+    for row in rows:
+        symbol, price, amount, trade_id = row
+        try:
+            px = fetch_price(symbol) or float(price)
+            snap = quick_tf_snapshot(symbol, "1h", limit=100) or {}
+            atr_pct_val = float(snap.get("ATR%") or 2.0)
+            atr_abs_val = px * atr_pct_val / 100.0
+            logger.info(f"[startup-recovery] Relaunching trailing for {symbol} trade_id={trade_id} "
+                        f"entry={float(price):.4f} qty={float(amount):.6f} ATR={atr_abs_val:.4f}")
+            dynamic_trailing_stop(
+                symbol=symbol,
+                amount=float(amount),
+                purchase_price=float(price),
+                trade_id=trade_id,
+                atr_abs=atr_abs_val,
+                mode='momentum',
+            )
+        except Exception as e:
+            logger.error(f"[startup-recovery] Failed to relaunch trailing for {symbol} ({trade_id}): {e}")
+
+
 def startup_cleanup():
     logger.info("Startup cleanup: closing non-USDT balances and syncing DB states...")
     try:
-        try: 
+        try:
             exchange.load_markets()
-        except Exception as e: 
+        except Exception as e:
             logger.warning(f"load_markets warning: {e}")
 
-        balances = exchange.fetch_balance() or {} 
+        balances = exchange.fetch_balance() or {}
         free = balances.get("free", {}) or {}
         non_usdt = {a: amt for a, amt in free.items() if a != "USDT" and amt and amt > 0}
+
+        # v28 FIX: Identify open trades in DB — do NOT sell those assets
+        open_trade_assets: set = set()
+        try:
+            conn_ot = sqlite3.connect(DB_NAME)
+            cur_ot = conn_ot.cursor()
+            cur_ot.execute("SELECT DISTINCT symbol FROM transactions WHERE side='buy' AND status='open'")
+            for (sym,) in cur_ot.fetchall():
+                open_trade_assets.add(sym.split('/')[0])
+            conn_ot.close()
+        except Exception as e:
+            logger.warning(f"[startup] Could not query open trades: {e}")
 
         conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
 
         for asset, amt in non_usdt.items():
             symbol = f"{asset}/USDT"
+
+            # v28 FIX: skip assets that have open tracked trades — relaunch their threads instead
+            if asset in open_trade_assets:
+                logger.info(f"[startup] Skipping sell of {asset} — open trade exists in DB, thread will be relaunched")
+                continue
+
             if symbol not in getattr(exchange, "markets", {}):
                 logger.info(f"Skip {asset}: market {symbol} not found")
                 continue
@@ -8048,6 +8127,8 @@ def startup_cleanup():
 
         conn.close()
         reconcile_orphan_open_buys()
+        # v28 FIX: relaunch trailing threads for any open trades that survived cleanup
+        _relaunch_open_trade_threads()
         logger.info("Startup cleanup done.")
     except Exception as e:
         logger.error(f"startup_cleanup fatal: {e}", exc_info=True)
