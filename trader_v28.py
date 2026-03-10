@@ -4930,6 +4930,13 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
       - Rebound-guard to avoid selling right into bounces
     """
     def loop():
+        # v28 FIX: 'amount = amount_to_sell' inside the while loop makes Python treat
+        # 'amount' as a LOCAL variable throughout ALL of loop(), including lines before
+        # the assignment. 'nonlocal amount' tells Python to use the outer function's
+        # parameter instead, avoiding UnboundLocalError on every single trailing thread.
+        # This was the TRUE root cause of "bot enters buys but never exits" in v27.
+        nonlocal amount
+
         def trade_is_closed() -> bool:
             try:
                 conn = sqlite3.connect(DB_NAME)
@@ -4947,14 +4954,6 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 loop._trade_states.pop(trade_id, None)
 
         try:
-            # v28 FIX: Python scoping bug — because 'amount = amount_to_sell' is assigned
-            # inside the while loop below, Python treats 'amount' as a LOCAL variable
-            # throughout the entire loop() function, making any reference before that
-            # assignment raise UnboundLocalError.  Initializing here with the closure
-            # value prevents the error and was the root cause of ALL trailing threads
-            # dying immediately in v27 (explaining "bot enters buys but never exits").
-            amount = float(amount)  # pin local variable from closure before the while loop
-
             if not symbol or amount <= 0 or not purchase_price:
                 logger.info(f"[trailing] Invalid params, stopping. sym={symbol} amt={amount} px={purchase_price}")
                 return
