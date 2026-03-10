@@ -27,6 +27,12 @@ PARK_LOCK = threading.Lock()
 _RSI4H_BTC_CACHE = {'rsi': None, 'ts': 0}
 # >>> REMOVE MODULE-LEVEL GLOBALS: Use _TRADE_STATES dict for all trade states
 _TRADE_STATES = {}  # Module-level dict for all trade states (replaces PARK_GUARD and other globals)
+
+# v28: Shared price cache — all trailing threads read from here instead of hammering REST API
+# TTL=8s: fresh enough for trailing stop decisions, eliminates 429 bursts from concurrent threads
+_PRICE_CACHE: dict = {}          # {symbol: {'px': float, 'ts': float}}
+_PRICE_CACHE_TTL: float = 8.0   # seconds
+_PRICE_CACHE_LOCK = threading.Lock()
 # =========================
 # Config & initialization
 # =========================
@@ -1353,9 +1359,18 @@ def count_closed_bars_since(df: pd.DataFrame, ts_open: datetime) -> int:
 
 # >>> CHAN HELPERS END
 def get_last_price(symbol: str) -> float:
+    # v28: check shared cache first — avoids duplicate REST hits from concurrent trailing threads
+    now = time.time()
+    with _PRICE_CACHE_LOCK:
+        entry = _PRICE_CACHE.get(symbol)
+        if entry and (now - entry['ts']) < _PRICE_CACHE_TTL:
+            return entry['px']
+    # Cache miss or stale — fetch from exchange
     px = fetch_price(symbol)
     if px is None:
         raise RuntimeError(f"get_last_price: no price for {symbol}")
+    with _PRICE_CACHE_LOCK:
+        _PRICE_CACHE[symbol] = {'px': float(px), 'ts': time.time()}
     return float(px)
 
 
@@ -1363,7 +1378,13 @@ def fetch_price(symbol: str):
     try:
         t = exchange.fetch_ticker(symbol)
         price = t.get('last', None)
-        return float(price) if price is not None else None
+        if price is not None:
+            px = float(price)
+            # v28: also update shared cache whenever fetch_price is called directly
+            with _PRICE_CACHE_LOCK:
+                _PRICE_CACHE[symbol] = {'px': px, 'ts': time.time()}
+            return px
+        return None
     except Exception as e:
         logger.error(f"fetch_price error {symbol}: {e}")
         return None
@@ -4936,6 +4957,10 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
         # parameter instead, avoiding UnboundLocalError on every single trailing thread.
         # This was the TRUE root cause of "bot enters buys but never exits" in v27.
         nonlocal amount
+
+        # v28: stagger thread wakeups to avoid all threads hitting the API at the same instant
+        # Especially important when _relaunch_open_trade_threads starts many threads in quick succession
+        time.sleep(random.uniform(0, EXIT_CHECK_EVERY_SEC))
 
         def trade_is_closed() -> bool:
             try:
