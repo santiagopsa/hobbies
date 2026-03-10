@@ -265,9 +265,9 @@ ADX_MIN_DEFAULT = float(os.getenv("ADX_MIN_DEFAULT", "20"))  # Increased from 15
 RSI_MIN_DEFAULT, RSI_MAX_DEFAULT = float(os.getenv("RSI_MIN_DEFAULT", "40")), 68  # Increased from 35 - avoid false oversold
 RVOL_BASE_DEFAULT = 1.35  # Ajustado desde 1.5: tendencias buenas viven entre 1.1-1.3
 # >>> PATCH START: gate & cooldowns
-SCORE_GATE_START = float(os.getenv("SCORE_GATE_START", "5.5"))  # Increased from 4.8
-SCORE_GATE_MIN = float(os.getenv("SCORE_GATE_MIN", "5.2"))  # Minimum gate (allows learning to lower it)
-SCORE_GATE_MAX = float(os.getenv("SCORE_GATE_MAX", "6.2"))  # Maximum gate
+SCORE_GATE_START = float(os.getenv("SCORE_GATE_START", "5.0"))  # v28: lowered from 5.5 — max score ~8-9, 5.5 was blocking most entries
+SCORE_GATE_MIN = float(os.getenv("SCORE_GATE_MIN", "4.8"))    # v28: lowered from 5.2 — allows autotune to find entries in calm markets
+SCORE_GATE_MAX = float(os.getenv("SCORE_GATE_MAX", "6.2"))    # unchanged
 SCORE_GATE_HARD_MIN = int(os.getenv("SCORE_GATE_HARD_MIN", "6"))  # DEPRECATED: use SCORE_GATE_MIN instead
 
 # re-entry/cooldowns
@@ -449,8 +449,14 @@ NBUS_MACDH15_NEG = -0.002
 
 # >>> PATCH A1: BEAR/THIN-TAPE & COLLAPSE KNOBS
 # Bearish-context gate (4h) & Thin-tape RVOL floors
-RSI4H_HARD_MIN = float(os.getenv("RSI4H_HARD_MIN", "50.0"))  # Increased from 45.0 - block more in bear markets
-RSI4H_SOFT_MIN = 50.0       # SOFT block if 45≤RSI<50 and trending down unless RVOL strong
+# v28: RSI4h gate logic (clarified):
+#   RSI4h < RSI_FEAR_PROXY (35) → fear zone → DCA allowed, swing blocked by hybrid_decision
+#   RSI4h 35–45               → soft bear → swing allowed if RVOL strong (RSI4H_SOFT_MIN)
+#   RSI4h 45–RSI4H_HARD_MIN   → borderline → swing allowed (hard gate not yet triggered)
+#   RSI4h >= RSI4H_HARD_MIN    → bull zone → normal swing entries
+# Was: HARD_MIN=50 + FEAR_PROXY=35 left a dead zone at 35-50 where neither rule was clear
+RSI4H_HARD_MIN = float(os.getenv("RSI4H_HARD_MIN", "45.0"))  # v28: lowered from 50 — 45 is real bear/bull boundary
+RSI4H_SOFT_MIN = 40.0       # SOFT block if 40≤RSI<45 and trending down unless RVOL strong
 RSI4H_SLOPE_BARS = 6        # slope lookback (4h bars)
 
 # >>> RSI FEAR PROXY (replaces FGI - configurable via .env)
@@ -5081,6 +5087,7 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 # Check if trade is still open before processing
                 if trade_is_closed():
                     logger.info(f"[trailing] Trade {trade_id} for {symbol} is closed - stopping monitoring")
+                    cleanup_trade_state()  # v28 fix: was missing, causing stale state after close
                     break
 
                 # Defensive amount to liquidate in catastrophic / pre-arm / rapid-kill exits
@@ -5588,6 +5595,9 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 atr_pct = (atr_abs / entry_price) * 100.0 if (atr_abs and entry_price) else 2.0  # ATR% real
                 r_pct = INIT_STOP_ATR_MULT * atr_pct  # Risk en %
                 tp_threshold = 1.5 * r_pct  # TP en 1.5R
+                # v28 fix: snapshot atr_pct for phase thresholds BEFORE it gets overwritten at line ~5689
+                # (atr_pct is recalculated from 1h ATR later; using that for phase gates causes jumping)
+                _atr_pct_for_phases = atr_pct
 
                 # 'Strong trend' mode requires both 1h and 4h ADX strong
                 try:
@@ -5678,11 +5688,11 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                     except Exception as e:
                         logger.debug(f"partial sell check error {symbol}: {e}")
                 
-                # Track highest close price for trailing (use close, not high, to be more conservative)
+                # Track highest price for trailing — use max(1h close, live price) so the trail
+                # doesn't lag when price has moved above the last closed candle (v28 fix)
                 if not hasattr(loop, '_highest_close'):
                     loop._highest_close = purchase_price
-                if close1h > loop._highest_close:
-                    loop._highest_close = close1h
+                loop._highest_close = max(loop._highest_close, close1h, price)
                 
                 # Calculate ATR% for trailing distance (use close1h, not current price)
                 atr1h_abs = float(df1h['ATR'].iloc[-1]) if pd.notna(df1h['ATR'].iloc[-1]) else atr_abs
@@ -5783,18 +5793,18 @@ def dynamic_trailing_stop(symbol: str, amount: float, purchase_price: float, tra
                 
                 # Phase 0: ATR-based initial stop (v28: was -7% fixed, now 1.5x ATR ≈ 3-4%)
                 # Industry standard: 1.5-2.0x ATR(14) for crypto swing trades
-                if gain_pct_now < max(1.0, atr_pct * 1.0):  # v28: phase 0 ends at +1x ATR
+                if gain_pct_now < max(1.0, _atr_pct_for_phases * 1.0):  # v28 fix: uses entry ATR, not live ATR
                     # Use initial_stop (ATR-based, computed at entry) instead of fixed -7%
                     stop_price = initial_stop  # e.g., entry - 1.5*ATR ≈ -3 to -4%
                     trail_armed = False
-                    
+
                     # >>> HYBRID: Use CHAN stop if available and more protective
                     if EXIT_MODE == "hybrid" and chandelier_stop is not None:
                         stop_price = max(stop_price, chandelier_stop)
-                
+
                 # Phase 1: Break-even at +1x ATR (v28: was +5% fixed — 2.5x too late)
                 # Industry standard: lock breakeven once trade gains 1x ATR (~2%)
-                elif gain_pct_now < max(1.5, atr_pct * 1.5):  # v28: phase 1 until +1.5x ATR
+                elif gain_pct_now < max(1.5, _atr_pct_for_phases * 1.5):  # v28 fix: uses entry ATR
                     # Move stop to break-even (or +0.5% if preferred)
                     be_stop = purchase_price  # Break-even (or use * 1.005 for +0.5%)
                     stop_price = max(initial_stop, be_stop)
@@ -8309,11 +8319,21 @@ if __name__ == "__main__":
             logger.info("Backtest complete. Exiting.")
             exit(0)
 
+        _main_cycle_count = 0  # v28: counter for periodic reconciliation
         while True:
             check_log_rotation()
 
             crash_active = crash_halt()
             cycle_decisions = []
+
+            # v28: reconcile phantom open trades every 10 cycles (~5 min at 30s/cycle)
+            # Stale DB rows with status='open' block new entries by inflating open_trades count
+            _main_cycle_count += 1
+            if _main_cycle_count % 10 == 0:
+                try:
+                    reconcile_orphan_open_buys()
+                except Exception as _rec_err:
+                    logger.debug(f"[reconcile] periodic error: {_rec_err}")
             
             # >>> CACHE RSI4h BTC: Update cache via helper function (TTL 300s)
             # Cache is updated automatically by get_btc_rsi4h_cached() when called
