@@ -8038,9 +8038,9 @@ def _relaunch_open_trade_threads():
 
 
 def startup_cleanup():
-    # v28: STARTUP_FRESH=1 → sell all positions and start from zero (clean slate for new version)
-    #      STARTUP_FRESH=0 (default) → skip open DB trades and relaunch their trailing threads
-    STARTUP_FRESH = bool(int(os.getenv("STARTUP_FRESH", "0")))
+    # v28: STARTUP_FRESH=1 (default) → sell all positions and start from zero
+    #      STARTUP_FRESH=0 → skip open DB trades and relaunch their trailing threads (recovery mode)
+    STARTUP_FRESH = bool(int(os.getenv("STARTUP_FRESH", "1")))
     if STARTUP_FRESH:
         logger.info("Startup cleanup: STARTUP_FRESH=1 — selling ALL positions for a clean start...")
     else:
