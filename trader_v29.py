@@ -8451,18 +8451,202 @@ def daily_report():
     except Exception as e:
         logger.error(f"daily_report error: {e}")
 
-# Schedule daily report (every 24 hours)
+# =========================
+# v29: WEEKLY PERFORMANCE REPORT (bot vs market benchmark)
+# =========================
+def weekly_report():
+    """
+    Weekly performance report comparing bot vs BTC buy-and-hold.
+    Designed to be copy-pasted to Claude for analysis.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        week_ago = now - timedelta(days=7)
+
+        conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+
+        # --- 1) All closed trades this week ---
+        cur.execute("""
+            SELECT t_sell.symbol, t_sell.trade_id, t_buy.price AS buy_px, t_sell.price AS sell_px,
+                   t_buy.amount, t_buy.ts AS buy_ts, t_sell.ts AS sell_ts
+            FROM transactions t_sell
+            JOIN transactions t_buy ON t_sell.trade_id = t_buy.trade_id AND t_buy.side='buy'
+            WHERE t_sell.side='sell' AND t_sell.status='closed'
+              AND t_sell.ts >= ?
+            ORDER BY t_sell.ts
+        """, (week_ago.isoformat(),))
+        closed_trades = cur.fetchall()
+
+        # --- 2) Open positions ---
+        cur.execute("""
+            SELECT symbol, price, amount, ts, trade_id
+            FROM transactions WHERE side='buy' AND status='open'
+        """)
+        open_positions = cur.fetchall()
+
+        # --- 3) Equity snapshot ---
+        cur.execute("""
+            SELECT value FROM equity_guard_state WHERE key='start_balance_today'
+        """)
+        row_eq = cur.fetchone()
+        conn.close()
+
+        # Current balances
+        try:
+            bal = exchange.fetch_balance() or {}
+            usdt_free = float((bal.get("free", {}) or {}).get("USDT", 0) or 0)
+            usdt_total = float((bal.get("total", {}) or {}).get("USDT", 0) or 0)
+        except Exception:
+            usdt_free = 0; usdt_total = 0
+
+        # Calculate total equity (USDT + open positions value)
+        open_value = 0.0
+        open_lines = []
+        for sym, px, amt, ts, tid in open_positions:
+            try:
+                cur_px = fetch_price(sym)
+                if cur_px:
+                    val = float(amt) * cur_px
+                    pnl_pct = (cur_px / float(px) - 1.0) * 100.0
+                    open_value += val
+                    open_lines.append(f"  {sym}: qty={float(amt):.4f} entry={float(px):.4f} now={cur_px:.4f} ({pnl_pct:+.2f}%)")
+            except Exception:
+                pass
+
+        total_equity = usdt_total + open_value
+
+        # --- 4) Trade stats ---
+        wins = 0; losses = 0; total_pnl = 0.0; pnl_by_symbol = {}
+        exit_reasons = {}
+        trade_lines = []
+        for sym, tid, buy_px, sell_px, amt, buy_ts, sell_ts in closed_trades:
+            pnl = (float(sell_px) - float(buy_px)) * float(amt)
+            pnl_pct = (float(sell_px) / float(buy_px) - 1.0) * 100.0
+            total_pnl += pnl
+            if pnl >= 0:
+                wins += 1
+            else:
+                losses += 1
+            base = sym.split("/")[0]
+            pnl_by_symbol[base] = pnl_by_symbol.get(base, 0.0) + pnl
+
+            # Get exit reason from trade_features
+            try:
+                conn2 = sqlite3.connect(DB_NAME); cur2 = conn2.cursor()
+                cur2.execute("SELECT features_json FROM trade_features WHERE trade_id=? AND side='exit' ORDER BY ts DESC LIMIT 1", (tid,))
+                feat_row = cur2.fetchone()
+                conn2.close()
+                reason = "unknown"
+                if feat_row:
+                    feats = json.loads(feat_row[0])
+                    reason = feats.get("exit_reason", feats.get("general", {}).get("exit_reason", "unknown"))
+                exit_reasons[reason] = exit_reasons.get(reason, 0) + 1
+            except Exception:
+                pass
+
+            # Duration
+            try:
+                dt_buy = datetime.fromisoformat(buy_ts.replace("Z",""))
+                dt_sell = datetime.fromisoformat(sell_ts.replace("Z",""))
+                dur_h = (dt_sell - dt_buy).total_seconds() / 3600.0
+            except Exception:
+                dur_h = 0
+            trade_lines.append(f"  {sym} {pnl_pct:+.2f}% (${pnl:+.3f}) {dur_h:.1f}h")
+
+        total_trades = wins + losses
+        win_rate = (wins / total_trades * 100.0) if total_trades > 0 else 0.0
+
+        # --- 5) BTC benchmark (buy-and-hold comparison) ---
+        btc_now = 0.0; btc_week_ago = 0.0; btc_change_pct = 0.0
+        try:
+            btc_now = fetch_price("BTC/USDT") or 0
+            df_btc = fetch_and_prepare_data_hybrid("BTC/USDT", timeframe="1d", limit=10)
+            if df_btc is not None and len(df_btc) >= 7:
+                btc_week_ago = float(df_btc['close'].iloc[-7])
+                btc_change_pct = (btc_now / btc_week_ago - 1.0) * 100.0 if btc_week_ago > 0 else 0
+        except Exception:
+            pass
+
+        # Bot return this week
+        bot_return_pct = (total_pnl / max(total_equity - total_pnl, 1.0)) * 100.0 if total_equity > 0 else 0
+
+        # --- 6) Conviction override stats ---
+        conviction_count = 0
+        try:
+            conn3 = sqlite3.connect(DB_NAME); cur3 = conn3.cursor()
+            cur3.execute("""
+                SELECT COUNT(*) FROM decision_log
+                WHERE ts >= ? AND action='buy'
+            """, (week_ago.isoformat(),))
+            total_buys_week = cur3.fetchone()[0] or 0
+            conn3.close()
+        except Exception:
+            total_buys_week = 0
+
+        # --- 7) Build message ---
+        sep = "—" * 30
+        msg = f"📊 *WEEKLY REPORT* ({VERSION})\n"
+        msg += f"Period: {week_ago.strftime('%b %d')} - {now.strftime('%b %d, %Y')}\n"
+        msg += f"Profile: {STRATEGY_PROFILE}\n"
+        msg += f"{sep}\n"
+        msg += f"*EQUITY*\n"
+        msg += f"USDT: ${usdt_total:.2f} | Open: ${open_value:.2f}\n"
+        msg += f"Total: *${total_equity:.2f}*\n"
+        msg += f"{sep}\n"
+        msg += f"*TRADES ({total_trades})*\n"
+        msg += f"Wins: {wins} | Losses: {losses}\n"
+        msg += f"Win Rate: *{win_rate:.0f}%*\n"
+        msg += f"PnL: *${total_pnl:+.3f}* ({bot_return_pct:+.2f}%)\n"
+        if pnl_by_symbol:
+            msg += f"By coin: {', '.join(f'{k}:{v:+.3f}' for k,v in sorted(pnl_by_symbol.items(), key=lambda x:-x[1]))}\n"
+        if exit_reasons:
+            msg += f"Exits: {', '.join(f'{k}:{v}' for k,v in sorted(exit_reasons.items(), key=lambda x:-x[1]))}\n"
+        msg += f"{sep}\n"
+        msg += f"*BOT vs MARKET*\n"
+        msg += f"Bot: *{bot_return_pct:+.2f}%* this week\n"
+        msg += f"BTC: *{btc_change_pct:+.2f}%* this week (${btc_week_ago:.0f}->${btc_now:.0f})\n"
+        msg += f"Alpha: *{bot_return_pct - btc_change_pct:+.2f}%*\n"
+        msg += f"{sep}\n"
+        if open_lines:
+            msg += f"*OPEN POSITIONS ({len(open_lines)})*\n"
+            msg += "\n".join(open_lines) + "\n"
+            msg += f"{sep}\n"
+        if trade_lines:
+            msg += f"*TRADE LOG*\n"
+            msg += "\n".join(trade_lines[-10:]) + "\n"  # last 10
+            if len(trade_lines) > 10:
+                msg += f"  ...and {len(trade_lines)-10} more\n"
+        msg += f"{sep}\n"
+        msg += f"_Copy this report to Claude for analysis_"
+
+        send_telegram_message(msg)
+        logger.info(f"[weekly-report] Sent: {total_trades} trades, PnL=${total_pnl:+.3f}, WR={win_rate:.0f}%, Alpha={bot_return_pct - btc_change_pct:+.2f}%")
+
+    except Exception as e:
+        logger.error(f"weekly_report error: {e}", exc_info=True)
+
+
+# Schedule daily + weekly reports
 def schedule_daily_report():
-    """
-    Schedule daily report to run every 24 hours.
-    """
     def run_daily():
         daily_report()
-        # Schedule next run in 24 hours
         threading.Timer(86400.0, run_daily).start()
-    
-    # Start first report in 1 hour (to avoid immediate execution)
     threading.Timer(3600.0, run_daily).start()
+
+def schedule_weekly_report():
+    """Run weekly report every Sunday at ~18:00 UTC."""
+    def run_weekly():
+        weekly_report()
+        threading.Timer(604800.0, run_weekly).start()  # 7 days
+    # Calculate seconds until next Sunday 18:00 UTC
+    now = datetime.now(timezone.utc)
+    days_until_sunday = (6 - now.weekday()) % 7
+    if days_until_sunday == 0 and now.hour >= 18:
+        days_until_sunday = 7
+    next_sunday = now.replace(hour=18, minute=0, second=0, microsecond=0) + timedelta(days=days_until_sunday)
+    delay = (next_sunday - now).total_seconds()
+    logger.info(f"[weekly-report] Scheduled: next run in {delay/3600:.1f}h ({next_sunday.strftime('%Y-%m-%d %H:%M UTC')})")
+    threading.Timer(delay, run_weekly).start()
 
 if __name__ == "__main__":
     logger.info(f"Starting hybrid trader ({VERSION}, profile={STRATEGY_PROFILE})…")
@@ -8495,6 +8679,10 @@ if __name__ == "__main__":
             
             logger.info("Backtest complete. Exiting.")
             exit(0)
+
+        # v29: start scheduled reports
+        schedule_daily_report()
+        schedule_weekly_report()
 
         _main_cycle_count = 0  # v28: counter for periodic reconciliation
         while True:
