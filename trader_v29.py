@@ -7281,17 +7281,32 @@ def has_open_position(symbol: str) -> bool:
         px = None
 
     db_notional = (db_qty * float(px)) if px else 0.0
-    exch_notional = 0.0
 
-    # Use exchange balance as sanity fallback to avoid stale DB-only dust.
+    # v29-fix: verify exchange actually holds the position (DB can be stale after restart/cleanup)
+    exch_notional = 0.0
     try:
         base = symbol.split("/")[0]
         bal = exchange.fetch_balance() or {}
+        free_base = float((bal.get("free", {}) or {}).get(base, 0.0) or 0.0)
         total_base = float((bal.get("total", {}) or {}).get(base, 0.0) or 0.0)
         if total_base > 0:
             px2 = px or fetch_price(symbol)
             if px2:
                 exch_notional = total_base * float(px2)
+        # v29-fix: if exchange has no real balance but DB says open, clean up stale DB entry
+        if total_base <= 0 and db_qty > 0:
+            logger.info(f"[dust-cleanup] {symbol}: DB shows open qty={db_qty:.6f} but exchange balance=0 — closing stale DB entry")
+            try:
+                conn2 = sqlite3.connect(DB_NAME); cur2 = conn2.cursor()
+                cur2.execute("UPDATE transactions SET status='closed' WHERE symbol=? AND side='buy' AND status='open'", (symbol,))
+                conn2.commit(); conn2.close()
+            except Exception as e:
+                logger.warning(f"[dust-cleanup] DB cleanup failed for {symbol}: {e}")
+            return False
+        # v29-fix: if exchange balance is dust (below MIN_NOTIONAL), don't count as holding
+        if exch_notional > 0 and exch_notional < MIN_NOTIONAL:
+            logger.debug(f"[dust-skip] {symbol}: exchange notional ${exch_notional:.2f} < MIN_NOTIONAL ${MIN_NOTIONAL} — treating as no position")
+            return False
     except Exception:
         pass
 
@@ -8113,32 +8128,75 @@ def write_status_json(decisions: list, path: str = "status.json"):
 # Reconcile orphans
 # =========================
 def reconcile_orphan_open_buys():
+    """v29: Bidirectional reconciliation DB ↔ Exchange spot balances.
+    1) DB says open but exchange has no balance → close orphan in DB
+    2) DB says open but exchange qty differs significantly → log warning
+    3) Exchange has balance but DB has no open trade → log untracked asset
+    """
     try:
         try: exchange.load_markets()
         except Exception as e: logger.warning(f"load_markets warn (reconcile): {e}")
 
-        balances = exchange.fetch_balance() or {}; free = balances.get("free", {}) or {}
+        balances = exchange.fetch_balance() or {}
+        free = balances.get("free", {}) or {}
+        total = balances.get("total", {}) or {}
         conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+
+        # --- Direction 1: DB open trades → verify exchange has balance ---
         cur.execute("SELECT symbol, trade_id, amount FROM transactions WHERE side='buy' AND status='open'")
         rows = cur.fetchall()
 
         closed = 0
+        db_open_assets = set()
         for symbol, trade_id, buy_amt in rows:
             base = symbol.split('/')[0]
-            held = float(free.get(base, 0) or 0.0)
+            db_open_assets.add(base)
+            # Use total (not just free) to catch locked balances too
+            held = float(total.get(base, 0) or 0.0)
             min_amt = None
             try:
                 if symbol in getattr(exchange, "markets", {}):
                     min_amt = (exchange.markets[symbol].get("limits", {}) or {}).get("amount", {}).get("min", None)
             except Exception: pass
             dust_eps = float(min_amt) if min_amt else 1e-10
+
             if held <= dust_eps:
+                # Exchange has no real balance → orphan
                 cur.execute("UPDATE transactions SET status='closed_orphan' WHERE trade_id=? AND side='buy'", (trade_id,))
                 conn.commit(); closed += 1
-                send_telegram_message(f"🧹 *Startup Reconcile*: Cerrado en BD trade `{trade_id}` ({symbol}) por falta de balance (status=closed_orphan)")
-                logger.info(f"Reconciled orphan BUY -> closed_orphan: {trade_id} {symbol}")
+                send_telegram_message(f"🧹 *Reconcile*: Cerrado orphan `{trade_id}` ({symbol}) — exchange balance=0")
+                logger.info(f"[reconcile] orphan closed: {trade_id} {symbol} (DB qty={buy_amt}, exch=0)")
+            else:
+                # Exchange has balance — check if qty matches
+                diff_pct = abs(held - float(buy_amt)) / max(float(buy_amt), 1e-10) * 100
+                if diff_pct > 10.0:  # >10% difference
+                    logger.warning(f"[reconcile] QTY MISMATCH {symbol}: DB={float(buy_amt):.6f} vs Exchange={held:.6f} ({diff_pct:.1f}% diff) trade_id={trade_id}")
+
+        # --- Direction 2: Exchange balances → verify DB has open trade ---
+        untracked = 0
+        for asset, amt in total.items():
+            if asset == "USDT" or not amt or float(amt) <= 0:
+                continue
+            if asset in db_open_assets:
+                continue  # Already tracked
+            symbol = f"{asset}/USDT"
+            if symbol not in getattr(exchange, "markets", {}):
+                continue
+            px = fetch_price(symbol)
+            notional = float(amt) * float(px) if px else 0.0
+            if notional < MIN_NOTIONAL:
+                continue  # Dust, ignore
+            # Real position not tracked in DB
+            untracked += 1
+            logger.warning(f"[reconcile] UNTRACKED POSITION: {symbol} qty={float(amt):.6f} (~${notional:.2f}) — not in DB as open trade")
+            send_telegram_message(f"⚠️ *Reconcile*: Posicion NO rastreada `{symbol}` qty=`{float(amt):.6f}` (~${notional:.2f})")
+
         conn.close()
-        if closed: logger.info(f"Reconcile: {closed} BUYs huérfanos cerrados.")
+        total_issues = closed + untracked
+        if total_issues:
+            logger.info(f"[reconcile] Done: {closed} orphans closed, {untracked} untracked positions found")
+        else:
+            logger.info("[reconcile] DB and Exchange are in sync ✓")
     except Exception as e:
         logger.error(f"reconcile_orphan_open_buys error: {e}", exc_info=True)
 
