@@ -42,7 +42,7 @@ load_dotenv()
 # >>> STRATEGY PROFILE (ANCHOR SP0)
 # Selector de estrategia
 
-VERSION = "v28"
+VERSION = "v29"
 PARK_IN_MOMENTUM = bool(int(os.getenv("PARK_IN_MOMENTUM", "0")))
 
 STRATEGY_PROFILES = {"USDT_MOMENTUM", "BTC_PARK", "AUTO_HYBRID"}
@@ -117,7 +117,7 @@ PARK_REENTRY_PAD_BPS = int(os.getenv("PARK_REENTRY_PAD_BPS", "30"))  # +0.30% pa
 PARK_MIN_HOLD_MIN = int(os.getenv("PARK_MIN_HOLD_MIN", "15"))   # evitar churn
 PARK_TRAIL_BPS = int(round(PARK_TRAIL_PCT * 10000))
 
-# Target de parking cuando el entorno está “calm/safe”
+# Target de parking cuando el entorno está "calm/safe"
 AUTO_PARK_PCT = float(os.getenv("AUTO_PARK_PCT", "0.60"))      # 60% del capital libre (tras reserva) hacia BTC
 AUTO_PARK_DEADBAND_BPS = int(os.getenv("AUTO_PARK_DEADBAND_BPS", "50"))  # banda muerta ±0.50% para evitar micro-churn
 
@@ -130,7 +130,7 @@ HYBRID_GLOBAL_COOLDOWN_SEC = int(os.getenv("HYBRID_GLOBAL_COOLDOWN_SEC", "120"))
 HYBRID_MIN_REVERSAL_BPS    = int(os.getenv("HYBRID_MIN_REVERSAL_BPS", "10"))
 HYBRID_MAX_ACTIONS_5M      = int(os.getenv("HYBRID_MAX_ACTIONS_5M", "4"))        # tope de acciones en 5 minutos
 
-# Condiciones “calm/safe”
+# Condiciones "calm/safe"
 AUTO_SAFE_FGI = int(os.getenv("AUTO_SAFE_FGI", "60"))           # FGI ≥ 60
 AUTO_SAFE_ATRP_BTC = float(os.getenv("AUTO_SAFE_ATRP_BTC", "1.2"))  # ATR% 30d de BTC ≤ 1.2%
 
@@ -245,7 +245,7 @@ SCALE_IN_MIN_R_MULT = 1.0             # sólo si el trade ya está >= 1R desde l
 SLOT_STEAL_ENABLED = True
 SLOT_STEAL_MAX_PER_DAY = 3
 SLOT_STEAL_MIN_CONF = 65
-SLOT_STEAL_SCORE_DELTA = 1.2
+SLOT_STEAL_SCORE_DELTA = 13.0  # v29: scaled to 0-100 (was 1.2)
 SLOT_STEAL_MIN_HOLD_MINUTES = 15
 SLOT_STEAL_MIN_NOTIONAL = 50.0  # no intentes rotar por montos muy bajos
 
@@ -265,10 +265,10 @@ ADX_MIN_DEFAULT = float(os.getenv("ADX_MIN_DEFAULT", "20"))  # Increased from 15
 RSI_MIN_DEFAULT, RSI_MAX_DEFAULT = float(os.getenv("RSI_MIN_DEFAULT", "40")), 68  # Increased from 35 - avoid false oversold
 RVOL_BASE_DEFAULT = 1.35  # Ajustado desde 1.5: tendencias buenas viven entre 1.1-1.3
 # >>> PATCH START: gate & cooldowns
-SCORE_GATE_START = float(os.getenv("SCORE_GATE_START", "5.0"))  # v28: lowered from 5.5 — max score ~8-9, 5.5 was blocking most entries
-SCORE_GATE_MIN = float(os.getenv("SCORE_GATE_MIN", "4.8"))    # v28: lowered from 5.2 — allows autotune to find entries in calm markets
-SCORE_GATE_MAX = float(os.getenv("SCORE_GATE_MAX", "6.2"))    # unchanged
-SCORE_GATE_HARD_MIN = float(os.getenv("SCORE_GATE_HARD_MIN", "3.0"))  # v28-fix: minimum score to allow ANY entry (was 6, deprecated label removed)
+SCORE_GATE_START = float(os.getenv("SCORE_GATE_START", "55.0"))  # v29: normalized 0-100 (was 5.0 on 0-9 scale)
+SCORE_GATE_MIN = float(os.getenv("SCORE_GATE_MIN", "50.0"))    # v29: normalized 0-100 (was 4.8)
+SCORE_GATE_MAX = float(os.getenv("SCORE_GATE_MAX", "72.0"))    # v29: normalized 0-100 (was 6.2)
+SCORE_GATE_HARD_MIN = float(os.getenv("SCORE_GATE_HARD_MIN", "35.0"))  # v29: minimum score for ANY entry (normalized 0-100)
 
 # re-entry/cooldowns
 COOLDOWN_AFTER_COLLAPSE_MIN = 60   # minutes — after a volume-collapse exit
@@ -287,7 +287,7 @@ MEAN_REV_WEIGHT = 0.02
 # Buy-flow controller
 TARGET_BUY_RATIO = 0.38
 BUY_RATIO_DELTA = 0.05
-GATE_STEP = 0.10
+GATE_STEP = 1.1  # v29: scaled to 0-100 (was 0.10)
 EPSILON_EXPLORE = 0.03
 DECISION_WINDOW = 120
 
@@ -474,6 +474,25 @@ RVOL_COLLAPSE_EXIT = 0.50   # if 15m RVOL < 0.50 after min hold → exit
 MACD_H_ENTRY_MIN = 0.0 # Require positive MACD hist for entries (earlier signal than RSI/ADX alone).
 TRAIL_WIDEN_MULT = 1.2 # Widen trail 20% if RVOL >2.0 (grace for vol dips).
 
+# ===== v29 SCORING WEIGHTS (category-weighted, normalized 0-100) =====
+W_MOMENTUM = float(os.getenv("W_MOMENTUM", "0.35"))   # RSI, MACD, Fisher, StochRSI
+W_TREND    = float(os.getenv("W_TREND",    "0.40"))   # ADX, EMA alignment, MTF, price_slope
+W_VOLUME   = float(os.getenv("W_VOLUME",   "0.25"))   # RVOL, OBI, spread
+
+# v29 new signal thresholds
+MACDH_ZEROCROSS_BONUS = float(os.getenv("MACDH_ZEROCROSS_BONUS", "0.15"))
+ADX_RISING_INTO_25_BONUS = float(os.getenv("ADX_RISING_INTO_25_BONUS", "0.12"))
+BB_SQUEEZE_SOFT_RANK = float(os.getenv("BB_SQUEEZE_SOFT_RANK", "0.15"))
+OBI_BONUS_THRESHOLD = float(os.getenv("OBI_BONUS_THRESHOLD", "0.33"))
+OBI_BONUS_VALUE = float(os.getenv("OBI_BONUS_VALUE", "0.08"))
+RVOL_SOFT_BLOCK_THRESHOLD = float(os.getenv("RVOL_SOFT_BLOCK_THRESHOLD", "1.0"))
+
+# v29 conviction override thresholds
+CONVICTION_RSI4H_DEEP_OVERSOLD = float(os.getenv("CONVICTION_RSI4H_DEEP_OVERSOLD", "25.0"))
+CONVICTION_ADX_EXPLOSIVE = float(os.getenv("CONVICTION_ADX_EXPLOSIVE", "40.0"))
+CONVICTION_RVOL_EXPLOSIVE = float(os.getenv("CONVICTION_RVOL_EXPLOSIVE", "2.5"))
+CONVICTION_FISHER_CROSS_FROM = float(os.getenv("CONVICTION_FISHER_CROSS_FROM", "-1.5"))
+
 # >>> FGI CONFIG (ANCHOR FGI0)
 FGI_API_URL = "https://api.alternative.me/fng/?limit=2&format=json"
 FGI_CACHE_TTL_SEC = 600   # 10 min
@@ -627,6 +646,12 @@ def initialize_db():
     if not row:
         cur.execute("INSERT INTO controller (id, score_gate, updated_at) VALUES (1, ?, ?)",
                     (SCORE_GATE_START, datetime.now(timezone.utc).isoformat()))
+    elif row[0] is not None and float(row[0]) < 15.0:
+        # v29 migration: old 0-9 scale → 0-100 scale
+        new_val = round(float(row[0]) * 11.0, 1)
+        cur.execute("UPDATE controller SET score_gate=?, updated_at=? WHERE id=1",
+                    (new_val, datetime.now(timezone.utc).isoformat()))
+        logger.info(f"[v29-migration] score_gate migrated from {row[0]} to {new_val} (0-100 scale)")
     conn.commit(); conn.close()
 
 initialize_db()
@@ -1559,7 +1584,7 @@ def compute_timeframe_features(df: pd.DataFrame, label: str):
         features["rvol10_closed"] = float(df['RVOL10_closed'].iloc[-1]) if 'RVOL10_closed' in df and pd.notna(df['RVOL10_closed'].iloc[-1]) else None
         features["rvol10_live"]   = float(df['RVOL10_live'].iloc[-1])   if 'RVOL10_live'   in df and pd.notna(df['RVOL10_live'].iloc[-1])   else None
 
-        # Elegimos un RVOL “principal” para lógica general: prioriza closed; si no hay, usa live
+        # Elegimos un RVOL "principal" para lógica general: prioriza closed; si no hay, usa live
         rvv = features["rvol10_closed"] if features["rvol10_closed"] is not None else features["rvol10_live"]
 
         # Slopes de 10 barras
@@ -2883,7 +2908,7 @@ def controller_autotune():
             
             if rsi4h_btc is not None and vol_slope_btc is not None and rsi4h_btc < 35 and vol_slope_btc > 0:
                 # Fear + positive vol (recovery) - baja más rápido
-                step = 0.20  # Baja más rápido (de 0.10)
+                step = 2.2  # v29: scaled to 0-100 (was 0.20)
         except Exception:
             pass  # Fallback to normal step
         
@@ -3223,14 +3248,14 @@ def hybrid_decision(symbol: str):
         RSI_MIN_K, RSI_MAX_K = max(RSI_MIN, 52), min(RSI_MAX, 68)
         ADX_MIN_K = max(18, ADX_MIN - 2)
         RVOL_BASE_K = max(0.8, RVOL_BASE * 0.8)
-        SCORE_GATE_OFFSET = -0.2
+        SCORE_GATE_OFFSET = -2.2  # v29: scaled to 0-100 (was -0.2)
         reentry_pad_local = 0.0015
     elif klass == "unstable":
         # soften vs. your previous +0.3 gate bump and tighter RSI
         RSI_MIN_K, RSI_MAX_K = max(48, RSI_MIN - 2), min(66, RSI_MAX)   # was 65
         ADX_MIN_K = max(23, ADX_MIN)                                     # was 25
         RVOL_BASE_K = max(1.05, RVOL_BASE)                               # was >=1.1
-        SCORE_GATE_OFFSET = +0.1                                         # was +0.3
+        SCORE_GATE_OFFSET = +1.1                                         # v29: scaled to 0-100 (was +0.1)
         reentry_pad_local = 0.0030                                       # was 0.0035
 
     blocks = []
@@ -3271,7 +3296,7 @@ def hybrid_decision(symbol: str):
         # Extreme Greed + rising: be more selective (soft modifier, don't block)
         if fgi_classification == "extreme_greed" and fgi_slope_7d is not None and fgi_slope_7d > 0:
             # Soft modifier: raise gate by +0.3 to +0.5 (be more selective, don't block)
-            SCORE_GATE_OFFSET += +0.40  # Between +0.3 and +0.5 as requested
+            SCORE_GATE_OFFSET += +4.4  # v29: scaled to 0-100 (was +0.40)
             blocks.append(f"FGI soft-mod: Extreme Greed rising (FGI={fgi_value:.0f}, slope_7d={fgi_slope_7d:+.1f}) - more selective entry")
         
         # >>> FGI OVERRIDE: Force entries in fear if recovering (slope_7d > 0)
@@ -3295,12 +3320,12 @@ def hybrid_decision(symbol: str):
             bump = 1.0 + 0.35 * down_sev
             ADX_MIN_K = max(ADX_MIN_K, 20 + 6*down_sev)
             RVOL_BASE_K = max(RVOL_BASE_K, 1.1 * bump)
-            SCORE_GATE_OFFSET += +0.20 + 0.20*down_sev
+            SCORE_GATE_OFFSET += +2.2 + 2.2*down_sev  # v29: scaled to 0-100
             reentry_pad_local = max(reentry_pad_local, 0.003 + 0.004*down_sev)
             reentry_block_min_local = max(reentry_block_min_local, int(20 + 20*down_sev))
         else:
             # En subida local: permite un poco más de entradas
-            SCORE_GATE_OFFSET += -0.05
+            SCORE_GATE_OFFSET += -0.55  # v29: scaled to 0-100 (was -0.05)
 
         note_parts = []
         if fgi_v is not None: note_parts.append(f"FGI={fgi_v}({fgi_tag})")
@@ -4028,52 +4053,41 @@ def hybrid_decision(symbol: str):
             level = "HARD"
 
 
-        # ===== scoring =====
-    score = 0.0
-    # notes already initialized at the beginning of function
+        # ===== v29 SCORING: 3 weighted categories, normalized 0-100 =====
+    s_momentum = 0.0  # RSI, MACD, Fisher, StochRSI
+    s_trend = 0.0     # ADX, EMA, MTF, price_slope, breakout
+    s_volume = 0.0    # RVOL, OBI, spread
 
-    # Overbought + MACDh soft score penalty (no hard block)
-    if (
-        rsi1h_now is not None and rsi1h_now >= 68.0 and
-        (rsi15_now or 0) >= 70.0 and
-        (macdh15_now or 0) <= 0.0
-    ):
-        score -= 0.5
-        notes.append("overbought 1h/15m + MACDh15≤0 penalty (-0.5)")
+    rsi = float(row['RSI']) if pd.notna(row['RSI']) else 50.0
 
-    # >>> PATCH START: MACDh15 penalty (moved here, after score/notes init)
-    if (macdh15 is not None) and (macdh15 < 0):
-        score -= 0.7
-        notes.append("MACDh15<0 penalty (-0.7)")
-        if adx < 25.0:
-            blocks.append("SOFT block: ADX<25 with MACDh15<0")
-            if level != "HARD": level = "SOFT"
-    # >>> PATCH END
-
-    # RVOL contribution uses ANY of (1h,15m) so early wake-ups don’t get punished (ANCHOR-8)
+    # --- RVOL computation (shared across categories) ---
     rvol_any = None
     for _rv in (rvol_1h, rv15):
         if _rv is not None and np.isfinite(_rv):
             rvol_any = _rv if (rvol_any is None) else max(rvol_any, _rv)
 
-    if rvol_any is not None and rvol_any >= RVOL_BASE_K:
-        score += 2.0
-        notes.append(f"RVOL≥{RVOL_BASE_K:.2f} ({rvol_any:.2f})")
-        if rvol_any >= RVOL_BASE_K + 0.5:
-            score += 1.0
-        if rvol_any >= RVOL_BASE_K + 1.5:
-            score += 1.0
+    # v29: RVOL < 1.0 soft block (was just gate bump in v28)
+    if rvol_any is not None and rvol_any < RVOL_SOFT_BLOCK_THRESHOLD:
+        blocks.append(f"SOFT block: RVOL {rvol_any:.2f} < {RVOL_SOFT_BLOCK_THRESHOLD}")
+        if level != "HARD": level = "SOFT"
+    elif rvol_any is None:
+        blocks.append("SOFT block: RVOL unavailable")
+        if level != "HARD": level = "SOFT"
 
-    if price_slope > 0:
-        score += 1.0
-        notes.append("price slope>0")
+    # --- OBI computation from orderbook (v29 new) ---
+    obi = None
+    try:
+        if ob and ob.get('bids') and ob.get('asks'):
+            _bid_vol = sum(v for _, v in ob['bids'][:20])
+            _ask_vol = sum(v for _, v in ob['asks'][:20])
+            if _ask_vol > 0:
+                obi = _bid_vol / _ask_vol
+    except Exception:
+        pass
 
-
-    rsi = float(row['RSI']) if pd.notna(row['RSI']) else 50.0
-    # ...ya tienes tf15/tf4h snapshots
+    # --- Leading indicators (StochRSI + Fisher) ---
     stochk15 = tf15.get('STOCHRSIk')
     willr15 = tf15.get('WILLR')
-    # Fisher 1h desde df de 1h ya cargado
     f_t = None
     try:
         fdf = ta.fisher(df['high'], df['low'], length=9)
@@ -4082,17 +4096,10 @@ def hybrid_decision(symbol: str):
     except Exception:
         fdf = None
 
-    # Scoring con guardas de volumen (defensa 1: cap leading_raw)
     leading_raw = 0.0
+    rvol_any_for_leading = rvol_any or 0
 
-    # re-eval rvol_any (explicit)
-    rvol_any_for_leading = None
-    for _rv in (rvol_1h, rv15):
-        if _rv is not None and np.isfinite(_rv):
-            rvol_any_for_leading = _rv if (rvol_any_for_leading is None) else max(rvol_any_for_leading, _rv)
-    rvol_any_for_leading = rvol_any_for_leading or 0  # fallback
-
-    # StochRSI 15m (timing entrada; umbrales por klass + persistencia, defensa 2)
+    # StochRSI 15m
     stoch_persist_ok = False
     if stochk15 is not None:
         try:
@@ -4101,19 +4108,18 @@ def hybrid_decision(symbol: str):
             if df15_full is not None and len(df15_full) > 20:
                 srs = ta.stochrsi(df15_full['close'], length=14)
                 k = float(srs.iloc[-1,0]); k_prev = float(srs.iloc[-2,0])
-                stoch_persist_ok = (k < 20 and k_prev < 20)  # 2 velas cerradas
+                stoch_persist_ok = (k < 20 and k_prev < 20)
         except Exception:
-            stoch_persist_ok = True  # fallback no-block
+            stoch_persist_ok = True
     stoch_threshold = 18 if klass == "stable" else 20 if klass == "medium" else 22
     if (stochk15 is not None and stochk15 < stoch_threshold and stoch_persist_ok and
         rvol_any_for_leading >= max(RVOL_BASE_K, 1.0) and (tf15.get('MACDh') or 0) > 0):
         leading_raw += 1.0; notes.append("StochRSI15 oversold + vol")
 
-    # Fisher 1h (cambio régimen; umbral por klass)
+    # Fisher 1h
     fisher_threshold = 0 if klass == "stable" else 0 if klass == "medium" else 0.2
     if f_t is not None and f_t > fisher_threshold:
         leading_raw += 0.7; notes.append("Fisher1h bullish")
-        # Extra si sube vs. previa
         try:
             if fdf is not None:
                 f_prev = float(fdf.iloc[-2, 0])
@@ -4121,35 +4127,30 @@ def hybrid_decision(symbol: str):
                     leading_raw += 0.3
         except Exception:
             pass
-        # Si estabas en SOFT por confirmaciones EMA/VWAP, permite override suave
         if level == "SOFT":
             notes.append("soft override (Fisher1h)")
             level = "NONE"
 
-    leading_bonus = min(leading_raw, 1.2)  # cap duro (defensa 1)
-    # (FIX) Don't add leading_bonus yet; apply once after MTF alignment below.
+    leading_bonus = min(leading_raw, 1.2)
 
-    # Defensa 3: Anti-chop BBWidth + ADX squeeze
+    # Defensa 3: Anti-chop BBWidth + ADX squeeze (v29: SOFT instead of HARD)
     try:
         bb = ta.bbands(df['close'], length=20, std=2)
         width = (bb['BBU_20_2.0'] - bb['BBL_20_2.0']) / df['close']
         last_w = float(width.iloc[-1])
         hist = width.dropna().iloc[-60:]
-        bb_rank = float((hist < last_w).mean())  # 0..1
-        
-        # >>> RELAJA CHOP/SQUEEZE IN MOMENTUM: Bypass si ADX>18 y vol_slope>0
-        chop_block = (adx or 0) < 20 and bb_rank < 0.30
+        bb_rank = float((hist < last_w).mean())
+
+        chop_block = (adx or 0) < 20 and bb_rank < BB_SQUEEZE_SOFT_RANK
         if chop_block:
-            # Check if momentum override (ADX>18 and vol_slope>0)
             vol_slope_chop = calculate_vol_slope(df, periods=10) if df is not None else None
             if (adx or 0) >= 18 and vol_slope_chop is not None and vol_slope_chop > 0:
-                # Momentum, no chop block
                 chop_block = False
-                notes.append(f"Chop bypass: ADX={adx:.1f}≥18 & vol_slope={vol_slope_chop:.2f}>0 (momentum)")
-        
+                notes.append(f"Chop bypass: ADX={adx:.1f}>=18 & vol_slope>0")
+
         if chop_block:
-            blocks.append(f"chop/squeeze: BBwidth%rank={bb_rank:.2f}, ADX={adx:.1f}")
-            level = "HARD"
+            blocks.append(f"SOFT chop/squeeze: BBrank={bb_rank:.2f}, ADX={adx:.1f}")
+            if level != "HARD": level = "SOFT"  # v29: was HARD, now SOFT
     except Exception:
         pass
 
@@ -4166,16 +4167,13 @@ def hybrid_decision(symbol: str):
             bo_now_low = float(df15_full['low'].iloc[-1]); bo_now_close = float(df15_full['close'].iloc[-1])
             breakout = (bo_lvl and bo_prev_close > bo_lvl and (rv15 or 0) >= (rvol15_floor + 0.2))
             retest_ok = (bo_lvl and bo_now_low <= bo_lvl * 1.002 and bo_now_close >= bo_lvl)
-            if breakout and retest_ok:
-                score += 0.8; notes.append("breakout+retest 15m")
-            elif breakout and not retest_ok:
-                # Defensa 7: Cooldown breakout fallido (solo para leading)
+            if breakout and not retest_ok:
                 reentry_block_min_local = max(reentry_block_min_local, 20)
                 reentry_pad_local = max(reentry_pad_local, 0.004)
     except Exception:
         pass
 
-    # Defensa 5: Filtro velas con mecha (15m última vela)
+    # Defensa 5: Filtro velas con mecha
     try:
         if df15_full is not None and len(df15_full) > 1:
             rng = df15_full['high'].iloc[-1] - df15_full['low'].iloc[-1]
@@ -4187,54 +4185,101 @@ def hybrid_decision(symbol: str):
     except Exception:
         pass
 
-    # >>> SIMPLIFIED: EMA/EMA50 are score bonuses, NOT hard filters
-    # Analysis shows: ~47% of winners don't have EMA20>EMA50, ~67% don't have close>EMA20
-    # These are bonuses for trend-following entries, but don't block mean-reversion trades
-    
-    # EMA20/EMA50 alignment bonus (trend-following signal)
-    if row['EMA20'] > row['EMA50']:
-        score += 1.0
-        notes.append("EMA20>EMA50 (trend-following bonus)")
-    
-    # Close above EMA20 bonus
-    if row['close'] > row['EMA20']:
-        score += 0.5
-        notes.append("close>EMA20 bonus")
-    
-    # NOTE: price_slope, volume_slope, volume_ratio, price_near_high_pct are NOT used as filters
-    # Analysis shows: these don't improve precision (some even have improvement_factor < 1)
-    # They only add friction without edge. Removed from scoring to keep it simple.
-    
-    # Defensa 6: Alineación MTF light (aplica leading_bonus SOLO si alineado)
-    if not (row['EMA20'] > row['EMA50'] and adx_slope_1h > 0):
-        notes.append("MTF misaligned → sin bonus leading")
-        # (FIX) do not add leading_bonus
-    else:
-        score += leading_bonus  # apply once when aligned
+    # MACDh15 zero-cross detection (v29 new)
+    macdh15_zerocross = False
+    try:
+        if df15_full is not None and len(df15_full) >= 26:
+            macd15_zc = ta.macd(df15_full['close'], fast=12, slow=26, signal=9)
+            h_now_zc = float(macd15_zc['MACDh_12_26_9'].iloc[-1])
+            h_prev_zc = float(macd15_zc['MACDh_12_26_9'].iloc[-2])
+            macdh15_zerocross = (h_prev_zc < 0 and h_now_zc > 0)
+    except Exception:
+        pass
 
-    # RSI band (already filtered by hard filter 30-52, so this is just scoring)
+    # ===== MOMENTUM category (max raw 1.0) =====
+    # Penalties
+    if (rsi1h_now is not None and rsi1h_now >= 68.0 and
+        (rsi15_now or 0) >= 70.0 and (macdh15_now or 0) <= 0.0):
+        s_momentum -= 0.15; notes.append("overbought penalty")
+
+    if (macdh15 is not None) and (macdh15 < 0):
+        s_momentum -= 0.20; notes.append("MACDh15<0 penalty")
+        if adx < 25.0:
+            blocks.append("SOFT block: ADX<25 with MACDh15<0")
+            if level != "HARD": level = "SOFT"
+
+    # Bonuses
     if 30.0 <= rsi <= 52.0:
-        score += 1.0; notes.append(f"RSI in band ({rsi:.1f})")
-    if rsi >= 41.0:  # Middle of range (30-52)
-        score += 0.5
+        s_momentum += 0.25; notes.append(f"RSI band ({rsi:.1f})")
+    if rsi >= 41.0:
+        s_momentum += 0.10
 
-    if adx >= 18.0:  # Already filtered by hard filter, so this is just scoring
-        score += 1.0; notes.append(f"ADX≥18 ({adx:.1f})")
-    
-    # NOTE: volume_slope removed from scoring
-    # Analysis shows: volume_slope10 doesn't improve precision (improvement_factor < 1)
-    # It only adds friction without edge. Removed to keep it simple.
+    if (macdh15 is not None) and (macdh15 > 0):
+        s_momentum += 0.20; notes.append("MACDh15>0")
 
-    # Spread penalty (skip if orderbook missing)
+    if macdh15_zerocross:
+        s_momentum += MACDH_ZEROCROSS_BONUS; notes.append("MACDh15 zero-cross (neg->pos)")
+
+    # Leading bonus → momentum (scaled: 1.2 old → 0.20 max new)
+    # Applied only if MTF aligned (checked below in trend)
+    _leading_applied = False
+    if row['EMA20'] > row['EMA50'] and adx_slope_1h > 0:
+        s_momentum += leading_bonus / 6.0
+        _leading_applied = True
+    else:
+        notes.append("MTF misaligned -> no leading bonus")
+
+    # ===== TREND category (max raw 1.0) =====
+    if row['EMA20'] > row['EMA50']:
+        s_trend += 0.25; notes.append("EMA20>EMA50")
+
+    if row['close'] > row['EMA20']:
+        s_trend += 0.10; notes.append("close>EMA20")
+
+    if adx >= 18.0:
+        s_trend += 0.15; notes.append(f"ADX>={18} ({adx:.1f})")
+
+    # ADX rising into 25+ (v29 new)
+    if adx >= 25.0 and adx_slope_1h > 0:
+        s_trend += ADX_RISING_INTO_25_BONUS; notes.append(f"ADX rising 25+ ({adx:.1f})")
+
+    if price_slope > 0:
+        s_trend += 0.15; notes.append("price slope>0")
+
+    if _leading_applied:
+        s_trend += 0.10; notes.append("MTF aligned")
+
+    if breakout and retest_ok:
+        s_trend += 0.13; notes.append("breakout+retest 15m")
+
+    # ===== VOLUME category (max raw 1.0) =====
+    if rvol_any is not None and rvol_any >= RVOL_BASE_K:
+        s_volume += 0.30; notes.append(f"RVOL>={RVOL_BASE_K:.2f} ({rvol_any:.2f})")
+        if rvol_any >= RVOL_BASE_K + 0.5:
+            s_volume += 0.15
+        if rvol_any >= RVOL_BASE_K + 1.5:
+            s_volume += 0.15
+
+    if obi is not None and obi > (1.0 + OBI_BONUS_THRESHOLD):
+        s_volume += OBI_BONUS_VALUE; notes.append(f"OBI bullish ({obi:.2f})")
+
     try:
         if spr_p is not None and np.isfinite(spr_p):
             spr_pct = spr_p * 100.0
             if spr_pct > 0.10:
-                score -= 0.2; notes.append(f"spread penalty {spr_pct:.2f}%")
+                s_volume -= 0.10; notes.append(f"spread penalty {spr_pct:.2f}%")
     except Exception:
         pass
 
-    # jitter (unchanged)
+    # ===== Combine weighted categories → normalize to 0-100 =====
+    raw_momentum = max(0.0, min(1.0, s_momentum))
+    raw_trend    = max(0.0, min(1.0, s_trend))
+    raw_volume   = max(0.0, min(1.0, s_volume))
+
+    weighted = raw_momentum * W_MOMENTUM + raw_trend * W_TREND + raw_volume * W_VOLUME
+    score = round(weighted * 100.0, 1)
+
+    # Jitter (scaled to 0-100)
     try:
         conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
         cur.execute("SELECT executed FROM decision_log ORDER BY id DESC LIMIT ?", (DECISION_WINDOW,))
@@ -4246,7 +4291,6 @@ def hybrid_decision(symbol: str):
     explore_p = JITTER_BASE
     if ratio_recent < (TARGET_BUY_RATIO * 0.6):
         explore_p = min(JITTER_MAX, JITTER_BASE + 0.03)
-    # >>> TWEAK4: jitter_disable_for_unstable
     adx4h_rising = False
     try:
         df4h_j = fetch_and_prepare_data_hybrid(symbol, timeframe="4h", limit=60)
@@ -4255,27 +4299,22 @@ def hybrid_decision(symbol: str):
             adx4h_rising = float(adx4h_ser.iloc[-1]) > float(adx4h_ser.iloc[-2])
     except Exception:
         pass
-
-    # after explore_p is set
     if klass == "unstable" and (rv15 or 0) < 1.0:
         explore_p = 0.0
-    elif adx4h_rising:                   # compute from 4h ADX slope
+    elif adx4h_rising:
         explore_p = max(explore_p, 0.01)
-
-
     if random.random() < explore_p:
-        jitter = random.uniform(-0.3, 0.3)
+        jitter = random.uniform(-3.0, 3.0)  # v29: scaled to 0-100
         score += jitter
-        notes.append(f"jitter {jitter:+.2f} (p={explore_p:.2f})")
+        notes.append(f"jitter {jitter:+.1f} (p={explore_p:.2f})")
 
     raw_score = max(0.0, score)
 
-    # executability and starvation logic
+    # Executability and starvation logic
     buy_ratio = _recent_buy_ratio()
     starvation = buy_ratio < TARGET_BUY_RATIO
-    relax_soft = starvation  # can set True to force testing
+    relax_soft = starvation
 
-    # >>> PATCH START: guarded starvation override
     if level == "HARD":
         exec_allowed = False
     elif level == "SOFT":
@@ -4284,33 +4323,49 @@ def hybrid_decision(symbol: str):
         if exec_allowed: notes.append("soft override (starvation, guarded)")
     else:
         exec_allowed = True
-    # >>> PATCH END
-
 
     score_for_gate = raw_score if exec_allowed else 0.0
-
-    # ANCHOR-8b: skip gate bump if 15m is waking up
-    fifteen_waking = (rv15 is not None and rv15 >= 0.9 and (tf15.get('MACDh') or 0) > 0)
-    if ((rvol_1h is None) or (rvol_1h < RVOL_BASE_K)) and not fifteen_waking:
-        # >>> TWEAK1: cap_gate_bump_under_starvation
-        starvation = (_recent_buy_ratio() or 0.0) < (TARGET_BUY_RATIO * 0.8)
-        if ((rvol_1h is None) or (rvol_1h < RVOL_BASE_K)) and not fifteen_waking:
-            score_gate += (0.1 if starvation else 0.3)
-
-
-
-    # final action
     gate = score_gate
-    # >>> LOG OVERRIDE IN FEAR: Debug low score buys when fear override active
-    try:
-        rsi4h_btc_log = get_btc_rsi4h_cached()  # Use cached helper
-        if rsi4h_btc_log is not None and rsi4h_btc_log < 35 and raw_score < SCORE_GATE_HARD_MIN:
-            logger.info(f"[FEAR-OVERRIDE] {symbol}: Fear override buy with score {raw_score:.1f} despite gate {gate:.1f} (RSI4h={rsi4h_btc_log:.1f}<35)")
-    except Exception:
-        pass
-    
-    # v28-fix: enforce hard minimum score — no entry with score below SCORE_GATE_HARD_MIN
-    if exec_allowed and raw_score >= gate and raw_score >= SCORE_GATE_HARD_MIN:
+
+    # ===== v29 CONVICTION OVERRIDE =====
+    conviction_override = False
+    conviction_reason = ""
+    if exec_allowed and raw_score < gate and level != "HARD":
+        # Override 1: Deep oversold on 4h (RSI4h < 25)
+        rsi4h_conv = None
+        try:
+            rsi4h_conv = get_btc_rsi4h_cached()
+        except Exception:
+            pass
+        if rsi4h_conv is not None and rsi4h_conv < CONVICTION_RSI4H_DEEP_OVERSOLD:
+            conviction_override = True
+            conviction_reason = f"RSI4h={rsi4h_conv:.1f}<{CONVICTION_RSI4H_DEEP_OVERSOLD}"
+
+        # Override 2: Explosive breakout (ADX>40 + RVOL>2.5 + MACDh>0)
+        elif (adx >= CONVICTION_ADX_EXPLOSIVE and
+              rvol_any is not None and rvol_any >= CONVICTION_RVOL_EXPLOSIVE and
+              (macdh15 or 0) > 0):
+            conviction_override = True
+            conviction_reason = (f"Explosive: ADX={adx:.1f} RVOL={rvol_any:.2f} MACDh15>0")
+
+        # Override 3: Fisher1h crossing from very negative to positive
+        elif f_t is not None and f_t > 0:
+            try:
+                if fdf is not None and len(fdf) >= 2:
+                    f_prev_conv = float(fdf.iloc[-2, 0])
+                    if f_prev_conv < CONVICTION_FISHER_CROSS_FROM and f_t > 0:
+                        conviction_override = True
+                        conviction_reason = f"Fisher1h cross: {f_prev_conv:.2f}->{f_t:.2f}"
+            except Exception:
+                pass
+
+        if conviction_override:
+            logger.info(f"[CONVICTION-OVERRIDE] {symbol}: score={raw_score:.1f} < gate={gate:.1f} "
+                       f"but OVERRIDE: {conviction_reason}")
+            notes.append(f"CONVICTION: {conviction_reason}")
+
+    # Final action
+    if exec_allowed and (raw_score >= gate or conviction_override) and raw_score >= SCORE_GATE_HARD_MIN:
         action = "buy"
     else:
         action = "hold"
@@ -4321,7 +4376,9 @@ def hybrid_decision(symbol: str):
     if symbol in LAST_LOSS_INFO:
         conf = min(conf, POST_LOSS_CONF_CAP)
 
-    note = f"raw={raw_score:.1f} gate={gate:.1f} score={score_for_gate:.1f} | " + ", ".join(notes)
+    note = (f"raw={raw_score:.1f} gate={gate:.1f} score={score_for_gate:.1f} "
+            f"[M={raw_momentum*100:.0f} T={raw_trend*100:.0f} V={raw_volume*100:.0f}] | "
+            + ", ".join(notes))
     note += f" | class={klass}"
     if blocks:
         note += f" | blocks=[{'; '.join(blocks)}] level={level} exec={exec_allowed}"
@@ -7110,7 +7167,7 @@ def maybe_slot_steal(symbol: str, need_notional: float, score: float, conf: int)
     except Exception:
         adx1h = 0.0
     min_conf = SLOT_STEAL_MIN_CONF - (5 if adx1h >= 30 else 0)
-    delta = SLOT_STEAL_SCORE_DELTA - (0.2 if adx1h >= 30 else 0.0)
+    delta = SLOT_STEAL_SCORE_DELTA - (2.2 if adx1h >= 30 else 0.0)  # v29: scaled
 
     if int(conf) < min_conf: return False
     if float(score) < (float(gate) + float(delta)): return False
@@ -7925,8 +7982,8 @@ def trade_once_with_report(symbol: str):
                 level = "HARD"
             else:
                 if "pullback_15m_clear" in reason:
-                    score += 0.7
-                    notes.append("15m pullback boost +0.7")
+                    score += 7.7  # v29: scaled to 0-100 (was 0.7)
+                    notes.append("15m pullback boost +7.7")
 
 
             # 8) Sizing en función de confianza, slippage y volatilidad
