@@ -4208,11 +4208,18 @@ def hybrid_decision(symbol: str):
             blocks.append("SOFT block: ADX<25 with MACDh15<0")
             if level != "HARD": level = "SOFT"
 
-    # Bonuses
+    # Bonuses — momentum (bullish range)
     if 30.0 <= rsi <= 52.0:
         s_momentum += 0.25; notes.append(f"RSI band ({rsi:.1f})")
     if rsi >= 41.0:
         s_momentum += 0.10
+
+    # v29-fix: Mean-reversion bonus for deeply oversold RSI
+    # RSI < 25 on 1h with ADX > 30 (strong trend = potential snap-back)
+    if rsi < 25.0 and adx >= 30.0:
+        s_momentum += 0.20; notes.append(f"RSI oversold reversal ({rsi:.1f}, ADX={adx:.1f})")
+    elif rsi < 30.0 and adx >= 25.0:
+        s_momentum += 0.10; notes.append(f"RSI oversold mild ({rsi:.1f})")
 
     if (macdh15 is not None) and (macdh15 > 0):
         s_momentum += 0.20; notes.append("MACDh15>0")
@@ -4328,24 +4335,40 @@ def hybrid_decision(symbol: str):
     gate = score_gate
 
     # ===== v29 CONVICTION OVERRIDE =====
+    # Conviction can override the soft gate but NOT the hard minimum.
+    # It grants a score BONUS (not a bypass) so the score still has to clear HARD_MIN.
     conviction_override = False
+    conviction_bonus = 0.0
     conviction_reason = ""
-    if exec_allowed and raw_score < gate and level != "HARD":
-        # Override 1: Deep oversold on 4h (RSI4h < 25)
+    if level != "HARD":
+        # Override 1: Deep oversold on 4h (RSI4h < 25) — mean reversion
         rsi4h_conv = None
         try:
             rsi4h_conv = get_btc_rsi4h_cached()
         except Exception:
             pass
         if rsi4h_conv is not None and rsi4h_conv < CONVICTION_RSI4H_DEEP_OVERSOLD:
-            conviction_override = True
-            conviction_reason = f"RSI4h={rsi4h_conv:.1f}<{CONVICTION_RSI4H_DEEP_OVERSOLD}"
+            # Only trigger if RSI is showing signs of reversal (not still falling)
+            _rsi4h_turning = False
+            try:
+                _df4h_conv = fetch_and_prepare_data_hybrid(symbol, timeframe="4h", limit=10)
+                if _df4h_conv is not None and len(_df4h_conv) >= 3:
+                    _rsi4h_vals = _df4h_conv['RSI'].dropna().tail(3).tolist()
+                    if len(_rsi4h_vals) >= 3 and _rsi4h_vals[-1] > _rsi4h_vals[-2]:
+                        _rsi4h_turning = True
+            except Exception:
+                pass
+            if _rsi4h_turning:
+                conviction_override = True
+                conviction_bonus = 25.0  # Boost score by 25 points
+                conviction_reason = f"RSI4h={rsi4h_conv:.1f}<{CONVICTION_RSI4H_DEEP_OVERSOLD} (turning up)"
 
         # Override 2: Explosive breakout (ADX>40 + RVOL>2.5 + MACDh>0)
         elif (adx >= CONVICTION_ADX_EXPLOSIVE and
               rvol_any is not None and rvol_any >= CONVICTION_RVOL_EXPLOSIVE and
               (macdh15 or 0) > 0):
             conviction_override = True
+            conviction_bonus = 30.0
             conviction_reason = (f"Explosive: ADX={adx:.1f} RVOL={rvol_any:.2f} MACDh15>0")
 
         # Override 3: Fisher1h crossing from very negative to positive
@@ -4355,21 +4378,24 @@ def hybrid_decision(symbol: str):
                     f_prev_conv = float(fdf.iloc[-2, 0])
                     if f_prev_conv < CONVICTION_FISHER_CROSS_FROM and f_t > 0:
                         conviction_override = True
+                        conviction_bonus = 20.0
                         conviction_reason = f"Fisher1h cross: {f_prev_conv:.2f}->{f_t:.2f}"
             except Exception:
                 pass
 
         if conviction_override:
-            logger.info(f"[CONVICTION-OVERRIDE] {symbol}: score={raw_score:.1f} < gate={gate:.1f} "
-                       f"but OVERRIDE: {conviction_reason}")
-            notes.append(f"CONVICTION: {conviction_reason}")
+            raw_score = min(100.0, raw_score + conviction_bonus)
+            score_for_gate = raw_score if exec_allowed else 0.0
+            logger.info(f"[CONVICTION-OVERRIDE] {symbol}: score boosted +{conviction_bonus:.0f} → {raw_score:.1f} "
+                       f"reason: {conviction_reason}")
+            notes.append(f"CONVICTION +{conviction_bonus:.0f}: {conviction_reason}")
 
-    # Final action
-    if exec_allowed and (raw_score >= gate or conviction_override) and raw_score >= SCORE_GATE_HARD_MIN:
+    # Final action — conviction now boosts score, so HARD_MIN still applies
+    if exec_allowed and raw_score >= SCORE_GATE_HARD_MIN:
         action = "buy"
     else:
         action = "hold"
-        if exec_allowed and raw_score >= gate and raw_score < SCORE_GATE_HARD_MIN:
+        if exec_allowed and raw_score > 0 and raw_score < SCORE_GATE_HARD_MIN:
             notes.append(f"BLOCKED:score_below_hard_min({raw_score:.1f}<{SCORE_GATE_HARD_MIN})")
 
     conf = int(clamp(50 + 10*(1 if row['EMA20'] > row['EMA50'] else 0) + 5*(1 if price_slope>0 else 0), 0, 100))
@@ -7542,24 +7568,78 @@ def calculate_monthly_pnl() -> tuple[float, float]:
         logger.warning(f"calculate_monthly_pnl error: {e}")
         return 0.0, None
 
+def _save_equity_guard_state():
+    """Persist equity guard state to DB so restarts don't clear it."""
+    try:
+        conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        state = {
+            "daily_active": _EQUITY_BREAKER_ACTIVE,
+            "daily_reset_date": str(_EQUITY_LAST_RESET_DATE) if _EQUITY_LAST_RESET_DATE else None,
+            "monthly_active": _EQUITY_MONTHLY_BREAKER_ACTIVE,
+            "monthly_until": str(_EQUITY_MONTHLY_BREAKER_UNTIL) if _EQUITY_MONTHLY_BREAKER_UNTIL else None,
+        }
+        cur.execute("INSERT OR REPLACE INTO equity_guard_state (key, value, updated_at) VALUES (?, ?, ?)",
+                    ("guard_state", json.dumps(state), now_iso))
+        conn.commit(); conn.close()
+    except Exception as e:
+        logger.warning(f"_save_equity_guard_state error: {e}")
+
+def _load_equity_guard_state():
+    """Load equity guard state from DB on startup."""
+    global _EQUITY_BREAKER_ACTIVE, _EQUITY_LAST_RESET_DATE
+    global _EQUITY_MONTHLY_BREAKER_ACTIVE, _EQUITY_MONTHLY_BREAKER_UNTIL
+    try:
+        conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+        cur.execute("SELECT value FROM equity_guard_state WHERE key='guard_state'")
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return
+        state = json.loads(row[0])
+        today_date = datetime.now(timezone.utc).date()
+
+        # Restore daily guard (only if same day)
+        saved_date_str = state.get("daily_reset_date")
+        if saved_date_str and saved_date_str != "None":
+            saved_date = datetime.strptime(saved_date_str, "%Y-%m-%d").date()
+            if saved_date == today_date and state.get("daily_active"):
+                _EQUITY_BREAKER_ACTIVE = True
+                _EQUITY_LAST_RESET_DATE = saved_date
+                logger.info(f"[equity-guard] Restored daily breaker from DB (active until end of {today_date})")
+
+        # Restore monthly guard (if still within pause window)
+        monthly_until_str = state.get("monthly_until")
+        if monthly_until_str and monthly_until_str != "None" and state.get("monthly_active"):
+            monthly_until = datetime.strptime(monthly_until_str, "%Y-%m-%d").date()
+            if today_date < monthly_until:
+                _EQUITY_MONTHLY_BREAKER_ACTIVE = True
+                _EQUITY_MONTHLY_BREAKER_UNTIL = monthly_until
+                logger.info(f"[equity-guard] Restored monthly breaker from DB (active until {monthly_until})")
+            else:
+                logger.info(f"[equity-guard] Monthly breaker expired ({monthly_until}), not restoring")
+    except Exception as e:
+        logger.warning(f"_load_equity_guard_state error: {e}")
+
 def check_equity_guard() -> tuple[bool, str]:
     """
     Check if equity guard should activate (circuit breaker).
     Enhanced with FGI-based thresholds and monthly DD guard.
+    State is persisted to DB to survive restarts.
     Returns: (should_block, reason)
     If should_block is True, no new trades should be opened (but existing trades can be managed).
     """
     global _EQUITY_BREAKER_ACTIVE, _EQUITY_LAST_RESET_DATE
     global _EQUITY_MONTHLY_BREAKER_ACTIVE, _EQUITY_MONTHLY_BREAKER_UNTIL, _EQUITY_MONTHLY_START_BALANCE
-    
+
     if not EQUITY_GUARD_ENABLED:
         return False, "disabled"
-    
+
     try:
         now_utc = datetime.now(timezone.utc)
         today_date = now_utc.date()
         month_start = now_utc.replace(day=1).date()
-        
+
         # >>> MONTHLY DD GUARD (Priority #1)
         # Check monthly drawdown first (more critical than daily)
         if _EQUITY_MONTHLY_BREAKER_UNTIL is not None and today_date < _EQUITY_MONTHLY_BREAKER_UNTIL:
@@ -7567,17 +7647,19 @@ def check_equity_guard() -> tuple[bool, str]:
                 return True, f"monthly_dd_breaker_active (until {_EQUITY_MONTHLY_BREAKER_UNTIL})"
         else:
             # Reset monthly breaker if pause period expired
-            if _EQUITY_MONTHLY_BREAKER_ACTIVE and today_date >= _EQUITY_MONTHLY_BREAKER_UNTIL:
+            if _EQUITY_MONTHLY_BREAKER_ACTIVE and _EQUITY_MONTHLY_BREAKER_UNTIL is not None and today_date >= _EQUITY_MONTHLY_BREAKER_UNTIL:
                 _EQUITY_MONTHLY_BREAKER_ACTIVE = False
                 _EQUITY_MONTHLY_BREAKER_UNTIL = None
+                _save_equity_guard_state()
                 logger.info(f"Monthly equity guard reset: {today_date}")
-        
+
         # Check monthly DD if not already active
         if not _EQUITY_MONTHLY_BREAKER_ACTIVE:
             monthly_pnl_pct, monthly_start_bal = calculate_monthly_pnl()
             if monthly_start_bal is not None and monthly_pnl_pct <= EQUITY_GUARD_MONTHLY_MAX_DD_PCT:
                 _EQUITY_MONTHLY_BREAKER_ACTIVE = True
                 _EQUITY_MONTHLY_BREAKER_UNTIL = today_date + timedelta(days=EQUITY_GUARD_MONTHLY_PAUSE_DAYS)
+                _save_equity_guard_state()
                 logger.error(
                     f"🚨 MONTHLY EQUITY GUARD TRIGGERED: Monthly PnL {monthly_pnl_pct:.2f}% <= {EQUITY_GUARD_MONTHLY_MAX_DD_PCT}%"
                 )
@@ -7588,12 +7670,13 @@ def check_equity_guard() -> tuple[bool, str]:
                     f"All new trades blocked until {_EQUITY_MONTHLY_BREAKER_UNTIL} UTC"
                 )
                 return True, f"monthly_dd_breaker_triggered (pnl={monthly_pnl_pct:.2f}%)"
-        
+
         # >>> DAILY GUARD (with FGI-based threshold adjustment)
         # Reset daily breaker at start of new day
         if _EQUITY_LAST_RESET_DATE is None or _EQUITY_LAST_RESET_DATE < today_date:
             _EQUITY_BREAKER_ACTIVE = False
             _EQUITY_LAST_RESET_DATE = today_date
+            _save_equity_guard_state()
             logger.info(f"Equity guard reset for new day: {today_date}")
         
         # If daily breaker already active, block until reset
@@ -7632,6 +7715,7 @@ def check_equity_guard() -> tuple[bool, str]:
         threshold_realized = EQUITY_GUARD_MAX_LOSS_PCT  # -3%
         if realized_pct <= threshold_realized:
             _EQUITY_BREAKER_ACTIVE = True
+            _save_equity_guard_state()
             logger.error(f"🚨 EQUITY GUARD: Realized {realized_pct:.2f}% <= {threshold_realized}%")
             send_telegram_message(
                 f"🚨 *EQUITY GUARD TRIGGERED (Realized)*\n"
@@ -7645,6 +7729,7 @@ def check_equity_guard() -> tuple[bool, str]:
         # Check total PnL threshold (with fear adjustment)
         if total_pnl_pct <= threshold_total:
             _EQUITY_BREAKER_ACTIVE = True
+            _save_equity_guard_state()
             close_result = None
             should_close_all = total_pnl_pct <= EQUITY_GUARD_EMERGENCY_CLOSE_PCT
             if should_close_all:
@@ -8127,12 +8212,15 @@ def write_status_json(decisions: list, path: str = "status.json"):
 # =========================
 # Reconcile orphans
 # =========================
+_RECONCILE_ALERTED = set()  # v29-fix: track already-alerted untracked positions
+
 def reconcile_orphan_open_buys():
     """v29: Bidirectional reconciliation DB ↔ Exchange spot balances.
     1) DB says open but exchange has no balance → close orphan in DB
     2) DB says open but exchange qty differs significantly → log warning
-    3) Exchange has balance but DB has no open trade → log untracked asset
+    3) Exchange has balance but DB has no open trade → alert ONCE then silence
     """
+    global _RECONCILE_ALERTED
     try:
         try: exchange.load_markets()
         except Exception as e: logger.warning(f"load_markets warn (reconcile): {e}")
@@ -8151,7 +8239,6 @@ def reconcile_orphan_open_buys():
         for symbol, trade_id, buy_amt in rows:
             base = symbol.split('/')[0]
             db_open_assets.add(base)
-            # Use total (not just free) to catch locked balances too
             held = float(total.get(base, 0) or 0.0)
             min_amt = None
             try:
@@ -8161,35 +8248,40 @@ def reconcile_orphan_open_buys():
             dust_eps = float(min_amt) if min_amt else 1e-10
 
             if held <= dust_eps:
-                # Exchange has no real balance → orphan
                 cur.execute("UPDATE transactions SET status='closed_orphan' WHERE trade_id=? AND side='buy'", (trade_id,))
                 conn.commit(); closed += 1
                 send_telegram_message(f"🧹 *Reconcile*: Cerrado orphan `{trade_id}` ({symbol}) — exchange balance=0")
                 logger.info(f"[reconcile] orphan closed: {trade_id} {symbol} (DB qty={buy_amt}, exch=0)")
             else:
-                # Exchange has balance — check if qty matches
                 diff_pct = abs(held - float(buy_amt)) / max(float(buy_amt), 1e-10) * 100
-                if diff_pct > 10.0:  # >10% difference
+                if diff_pct > 10.0:
                     logger.warning(f"[reconcile] QTY MISMATCH {symbol}: DB={float(buy_amt):.6f} vs Exchange={held:.6f} ({diff_pct:.1f}% diff) trade_id={trade_id}")
 
         # --- Direction 2: Exchange balances → verify DB has open trade ---
+        # v29-fix: Only alert ONCE per asset, then silence until resolved
         untracked = 0
+        current_untracked = set()
         for asset, amt in total.items():
             if asset == "USDT" or not amt or float(amt) <= 0:
                 continue
             if asset in db_open_assets:
-                continue  # Already tracked
+                continue
             symbol = f"{asset}/USDT"
             if symbol not in getattr(exchange, "markets", {}):
                 continue
             px = fetch_price(symbol)
             notional = float(amt) * float(px) if px else 0.0
             if notional < MIN_NOTIONAL:
-                continue  # Dust, ignore
-            # Real position not tracked in DB
+                continue
             untracked += 1
-            logger.warning(f"[reconcile] UNTRACKED POSITION: {symbol} qty={float(amt):.6f} (~${notional:.2f}) — not in DB as open trade")
-            send_telegram_message(f"⚠️ *Reconcile*: Posicion NO rastreada `{symbol}` qty=`{float(amt):.6f}` (~${notional:.2f})")
+            current_untracked.add(asset)
+            if asset not in _RECONCILE_ALERTED:
+                _RECONCILE_ALERTED.add(asset)
+                logger.warning(f"[reconcile] UNTRACKED POSITION: {symbol} qty={float(amt):.6f} (~${notional:.2f})")
+                send_telegram_message(f"⚠️ *Reconcile*: Posicion NO rastreada `{symbol}` qty=`{float(amt):.6f}` (~${notional:.2f}) — alerta unica, no se repetira")
+
+        # Clear alerts for assets that are no longer untracked (resolved)
+        _RECONCILE_ALERTED = _RECONCILE_ALERTED & current_untracked
 
         conn.close()
         total_issues = closed + untracked
@@ -8659,6 +8751,7 @@ if __name__ == "__main__":
             try: exchange.load_markets()
             except Exception as e: logger.warning(f"load_markets warning: {e}")
             startup_cleanup()
+            _load_equity_guard_state()  # v29-fix: restore equity guard from DB
         
         if BACKTEST_ENABLED:
             logger.info("Running in BACKTEST mode...")
