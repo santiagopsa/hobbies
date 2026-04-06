@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import py_compile; py_compile.compile\\('trader_v31.py', doraise=True\\)\")"
+    ]
+  }
+}
